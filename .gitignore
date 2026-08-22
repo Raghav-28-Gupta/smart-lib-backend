@@ -1,0 +1,14 @@
+node_modules
+.env
+
+# Local environment files
+.env.*
+!.env.example
+
+# TypeScript and test output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Generated Prisma client
+/src/generated/prisma/

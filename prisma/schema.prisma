@@ -1,0 +1,204 @@
+// Prisma 7: the `prisma-client` generator emits into an explicit output dir
+// (no more node_modules/.prisma), and the datasource URL now lives in
+// prisma.config.ts rather than an env() call here.
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  student
+  admin
+}
+
+enum CopyStatus {
+  available
+  borrowed
+  lost
+  maintenance
+}
+
+enum LoanStatus {
+  active
+  returned
+  overdue
+}
+
+enum ReservationStatus {
+  waiting
+  fulfilled
+  expired
+  cancelled
+}
+
+enum ResourceType {
+  seat
+  room
+}
+
+enum BookingStatus {
+  booked
+  checked_in
+  no_show
+  released
+  completed
+  cancelled
+}
+
+enum FineReason {
+  overdue
+  no_show
+}
+
+enum FineStatus {
+  pending
+  paid
+  waived
+}
+
+enum RecommendationMethod {
+  content
+  collaborative
+  hybrid
+}
+
+model User {
+  id               String   @id @default(uuid())
+  name             String
+  email            String   @unique
+  passwordHash     String
+  role             Role     @default(student)
+  reliabilityScore Float    @default(100)
+  createdAt        DateTime @default(now())
+
+  loans           Loan[]
+  reservations    Reservation[]
+  bookings        ResourceBooking[]
+  fines           Fine[]
+  reliabilityLogs ReliabilityScoreLog[]
+  recommendations RecommendationCache[]
+}
+
+model Book {
+  id            String  @id @default(uuid())
+  isbn          String  @unique
+  title         String
+  author        String
+  genre         String?
+  description   String?
+  publishedYear Int?
+  totalCopies   Int     @default(1)
+
+  copies          BookCopy[]
+  reservations    Reservation[]
+  recommendations RecommendationCache[]
+}
+
+model BookCopy {
+  id     String     @id @default(uuid())
+  bookId String
+  book   Book       @relation(fields: [bookId], references: [id])
+  status CopyStatus @default(available)
+  loans  Loan[]
+}
+
+model Loan {
+  id           String     @id @default(uuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id])
+  bookCopyId   String
+  bookCopy     BookCopy   @relation(fields: [bookCopyId], references: [id])
+  borrowedAt   DateTime   @default(now())
+  dueAt        DateTime
+  returnedAt   DateTime?
+  renewedCount Int        @default(0)
+  status       LoanStatus @default(active)
+  fines        Fine[]
+}
+
+model Reservation {
+  id             String            @id @default(uuid())
+  userId         String
+  user           User              @relation(fields: [userId], references: [id])
+  bookId         String
+  book           Book              @relation(fields: [bookId], references: [id])
+  requestedAt    DateTime          @default(now())
+  status         ReservationStatus @default(waiting)
+  claimExpiresAt DateTime?
+}
+
+model Resource {
+  id       String       @id @default(uuid())
+  type     ResourceType
+  name     String
+  location String?
+  capacity Int          @default(1)
+
+  bookings ResourceBooking[]
+}
+
+model ResourceBooking {
+  id                 String        @id @default(uuid())
+  userId             String
+  user               User          @relation(fields: [userId], references: [id])
+  resourceId         String
+  resource           Resource      @relation(fields: [resourceId], references: [id])
+  startTime          DateTime
+  endTime            DateTime
+  status             BookingStatus @default(booked)
+  gracePeriodMinutes Int           @default(15)
+  checkedInAt        DateTime?
+  priorityScore      Float?
+
+  noShowEvent NoShowEvent?
+  fines       Fine[]
+}
+
+model NoShowEvent {
+  id                   String          @id @default(uuid())
+  resourceBookingId    String          @unique
+  resourceBooking      ResourceBooking @relation(fields: [resourceBookingId], references: [id])
+  userId               String
+  predictedProbability Float
+  actualNoShow         Boolean?
+  recordedAt           DateTime        @default(now())
+}
+
+model Fine {
+  id               String           @id @default(uuid())
+  userId           String
+  user             User             @relation(fields: [userId], references: [id])
+  relatedLoanId    String?
+  relatedLoan      Loan?            @relation(fields: [relatedLoanId], references: [id])
+  relatedBookingId String?
+  relatedBooking   ResourceBooking? @relation(fields: [relatedBookingId], references: [id])
+  amount           Float
+  reason           FineReason
+  status           FineStatus       @default(pending)
+  createdAt        DateTime         @default(now())
+}
+
+model ReliabilityScoreLog {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  score      Float
+  delta      Float
+  reason     String
+  computedAt DateTime @default(now())
+}
+
+model RecommendationCache {
+  id          String               @id @default(uuid())
+  userId      String
+  user        User                 @relation(fields: [userId], references: [id])
+  bookId      String
+  book        Book                 @relation(fields: [bookId], references: [id])
+  score       Float
+  method      RecommendationMethod
+  generatedAt DateTime             @default(now())
+}
