@@ -5,6 +5,7 @@ import { authRouter } from './routes/auth'
 import { booksRouter } from './routes/books'
 import { healthRouter } from './routes/health'
 import { loansRouter } from './routes/loans'
+import { reservationsRouter } from './routes/reservations'
 
 // The Express app, separate from the listen() call in index.ts, so tests can
 // mount it directly with supertest without binding a real port.
@@ -16,6 +17,7 @@ app.use(healthRouter)
 app.use(authRouter)
 app.use(booksRouter)
 app.use(loansRouter)
+app.use(reservationsRouter)
 
 // More route modules land here as later tasks add them — each router
 // declares its own full paths (e.g. authRouter's '/auth/register'), so

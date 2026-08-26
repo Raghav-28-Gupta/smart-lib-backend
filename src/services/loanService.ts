@@ -2,6 +2,7 @@ import { LOAN_PERIOD_DAYS, MAX_RENEWALS, FINE_PER_DAY_INR } from '../config/cons
 import type { Loan } from '../generated/prisma/client'
 import { ConflictError, ForbiddenError, NotFoundError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
+import { assertNotReservedForAnother, consumeClaimIfAny, onBookReturned } from './reservationService'
 
 export interface LoanDto {
   id: string
@@ -76,6 +77,8 @@ export async function borrowBook(userId: string, bookId: string): Promise<LoanDt
   if (existing) throw new ConflictError('You already have this book borrowed.')
 
   const now = new Date()
+  await assertNotReservedForAnother(userId, bookId, now)
+
   // Claims one available copy via a guarded conditional update, which is
   // race-safe under Postgres's row locking without needing SELECT ... FOR
   // UPDATE: if two requests race for the same copy, the second's updateMany
@@ -106,6 +109,7 @@ export async function borrowBook(userId: string, bookId: string): Promise<LoanDt
     throw new ConflictError('No available copies right now.')
   })
 
+  await consumeClaimIfAny(userId, bookId)
   return toLoanDto(loan, now)
 }
 
@@ -175,7 +179,6 @@ export async function returnLoan(userId: string, loanId: string): Promise<LoanDt
     }),
     prisma.bookCopy.update({ where: { id: loan.bookCopyId }, data: { status: 'available' } }),
   ])
-  // Task 6 (waitlist cascade) hooks in here: if anyone is waiting on
-  // loan.bookCopy.bookId, promote the oldest waiting reservation.
+  await onBookReturned(loan.bookCopy.bookId, now)
   return toLoanDto(updated, now)
 }
