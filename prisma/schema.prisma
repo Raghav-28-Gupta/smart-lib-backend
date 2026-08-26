@@ -71,6 +71,9 @@ model User {
   name             String
   email            String   @unique
   passwordHash     String
+  // University roll number. Nullable because self-registered accounts don't
+  // supply one; the API surfaces `roll ?? 'Pending'` to the client.
+  roll             String?
   role             Role     @default(student)
   reliabilityScore Float    @default(100)
   createdAt        DateTime @default(now())
@@ -147,11 +150,16 @@ model ResourceBooking {
   user               User          @relation(fields: [userId], references: [id])
   resourceId         String
   resource           Resource      @relation(fields: [resourceId], references: [id])
-  startTime          DateTime
-  endTime            DateTime
+  // Timestamptz, not plain timestamp: the no_overlapping_bookings EXCLUDE
+  // constraint indexes tstzrange(startTime, endTime), and tstzrange() is only
+  // IMMUTABLE (a hard requirement for index expressions) when its arguments
+  // are already timestamptz. Absolute instants are the right model for
+  // bookings regardless.
+  startTime          DateTime      @db.Timestamptz(3)
+  endTime            DateTime      @db.Timestamptz(3)
   status             BookingStatus @default(booked)
   gracePeriodMinutes Int           @default(15)
-  checkedInAt        DateTime?
+  checkedInAt        DateTime?     @db.Timestamptz(3)
   priorityScore      Float?
 
   noShowEvent NoShowEvent?
