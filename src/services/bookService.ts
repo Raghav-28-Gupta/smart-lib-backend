@@ -32,28 +32,9 @@ function toBookDto(book: Book, availableCopies: number, waitlistCount: number): 
 
 // availableCopies/waitlistCount aren't stored columns — they're computed by
 // counting BookCopy/Reservation rows, same as the frontend mock repository
-// derives them from its in-memory Book fields. For a list of books this
-// batches both counts into two groupBy queries instead of N+1 individual
-// counts per book.
-export async function searchBooks(input: { q?: string; genre?: string }): Promise<BookDto[]> {
-  const q = input.q?.trim()
-  const genre = input.genre && input.genre !== 'All' ? input.genre : undefined
-
-  const books = await prisma.book.findMany({
-    where: {
-      ...(genre ? { genre } : {}),
-      ...(q
-        ? {
-            OR: [
-              { title: { contains: q, mode: 'insensitive' } },
-              { author: { contains: q, mode: 'insensitive' } },
-            ],
-          }
-        : {}),
-    },
-    orderBy: { title: 'asc' },
-  })
-
+// derives them from its in-memory Book fields. Batches both counts into two
+// groupBy queries instead of N+1 individual counts per book.
+async function attachComputedCounts(books: Book[]): Promise<BookDto[]> {
   if (books.length === 0) return []
 
   const bookIds = books.map((b) => b.id)
@@ -73,6 +54,41 @@ export async function searchBooks(input: { q?: string; genre?: string }): Promis
   const waitlistMap = new Map(waitlistGroups.map((g) => [g.bookId, g._count]))
 
   return books.map((b) => toBookDto(b, availableMap.get(b.id) ?? 0, waitlistMap.get(b.id) ?? 0))
+}
+
+export async function searchBooks(input: { q?: string; genre?: string }): Promise<BookDto[]> {
+  const q = input.q?.trim()
+  const genre = input.genre && input.genre !== 'All' ? input.genre : undefined
+
+  const books = await prisma.book.findMany({
+    where: {
+      ...(genre ? { genre } : {}),
+      ...(q
+        ? {
+            OR: [
+              { title: { contains: q, mode: 'insensitive' } },
+              { author: { contains: q, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    },
+    orderBy: { title: 'asc' },
+  })
+
+  return attachComputedCounts(books)
+}
+
+// Used by recommendationService: fetches an arbitrary set of books and
+// preserves the caller's ordering (e.g. popularity or AI-model rank) rather
+// than falling back to alphabetical, since order is the whole point of a
+// recommendation list. Silently drops any id that no longer resolves to a
+// book rather than erroring, since a stale AI result shouldn't break the page.
+export async function getBooksByIds(ids: string[]): Promise<BookDto[]> {
+  if (ids.length === 0) return []
+  const books = await prisma.book.findMany({ where: { id: { in: ids } } })
+  const dtos = await attachComputedCounts(books)
+  const byId = new Map(dtos.map((d) => [d.id, d]))
+  return ids.map((id) => byId.get(id)).filter((d): d is BookDto => d != null)
 }
 
 export async function getBookById(id: string): Promise<BookDto> {

@@ -11,3 +11,24 @@ export async function checkAiBackendHealth() {
   if (!res.ok) throw new Error(`AI backend unhealthy: ${res.status}`)
   return res.json()
 }
+
+export interface RecommendResult {
+  book_id: string
+  score: number
+  method: 'content' | 'collaborative' | 'hybrid'
+}
+
+// The real path is POST /recommend/books, not POST /recommend as
+// SMARTLIB_PROJECT_CONTEXT.md §5.3 previously documented (fixed alongside
+// this). Returns stub results ([]) until the Phase 3 model lands --
+// recommendationService.ts is the one that falls back when this is empty.
+export async function fetchRecommendations(userId: string, limit = 10): Promise<RecommendResult[]> {
+  const res = await fetch(`${AI_BACKEND_URL}/recommend/books`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, limit }),
+  })
+  if (!res.ok) throw new Error(`AI backend recommend failed: ${res.status}`)
+  const data = (await res.json()) as { results: RecommendResult[] }
+  return data.results
+}
