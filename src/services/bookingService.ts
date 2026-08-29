@@ -1,8 +1,9 @@
-import { TIME_SLOTS } from '../config/constants'
+import { RELIABILITY_ONTIME_BOOKING_BONUS, TIME_SLOTS } from '../config/constants'
 import { Prisma } from '../generated/prisma/client'
 import type { ResourceBooking, ResourceType } from '../generated/prisma/client'
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
+import { applyReliabilityDelta } from './reliabilityService'
 
 export interface BookingDto {
   id: string
@@ -197,10 +198,14 @@ export async function checkInBooking(userId: string, bookingId: string): Promise
   if (window.frontendStatus === 'upcomingFar') throw new ConflictError('Check-in opens at the start of your booking window.')
   if (window.frontendStatus === 'released') throw new ConflictError('The grace period for this booking has passed.')
 
-  const updated = await prisma.resourceBooking.update({
-    where: { id: bookingId },
-    data: { status: 'checked_in', checkedInAt: now },
-    include: { resource: { select: { name: true, type: true } } },
+  const updated = await prisma.$transaction(async (tx) => {
+    const result = await tx.resourceBooking.update({
+      where: { id: bookingId },
+      data: { status: 'checked_in', checkedInAt: now },
+      include: { resource: { select: { name: true, type: true } } },
+    })
+    await applyReliabilityDelta(tx, userId, RELIABILITY_ONTIME_BOOKING_BONUS, 'On-time check-in for a resource booking')
+    return result
   })
   return toBookingDto(updated, now)
 }

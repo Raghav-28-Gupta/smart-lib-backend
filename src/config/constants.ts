@@ -31,6 +31,15 @@ export const TIME_SLOTS = [
 // here, in one place, once the team decides on a real rate.
 export const FINE_PER_DAY_INR = 10
 
+// [ARBITRARY — flagged, not yet a team decision] Same status as
+// FINE_PER_DAY_INR above: a concrete placeholder so the reliability system is
+// testable, not a value the team has actually agreed on. Applied per
+// on-time booking check-in, capped at 100 (see reliabilityService.ts).
+// No-show detection isn't implemented in this phase (no scheduler exists to
+// detect a missed grace window yet), so there's currently no negative
+// trigger — only this positive one.
+export const RELIABILITY_ONTIME_BOOKING_BONUS = 2
+
 // Same validate-at-startup pattern as lib/prisma.ts's DATABASE_URL check —
 // fail loudly at boot rather than the first time a route tries to sign a token.
 const secret = process.env.JWT_SECRET

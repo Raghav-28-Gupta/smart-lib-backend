@@ -7,6 +7,7 @@ import { healthRouter } from './routes/health'
 import { loansRouter } from './routes/loans'
 import { reservationsRouter } from './routes/reservations'
 import { bookingsRouter } from './routes/bookings'
+import { profileRouter } from './routes/profile'
 import { resourcesRouter } from './routes/resources'
 
 // The Express app, separate from the listen() call in index.ts, so tests can
@@ -22,6 +23,7 @@ app.use(loansRouter)
 app.use(reservationsRouter)
 app.use(resourcesRouter)
 app.use(bookingsRouter)
+app.use(profileRouter)
 
 // More route modules land here as later tasks add them — each router
 // declares its own full paths (e.g. authRouter's '/auth/register'), so

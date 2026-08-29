@@ -1,0 +1,22 @@
+{
+  "worktree": {
+    "sparsePaths": [
+      ".claude",
+      "backend",
+      "ai-backend"
+    ],
+    "symlinkDirectories": [
+      "node_modules"
+    ]
+  },
+  "permissions": {
+    "additionalDirectories": [
+      "../ai-backend"
+    ],
+    "deny": [
+      "Read(./**/dist/**)",
+      "Read(./**/src/generated/**)",
+      "Read(./**/node_modules/**)"
+    ]
+  }
+}
