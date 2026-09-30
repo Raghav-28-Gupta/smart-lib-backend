@@ -1,7 +1,7 @@
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import { JWT_EXPIRES_IN, JWT_SECRET } from '../config/constants'
-import type { User } from '../generated/prisma/client'
+import type { Role, User } from '../generated/prisma/client'
 import { UnauthorizedError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
 
@@ -12,13 +12,16 @@ export interface AppUserDto {
   name: string
   email: string
   roll: string
+  role: Role
 }
 
-// Matches the frontend's AppUser shape exactly (lib/features/auth/auth_repository.dart)
+// Matches the frontend's AppUser shape exactly (lib/models/app_user.dart)
 // — roll falls back to 'Pending' for accounts that don't have one set, same
-// as the mock repository's register() behavior.
+// as the mock repository's register() behavior. role is exposed so a client
+// can route admins to the admin console; it's already in the JWT, but the
+// token is opaque to the client and shouldn't have to be decoded to read it.
 export function toAppUser(user: User): AppUserDto {
-  return { id: user.id, name: user.name, email: user.email, roll: user.roll ?? 'Pending' }
+  return { id: user.id, name: user.name, email: user.email, roll: user.roll ?? 'Pending', role: user.role }
 }
 
 function signToken(user: User): string {
