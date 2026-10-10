@@ -12,10 +12,13 @@ export interface BookDto {
   publishedYear: number | null
   totalCopies: number
   availableCopies: number
+  // Of availableCopies, how many are earmarked for a waitlisted student's live
+  // claim. They're on the shelf, but only the claimant can borrow them.
+  heldCopies: number
   waitlistCount: number
 }
 
-function toBookDto(book: Book, availableCopies: number, waitlistCount: number): BookDto {
+function toBookDto(book: Book, availableCopies: number, heldCopies: number, waitlistCount: number): BookDto {
   return {
     id: book.id,
     isbn: book.isbn,
@@ -26,6 +29,7 @@ function toBookDto(book: Book, availableCopies: number, waitlistCount: number): 
     publishedYear: book.publishedYear,
     totalCopies: book.totalCopies,
     availableCopies,
+    heldCopies,
     waitlistCount,
   }
 }
@@ -38,10 +42,19 @@ async function attachComputedCounts(books: Book[]): Promise<BookDto[]> {
   if (books.length === 0) return []
 
   const bookIds = books.map((b) => b.id)
-  const [availableGroups, waitlistGroups] = await Promise.all([
+  const now = new Date()
+  const [availableGroups, heldGroups, waitlistGroups] = await Promise.all([
     prisma.bookCopy.groupBy({
       by: ['bookId'],
       where: { bookId: { in: bookIds }, status: 'available' },
+      _count: true,
+    }),
+    // Counted, not rebalanced: a read shouldn't write. A claim past its
+    // expiry is excluded here and expired for real on the next write path
+    // (borrow, join, return), which runs rebalanceClaims.
+    prisma.reservation.groupBy({
+      by: ['bookId'],
+      where: { bookId: { in: bookIds }, status: 'fulfilled', claimExpiresAt: { gt: now } },
       _count: true,
     }),
     prisma.reservation.groupBy({
@@ -51,9 +64,12 @@ async function attachComputedCounts(books: Book[]): Promise<BookDto[]> {
     }),
   ])
   const availableMap = new Map(availableGroups.map((g) => [g.bookId, g._count]))
+  const heldMap = new Map(heldGroups.map((g) => [g.bookId, g._count]))
   const waitlistMap = new Map(waitlistGroups.map((g) => [g.bookId, g._count]))
 
-  return books.map((b) => toBookDto(b, availableMap.get(b.id) ?? 0, waitlistMap.get(b.id) ?? 0))
+  return books.map((b) =>
+    toBookDto(b, availableMap.get(b.id) ?? 0, heldMap.get(b.id) ?? 0, waitlistMap.get(b.id) ?? 0),
+  )
 }
 
 export async function searchBooks(input: { q?: string; genre?: string }): Promise<BookDto[]> {
@@ -95,9 +111,7 @@ export async function getBookById(id: string): Promise<BookDto> {
   const book = await prisma.book.findUnique({ where: { id } })
   if (!book) throw new NotFoundError('Book')
 
-  const [availableCopies, waitlistCount] = await Promise.all([
-    prisma.bookCopy.count({ where: { bookId: id, status: 'available' } }),
-    prisma.reservation.count({ where: { bookId: id, status: 'waiting' } }),
-  ])
-  return toBookDto(book, availableCopies, waitlistCount)
+  // Same counting as search, so the two can't disagree about a book.
+  const [dto] = await attachComputedCounts([book])
+  return dto
 }

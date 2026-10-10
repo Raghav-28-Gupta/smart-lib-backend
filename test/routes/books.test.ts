@@ -131,3 +131,43 @@ describe('GET /books/:id', () => {
     expect(res.status).toBe(404)
   })
 })
+
+// A copy earmarked for a waitlisted student's claim is still 'available' on
+// the shelf, but nobody else can borrow it. Without this count, clients show
+// a Borrow button the server will refuse, and hide Join Waitlist.
+describe('heldCopies', () => {
+  beforeEach(resetDb)
+
+  async function claimFor(bookId: string, claimExpiresAt: Date) {
+    const claimant = await prisma.user.create({
+      data: { name: 'Claimant', email: `claimant-${Math.random()}@test.com`, passwordHash: 'x' },
+    })
+    await prisma.reservation.create({ data: { userId: claimant.id, bookId, status: 'fulfilled', claimExpiresAt } })
+  }
+
+  it('counts copies held for a live claim', async () => {
+    const book = await seedBook({ totalCopies: 2, availableCopies: 1 })
+    await claimFor(book.id, new Date(Date.now() + 60_000))
+
+    const res = await request(app).get(`/books/${book.id}`)
+    expect(res.body).toMatchObject({ availableCopies: 1, heldCopies: 1 })
+  })
+
+  it('does not count a claim that has run out', async () => {
+    const book = await seedBook({ totalCopies: 2, availableCopies: 1 })
+    await claimFor(book.id, new Date(Date.now() - 1000))
+
+    const res = await request(app).get(`/books/${book.id}`)
+    expect(res.body.heldCopies).toBe(0)
+  })
+
+  it('is reported by search too, and is 0 when nothing is held', async () => {
+    const held = await seedBook({ title: 'Clean Code', totalCopies: 1, availableCopies: 1 })
+    await seedBook({ title: 'Design Patterns', totalCopies: 1, availableCopies: 1 })
+    await claimFor(held.id, new Date(Date.now() + 60_000))
+
+    const res = await request(app).get('/books/search')
+    const byTitle = Object.fromEntries(res.body.map((b: { title: string; heldCopies: number }) => [b.title, b.heldCopies]))
+    expect(byTitle).toEqual({ 'Clean Code': 1, 'Design Patterns': 0 })
+  })
+})

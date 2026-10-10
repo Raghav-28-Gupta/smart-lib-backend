@@ -111,7 +111,7 @@ than assuming it from the application logic alone.
 | POST | `/auth/login` | — | Get a JWT |
 | GET | `/auth/me` | ✓ | Current user |
 | GET | `/books/search?q=&genre=` | — | Catalog search |
-| GET | `/books/:id` | — | Book detail, with computed `availableCopies`/`waitlistCount` |
+| GET | `/books/:id` | — | Book detail, with computed `availableCopies`/`heldCopies`/`waitlistCount` |
 | POST | `/loans` | ✓ | Borrow a book (`{ bookId }`) |
 | GET | `/loans/me` | ✓ | Active loans, with computed fine/renewal/overdue fields |
 | POST | `/loans/:id/renew` | ✓ | Renew (blocked by renewal cap or an active waitlist) |
@@ -147,7 +147,9 @@ degrades gracefully to its fallback when it isn't.
 
 Most list/detail endpoints return **normalized fields alongside computed
 ones** rather than one or the other — e.g. a book carries its raw
-`totalCopies` next to the computed `availableCopies`/`waitlistCount`; a loan
+`totalCopies` next to the computed `availableCopies`/`heldCopies`/`waitlistCount`
+(`heldCopies` = shelf copies earmarked for a waitlisted student's live claim,
+which only that student may borrow); a loan
 carries the raw Prisma `status` next to the frontend-facing `frontendStatus`
 (`normal`/`overdue`). Nothing here runs on a schedule — grace-window expiry,
 overdue status, and waitlist-claim expiry are all computed lazily, at read
