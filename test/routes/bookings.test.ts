@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken'
 import request from 'supertest'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { app } from '../../src/app'
 import { GRACE_PERIOD_MINUTES, JWT_SECRET } from '../../src/config/constants'
 import { prisma } from '../../src/lib/prisma'
@@ -302,5 +302,95 @@ describe('GET /bookings/me', () => {
     const res = await request(app).get('/bookings/me').set('Authorization', `Bearer ${token}`)
     expect(res.body[0].frontendStatus).toBe('released')
     expect(res.body[0].status).toBe('booked') // raw DB status is untouched -- no scheduler in this phase
+  })
+})
+
+describe('POST /bookings conflict alternatives, relative to now', () => {
+  beforeEach(resetDb)
+  afterEach(() => vi.useRealTimers())
+
+  // Only Date is faked: Prisma, pg and supertest keep their real timers.
+  function at(y: number, m: number, d: number, h: number, min = 0) {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(y, m - 1, d, h, min, 0))
+  }
+
+  type Alt = { resourceId: string; timeSlot: string; startTime: string }
+
+  it('never suggests a window that has already started', async () => {
+    at(2027, 1, 10, 15, 30)
+    const { token: holder } = await seedUser()
+    const { token } = await seedUser()
+    const desk = await seedResource('seat', 'Desk 1')
+    await seedResource('seat', 'Desk 2')
+    await request(app).post('/bookings').set('Authorization', `Bearer ${holder}`)
+      .send({ resourceId: desk.id, startTime: iso(2027, 1, 10, 16), endTime: iso(2027, 1, 10, 17) })
+
+    const res = await request(app).post('/bookings').set('Authorization', `Bearer ${token}`)
+      .send({ resourceId: desk.id, startTime: iso(2027, 1, 10, 16), endTime: iso(2027, 1, 10, 17) })
+
+    expect(res.status).toBe(409)
+    const alternatives = res.body.details.alternatives as Alt[]
+    for (const alt of alternatives) {
+      expect(new Date(alt.startTime).getTime()).toBeGreaterThan(Date.now())
+    }
+    // Same desk: 9 AM-3 PM are past and 4 PM is the requested hour, so 5 PM.
+    expect(alternatives.find((a) => a.resourceId === desk.id)?.timeSlot).toBe('5:00 PM')
+  })
+
+  it('offers no other resource for a window that has already started', async () => {
+    // 3:10 PM: the 3:00 slot can still be booked (its check-in window is
+    // open), but suggesting it on another desk would hand over a booking
+    // with only minutes left to check in.
+    at(2027, 1, 10, 15, 10)
+    const { user: holder } = await seedUser()
+    const { token } = await seedUser()
+    const desk = await seedResource('seat', 'Desk 1')
+    const other = await seedResource('seat', 'Desk 2')
+    // Seeded directly: the current hour is already under way.
+    await prisma.resourceBooking.create({
+      data: { userId: holder.id, resourceId: desk.id, startTime: new Date(iso(2027, 1, 10, 15)), endTime: new Date(iso(2027, 1, 10, 16)) },
+    })
+
+    const res = await request(app).post('/bookings').set('Authorization', `Bearer ${token}`)
+      .send({ resourceId: desk.id, startTime: iso(2027, 1, 10, 15), endTime: iso(2027, 1, 10, 16) })
+
+    expect(res.status).toBe(409)
+    const alternatives = res.body.details.alternatives as Alt[]
+    expect(alternatives.some((a) => a.resourceId === other.id)).toBe(false)
+    expect(alternatives.find((a) => a.resourceId === desk.id)?.timeSlot).toBe('4:00 PM')
+  })
+})
+
+describe('POST /bookings for a slot that is already under way', () => {
+  beforeEach(resetDb)
+  afterEach(() => vi.useRealTimers())
+
+  function at(y: number, m: number, d: number, h: number, min = 0) {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(y, m - 1, d, h, min, 0))
+  }
+
+  it('refuses a booking whose check-in window has already closed', async () => {
+    // 3:00 PM's window closed at 3:15; at 3:30 the booking could only ever be
+    // released, never used.
+    at(2027, 1, 10, 15, 30)
+    const { token } = await seedUser()
+    const desk = await seedResource()
+    const res = await request(app).post('/bookings').set('Authorization', `Bearer ${token}`)
+      .send({ resourceId: desk.id, startTime: iso(2027, 1, 10, 15), endTime: iso(2027, 1, 10, 16) })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('That time slot has already passed. Pick a later one.')
+    expect(await prisma.resourceBooking.count()).toBe(0)
+  })
+
+  it('still accepts the current slot while it can be checked into', async () => {
+    at(2027, 1, 10, 15, 10)
+    const { token } = await seedUser()
+    const desk = await seedResource()
+    const res = await request(app).post('/bookings').set('Authorization', `Bearer ${token}`)
+      .send({ resourceId: desk.id, startTime: iso(2027, 1, 10, 15), endTime: iso(2027, 1, 10, 16) })
+    expect(res.status).toBe(201)
+    expect(res.body.frontendStatus).toBe('inWindow')
   })
 })

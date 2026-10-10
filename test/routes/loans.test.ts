@@ -58,6 +58,9 @@ describe('POST /loans (borrow)', () => {
     const book = await seedBookWithCopies(0, 2)
     const res = await request(app).post('/loans').set('Authorization', `Bearer ${token}`).send({ bookId: book.id })
     expect(res.status).toBe(409)
+    // Not the waitlist-reservation message: no copy is reserved, there are
+    // simply none left.
+    expect(res.body.error).toBe('No available copies right now.')
   })
 
   it('returns 409 if the user already has this book on loan', async () => {

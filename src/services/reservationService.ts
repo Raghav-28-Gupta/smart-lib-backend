@@ -134,6 +134,11 @@ export async function assertNotReservedForAnother(userId: string, bookId: string
     prisma.bookCopy.count({ where: { bookId, status: 'available' } }),
     prisma.reservation.count({ where: { bookId, status: 'fulfilled', userId: { not: userId } } }),
   ])
+  // Checked first: with no copies at all, nothing is "reserved" -- there are
+  // simply none left, and the message should say so.
+  if (availableCopies === 0) {
+    throw new ConflictError('No available copies right now.')
+  }
   if (availableCopies - claimsByOthers <= 0) {
     throw new ConflictError('All available copies are reserved for waitlisted students right now.')
   }

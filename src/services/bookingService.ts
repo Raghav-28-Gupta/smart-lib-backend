@@ -1,4 +1,4 @@
-import { RELIABILITY_ONTIME_BOOKING_BONUS, TIME_SLOTS } from '../config/constants'
+import { GRACE_PERIOD_MINUTES, RELIABILITY_ONTIME_BOOKING_BONUS, TIME_SLOTS } from '../config/constants'
 import { Prisma } from '../generated/prisma/client'
 import type { ResourceBooking, ResourceType } from '../generated/prisma/client'
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/httpError'
@@ -85,10 +85,14 @@ function toBookingDto(booking: ResourceBooking & { resource: { name: string; typ
 // free for the exact requested window. Assumes 1-hour slot granularity for
 // the same-resource suggestion (the frontend's kTimeSlots vocabulary); a
 // non-hour-long request just skips that half and still tries the other.
+// Never suggests a window that has already started: on today's date the
+// earliest free slots are usually in the past, and taking one would create a
+// booking released by the grace period almost at once.
 async function findAlternatives(
   resource: { id: string; type: ResourceType; name: string },
   startTime: Date,
   endTime: Date,
+  now: Date,
 ): Promise<BookingAlternative[]> {
   const alternatives: BookingAlternative[] = []
   const { year, month, day } = localDateParts(startTime)
@@ -105,6 +109,7 @@ async function findAlternatives(
     const freeSlot = TIME_SLOTS.find(({ hour }) => {
       if (hour === requestedHour) return false
       const slotStart = new Date(year, month - 1, day, hour, 0, 0)
+      if (slotStart <= now) return false
       const slotEnd = new Date(year, month - 1, day, hour + 1, 0, 0)
       return !sameResourceBookings.some((b) => b.startTime < slotEnd && b.endTime > slotStart)
     })
@@ -122,7 +127,8 @@ async function findAlternatives(
     }
   }
 
-  const otherResources = await prisma.resource.findMany({
+  // Same window elsewhere is only useful if the window is still ahead.
+  const otherResources = startTime <= now ? [] : await prisma.resource.findMany({
     where: { type: resource.type, id: { not: resource.id } },
     orderBy: { name: 'asc' },
   })
@@ -150,10 +156,17 @@ async function findAlternatives(
 export async function createBooking(userId: string, resourceId: string, startTime: Date, endTime: Date): Promise<BookingDto> {
   if (endTime <= startTime) throw new ValidationError('endTime must be after startTime.')
 
+  // A slot whose check-in window has closed can only ever be released, never
+  // used. The current slot stays bookable while it can still be checked into
+  // -- the same rule the client uses to grey out past slots.
+  const now = new Date()
+  if (now.getTime() > startTime.getTime() + GRACE_PERIOD_MINUTES * 60 * 1000) {
+    throw new ValidationError('That time slot has already passed. Pick a later one.')
+  }
+
   const resource = await prisma.resource.findUnique({ where: { id: resourceId } })
   if (!resource) throw new NotFoundError('Resource')
 
-  const now = new Date()
   try {
     const booking = await prisma.resourceBooking.create({
       data: { userId, resourceId, startTime, endTime },
@@ -162,7 +175,7 @@ export async function createBooking(userId: string, resourceId: string, startTim
     return toBookingDto(booking, now)
   } catch (e) {
     if (isExclusionViolation(e)) {
-      const alternatives = await findAlternatives(resource, startTime, endTime)
+      const alternatives = await findAlternatives(resource, startTime, endTime, now)
       throw new ConflictError('This resource is already booked for that time.', { alternatives })
     }
     throw e
