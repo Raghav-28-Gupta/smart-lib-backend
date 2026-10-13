@@ -5,7 +5,7 @@ talks to; it calls the FastAPI service internally for anything ML-related.
 
 ## Prerequisites
 
-- Node.js 18+ (developed on v22)
+- Node.js 22 (pinned in `package.json` `engines`; Render uses the same)
 - A Postgres database — Neon, `docker-compose up` from the repo root, or a local install
 - `btree_gist` available (Neon has it; the migration installs it with `CREATE EXTENSION IF NOT EXISTS`)
 
@@ -14,11 +14,11 @@ talks to; it calls the FastAPI service internally for anything ML-related.
 ```bash
 cd backend
 npm install                     # also runs `prisma generate` via postinstall
-cp ../.env.example .env         # then fill in DATABASE_URL, TEST_DATABASE_URL, JWT_SECRET
+cp .env.example .env            # then fill in DATABASE_URL, TEST_DATABASE_URL, JWT_SECRET
 ```
 
-See `.env.example` at the repo root for what each variable does and why. Two
-things worth calling out up front:
+See `.env.example` for what each variable does and why. Two things worth
+calling out up front:
 
 > **Direct vs. pooled Neon URLs.** Use the **direct / unpooled** endpoint (the
 > host *without* `-pooler`) for `DATABASE_URL` and `TEST_DATABASE_URL`.
@@ -103,6 +103,66 @@ the identical resource and time slot and asserts that exactly one succeeds —
 proving the `EXCLUDE` constraint holds under real concurrent load, rather
 than assuming it from the application logic alone.
 
+## Deploy
+
+Production runs on **Render** as a Node web service on the `main` branch, in
+Singapore next to the Neon database, configured in Render's dashboard.
+
+**On every push to `main`:** GitHub Actions (`.github/workflows/ci.yml`) runs
+the tests against a throwaway Postgres. It also runs the build and start
+commands below against an empty database and checks the server answers.
+With auto-deploy set to "After CI checks pass", Render deploys the commit
+only once both pass. Its build applies any pending migrations
+(`prisma migrate deploy`); on redeploy, the old server finishes in-flight
+requests before exiting.
+
+| Setting | Value |
+|---|---|
+| Runtime / branch / region | Node / `main` / Singapore |
+| Build command | `npm ci --include=dev && npm run build && npx prisma migrate deploy` |
+| Start command | `npm start` |
+| Health check path | `/health` |
+| Auto-deploy | After CI checks pass |
+
+The build needs `--include=dev`: with `NODE_ENV=production`, npm would skip
+TypeScript, a dev dependency. Node 22 comes from `engines` in `package.json`.
+
+| Variable | Where it comes from |
+|---|---|
+| `NODE_ENV` | `production` |
+| `DATABASE_URL` | You, once: the production Neon branch's **direct** connection string |
+| `JWT_SECRET` | You, once: a long random string (generator command in `.env.example`). Changing it logs everyone out |
+| `CORS_ORIGINS` | The web app's origin: `https://raghav-28-gupta.github.io` |
+| `PORT` | Set by Render |
+| `AI_BACKEND_URL` | Unset: the AI service isn't deployed, so recommendations fall back to what's popular |
+
+### First-time setup
+
+1. **Neon:** create a branch named `production` from your main branch
+   (Branches → New branch, with data). Copy its **direct** connection string
+   (not `-pooler`), with `sslmode=verify-full`. Don't create it schema-only:
+   that leaves out Prisma's migration history, and the first deploy would try
+   to recreate tables that already exist.
+2. **Render:** New → Web Service → this repository, with the settings and
+   variables above.
+3. **Demo data**, once, from your machine. This resets the demo accounts on the
+   production branch:
+   ```powershell
+   $env:DATABASE_URL = '<production direct connection string>'   # this terminal only
+   npm run seed
+   Remove-Item Env:DATABASE_URL
+   ```
+   `dotenv` never overrides a variable that's already set, so this beats
+   `backend/.env`.
+4. **Check** `https://<your-service>.onrender.com/health/db`. It should report
+   `ok`.
+
+**Free plan:** the service sleeps after 15 minutes without requests, so the
+next request takes about a minute while it wakes.
+
+**Running the production build locally:** `npm run build && npm start`
+(compiled JavaScript, as Render runs it, rather than `npm run dev`).
+
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
@@ -165,6 +225,11 @@ This project is on Prisma 7, which differs from most tutorials (written for v6):
 - The datasource URL lives in `prisma.config.ts`, not in `schema.prisma`.
 - `.env` is no longer auto-loaded — `prisma.config.ts` imports `dotenv/config`.
 - `PrismaClient` requires a driver adapter; we use `@prisma/adapter-pg`.
+- The generator is pinned to `moduleFormat = "cjs"` and
+  `importFileExtension = "js"`. Left to infer, it emits ES-module code that
+  imports `./x.ts`. `tsx` and vitest tolerate that, but the compiled server
+  (`node dist/index.js`, production) crashes on it at startup. CI builds and
+  starts the compiled server for exactly this reason.
 - An unmodeled constraint violation (like the `EXCLUDE` constraint above)
   surfaces as a generic `PrismaClientKnownRequestError` with code `P2039` —
   the real SQLSTATE only appears in the message text, not a structured field.

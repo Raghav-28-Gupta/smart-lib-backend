@@ -2,8 +2,14 @@
 // (no more node_modules/.prisma), and the datasource URL now lives in
 // prisma.config.ts rather than an env() call here.
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  // The backend compiles to CommonJS, and compiled output keeps import
+  // specifiers as written. Left to infer, the generator emits ES modules
+  // (import.meta.url) importing './x.ts' -- which tsx and vitest tolerate,
+  // but compiled `node dist/index.js` (production) crashes on at startup.
+  moduleFormat        = "cjs"
+  importFileExtension = "js"
 }
 
 datasource db {

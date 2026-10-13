@@ -14,7 +14,15 @@ import { resourcesRouter } from './routes/resources'
 // The Express app, separate from the listen() call in index.ts, so tests can
 // mount it directly with supertest without binding a real port.
 export const app = express()
-app.use(cors())
+
+// Browsers enforce CORS; the Android and Windows apps send no Origin and are
+// unaffected. CORS_ORIGINS is a comma-separated allowlist (production: the
+// web app's origin). Unset or empty allows any origin, for local development.
+const allowedOrigins = (process.env.CORS_ORIGINS ?? '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean)
+app.use(cors(allowedOrigins.length > 0 ? { origin: allowedOrigins } : {}))
 app.use(express.json())
 
 app.use(healthRouter)

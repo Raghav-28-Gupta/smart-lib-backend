@@ -3,7 +3,7 @@
 The Core Backend owns authentication, book lending, physical resource scheduling (seats & rooms), overdue fine calculations, waitlists, and user reliability scoring. It is the **single public entrypoint** for the Flutter client and communicates internally with the FastAPI AI backend for predictions and recommendations.
 
 ## Tech Stack
-- **Runtime**: Node.js 18+ (tested on v22)
+- **Runtime**: Node.js 22 (`engines: 22.x`, matching Render)
 - **Framework**: Express 5 + TypeScript
 - **ORM / Database**: Prisma 7 + PostgreSQL (Neon) with `@prisma/adapter-pg`
 - **Validation**: Zod
@@ -67,6 +67,8 @@ This project uses **Prisma 7**, which has specific configuration patterns:
 - **Generator**: Uses `prisma-client` (not `prisma-client-js`) and emits to `src/generated/prisma` (which is gitignored).
 - **Datasource Configuration**: Datasource URL is defined in `prisma.config.ts` (importing `dotenv/config`), not inside `schema.prisma`.
 - **Driver Adapter**: Uses `@prisma/adapter-pg` with a pooled `pg` client in `src/lib/prisma.ts`.
+- **Module format**: The generator is pinned to `moduleFormat = "cjs"` + `importFileExtension = "js"`. Never remove them: dev (`tsx`) and tests (vitest) pass without them, but the compiled production server crashes at startup. Anything that changes how the app compiles or starts must be checked by building and *running* the compiled server (`npm run build && npm start`), not just `npm test`.
+- **Deployment**: Render, Node runtime, branch `main`, configured in Render's dashboard (settings listed in README "Deploy"; keep them and `ci.yml`'s `start` job in sync). The build command runs `prisma migrate deploy`, so new migrations must be safe to apply to live data. Build with `npm ci --include=dev` (`NODE_ENV=production` would skip TypeScript). `CORS_ORIGINS` restricts browser origins in production.
 
 ---
 

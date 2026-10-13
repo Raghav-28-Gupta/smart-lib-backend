@@ -1,0 +1,89 @@
+# Tests every push and pull request against a throwaway Postgres, and checks
+# the server builds and starts the way Render runs it. With Render's
+# auto-deploy set to "After CI checks pass", a failing commit never deploys.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # The official image ships btree_gist, which the booking constraint needs.
+        image: postgres:16
+        env:
+          POSTGRES_USER: smartlib
+          POSTGRES_PASSWORD: smartlib
+          POSTGRES_DB: smartlib_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U smartlib"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # A disposable CI database; nothing here is a real credential.
+      DATABASE_URL: postgresql://smartlib:smartlib@localhost:5432/smartlib_test
+      TEST_DATABASE_URL: postgresql://smartlib:smartlib@localhost:5432/smartlib_test
+      JWT_SECRET: ci-only-not-a-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  # Runs Render's build and start commands (README "Deploy") against an empty
+  # database. The compiled server can fail at startup where tsx and vitest
+  # succeed -- it once did, on Prisma's module format -- so passing tests
+  # alone prove little about a deploy.
+  start:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: smartlib
+          POSTGRES_PASSWORD: smartlib
+          POSTGRES_DB: smartlib
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U smartlib"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Same as Render: production mode, so the build must cope with npm
+      # skipping dev dependencies unless told otherwise.
+      NODE_ENV: production
+      DATABASE_URL: postgresql://smartlib:smartlib@localhost:5432/smartlib
+      JWT_SECRET: ci-only-not-a-secret
+      PORT: 3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Build, as Render does (includes migrating the empty database)
+        run: npm ci --include=dev && npm run build && npx prisma migrate deploy
+      - name: Start, as Render does, and answer through the database
+        run: |
+          npm start > server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/health/db; then exit 0; fi
+            sleep 2
+          done
+          echo "::error::The server never became healthy"
+          cat server.log
+          exit 1

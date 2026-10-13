@@ -13,6 +13,7 @@
     "typecheck:seed": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution nodenext --esModuleInterop --strict --skipLibCheck --ignoreConfig prisma/seed.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "seed": "tsx prisma/seed.ts",
     "postinstall": "prisma generate",
@@ -23,6 +24,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": "22.x"
+  },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "^7.9.1",
