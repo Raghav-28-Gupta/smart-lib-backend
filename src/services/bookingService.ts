@@ -168,9 +168,23 @@ export async function createBooking(userId: string, resourceId: string, startTim
   if (!resource) throw new NotFoundError('Resource')
 
   try {
-    const booking = await prisma.resourceBooking.create({
-      data: { userId, resourceId, startTime, endTime },
-      include: { resource: { select: { name: true, type: true } } },
+    // The no_overlapping_bookings constraint is what guarantees no double
+    // booking. But when several requests insert overlapping rows at the same
+    // instant, Postgres can abort the losers with a deadlock (40P01) while they
+    // wait on each other's uncommitted rows, instead of the clean exclusion
+    // violation (23P01) -- a 500 here, and about a second of waiting per
+    // victim. Taking a per-resource lock first makes concurrent attempts for
+    // one resource queue up: each loser then sees the winner's committed row
+    // and fails fast with 23P01. Other resources are unaffected. The lock is
+    // released automatically at commit or rollback.
+    const booking = await prisma.$transaction(async (tx) => {
+      // $executeRaw, not $queryRaw: the function returns void, which Prisma
+      // cannot deserialize as a result column.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${resourceId}))`
+      return tx.resourceBooking.create({
+        data: { userId, resourceId, startTime, endTime },
+        include: { resource: { select: { name: true, type: true } } },
+      })
     })
     return toBookingDto(booking, now)
   } catch (e) {

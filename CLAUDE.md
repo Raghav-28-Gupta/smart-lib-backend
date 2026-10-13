@@ -95,6 +95,7 @@ To guarantee zero double-bookings at the database level, the `ResourceBooking` t
    ```bash
    npx prisma migrate dev
    ```
+4. **Keep the per-resource advisory lock in `createBooking`.** The constraint alone guarantees no double booking, but simultaneous inserts can make Postgres abort the losers with a deadlock (`40P01`, a 500 here) instead of `23P01`. This only reproduces on a low-latency database with warm connections (CI), never on Neon, so a green local `npm test` does not prove it. To check booking concurrency locally, run the suite against a Docker `postgres:16` (`TEST_DATABASE_URL=postgresql://...@localhost:5433/...`), as CI does.
 
 ---
 

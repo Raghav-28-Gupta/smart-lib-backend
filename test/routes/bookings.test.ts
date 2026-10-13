@@ -114,6 +114,33 @@ describe('POST /bookings', () => {
     const bookingsInDb = await prisma.resourceBooking.count({ where: { resourceId: resource.id, status: { in: ['booked', 'checked_in'] } } })
     expect(bookingsInDb).toBe(1)
   })
+
+  // Postgres can abort the losers of a simultaneous insert race with a
+  // deadlock (40P01) instead of the exclusion violation (23P01), and the API
+  // used to answer those with a 500. It needs warm connections to happen --
+  // a cold pool staggers the requests -- so the race is run repeatedly: up to
+  // 40 times, but no longer than 5 seconds once two rounds are done. A local
+  // database (CI) manages all 40 in about a second; a remote one is slower
+  // per round and can't reproduce the deadlock anyway, since its network
+  // latency staggers the requests.
+  it('answers every loser of repeated races with a 409, never an error', async () => {
+    const users = await Promise.all(Array.from({ length: 8 }, () => seedUser()))
+    const started = Date.now()
+
+    for (let round = 0; round < 40 && (round < 2 || Date.now() - started < 5_000); round++) {
+      const resource = await seedResource()
+      const results = await Promise.all(
+        users.map(({ token }) =>
+          request(app)
+            .post('/bookings')
+            .set('Authorization', `Bearer ${token}`)
+            .send({ resourceId: resource.id, startTime: iso(2027, 3, 1, 10), endTime: iso(2027, 3, 1, 11) }),
+        ),
+      )
+      const statuses = results.map((r) => r.status).sort()
+      expect(statuses, `round ${round}`).toEqual([201, 409, 409, 409, 409, 409, 409, 409])
+    }
+  }, 60_000)
 })
 
 describe('POST /bookings/:id/checkin', () => {

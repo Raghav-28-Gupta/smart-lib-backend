@@ -60,6 +60,13 @@ EXCLUDE USING gist (
 and turns it into a 409 with alternative-slot suggestions — see the endpoint
 table below.
 
+The insert runs inside a transaction that first takes a per-resource advisory
+lock (`pg_advisory_xact_lock`). The constraint is still what guarantees
+correctness; the lock keeps simultaneous requests orderly. Without it,
+Postgres can abort the losers of an insert race with a deadlock (`40P01`),
+which the API would answer with a 500 and which costs about a second per
+loser, instead of the clean `23P01`.
+
 ## Seed data
 
 ```bash
@@ -101,7 +108,11 @@ matters most for `test/routes/bookings.test.ts`, which includes a genuine
 concurrency test: it fires several simultaneous `POST /bookings` requests for
 the identical resource and time slot and asserts that exactly one succeeds —
 proving the `EXCLUDE` constraint holds under real concurrent load, rather
-than assuming it from the application logic alone.
+than assuming it from the application logic alone. A second test repeats the
+race up to 40 times (at most about 5 seconds): the deadlock described under
+*Database migration* above only shows up against a local database with warm
+connections, such as CI's. Neon's network latency staggers the requests and
+hides it, so a green local run does not prove this case.
 
 ## Deploy
 
