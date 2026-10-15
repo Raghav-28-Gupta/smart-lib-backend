@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken'
 import { JWT_SECRET } from '../config/constants'
 import type { Role } from '../generated/prisma/client'
 import { ForbiddenError, UnauthorizedError } from '../lib/httpError'
+import { prisma } from '../lib/prisma'
 
 export interface AuthPayload {
   sub: string
@@ -32,9 +33,14 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 }
 
 // Must run after requireAuth in the chain — it reads req.user, which only
-// requireAuth sets. Reserved for the /admin/metrics/* routes (Phase 4).
-export function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  if (req.user?.role !== 'admin') {
+// requireAuth sets. Guards every /admin route. It checks the stored role, not
+// the token's: a token outlives a demotion or deletion by up to its 7 days.
+export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const user = req.user && (await prisma.user.findUnique({ where: { id: req.user.sub }, select: { role: true } }))
+  if (!user) {
+    throw new UnauthorizedError('This account no longer exists')
+  }
+  if (user.role !== 'admin') {
     throw new ForbiddenError('Admin access required')
   }
   next()

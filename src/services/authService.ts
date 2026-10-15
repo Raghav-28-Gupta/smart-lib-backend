@@ -5,7 +5,7 @@ import type { Role, User } from '../generated/prisma/client'
 import { UnauthorizedError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
 
-const BCRYPT_ROUNDS = 10
+export const BCRYPT_ROUNDS = 10
 
 export interface AppUserDto {
   id: string

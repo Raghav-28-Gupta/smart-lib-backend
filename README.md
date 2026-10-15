@@ -82,9 +82,40 @@ blocked from renewal by a waitlist, a degraded reliability score) so her own
 screens aren't empty on first login. Details and the specific scope decisions
 are documented in the comment block at the top of `prisma/seed.ts`.
 
-Safe to re-run — it deletes only the rows it owns (matched by the fixed seed
-ids/emails) before recreating them, so it won't touch data created through
-the live API separately.
+It also generates four weeks of past activity, ending yesterday, for the six
+"Seed Student" accounts: about 600-900 bookings (weekday afternoons busiest,
+about 1 in 5 missed) and 40-60 loans. The admin console's Dashboard reads it.
+The same seed (`HISTORY_SEED` in `prisma/history.ts`) gives the same history
+every time, shifted to end yesterday. The demo student's account gets none of
+it, so the student app looks exactly as before.
+
+Re-running it resets the seeded books (b1-b12), resources (s1-r3) and seed
+accounts, then recreates them. The reset includes every loan, booking and
+waitlist entry on those books and resources, including ones students made
+through the live app. Other books, resources and accounts are left alone.
+Against production, only re-run it if nothing there needs keeping.
+
+## Admin accounts
+
+The admin console (`../admin`) only lets in accounts with the admin role.
+Public registration never creates one, and the seed doesn't either, because
+the seed is also run against production. Create one per database:
+
+```bash
+npm run create-admin
+```
+
+It asks for a name, email and password (typed twice, not shown). If the email
+already belongs to an account, it asks before making that account an admin and
+setting the new password; the account keeps its name.
+
+For production, point this terminal only at the production database first:
+
+```powershell
+$env:DATABASE_URL = '<production direct connection string>'
+npm run create-admin
+Remove-Item Env:DATABASE_URL
+```
 
 ## Run
 
@@ -141,9 +172,10 @@ TypeScript, a dev dependency. Node 22 comes from `engines` in `package.json`.
 | Variable | Where it comes from |
 |---|---|
 | `NODE_ENV` | `production` |
+| `TZ` | `Asia/Kolkata`. Days and booking slots use the server's time zone; without it Render uses UTC and every slot is off by 5½ hours |
 | `DATABASE_URL` | You, once: the production Neon branch's **direct** connection string |
 | `JWT_SECRET` | You, once: a long random string (generator command in `.env.example`). Changing it logs everyone out |
-| `CORS_ORIGINS` | The web app's origin: `https://raghav-28-gupta.github.io` |
+| `CORS_ORIGINS` | Browser origins, comma-separated: the student web app `https://raghav-28-gupta.github.io` and the admin console's Vercel origin |
 | `PORT` | Set by Render |
 | `AI_BACKEND_URL` | Unset: the AI service isn't deployed, so recommendations fall back to what's popular |
 
@@ -197,9 +229,19 @@ next request takes about a minute while it wakes.
 | POST | `/bookings/:id/cancel` | ✓ | Cancel before check-in |
 | GET | `/profile/reliability` | ✓ | Reliability score, tier, and recent history |
 | GET | `/recommendations/me` | ✓ | AI-backend recommendations, falling back to "popular right now" |
+| GET | `/admin/metrics/utilization` | admin | Booked share of open hours: today, the same weekday last week, and seats/rooms for the last 7 days |
+| GET | `/admin/metrics/circulation` | admin | Borrows, returns and top 5 titles over the last 7 days |
+| GET | `/admin/metrics/overdue` | admin | Loans overdue now and 24 hours ago |
+| GET | `/admin/metrics/demand` | admin | Booked share and busiest slot per area over the last 7 days |
 | GET | `/health` | — | Is this service up |
 | GET | `/health/db` | — | Proves the Node → Postgres link |
 | GET | `/health/ai` | — | Proves the Node → FastAPI link |
+
+`admin` routes need a token for an account with the admin role: 401 without a
+token, 403 for a student. Admin accounts are created with `npm run create-admin`
+(see *Admin accounts*). The metric definitions live in
+`src/services/adminMetrics.ts`, and in the design spec in the admin console's
+repository (`smart-lib-admin`, `docs/2026-10-15-admin-console-slice1-design.md`).
 
 Routes marked `✓` require `Authorization: Bearer <token>` from `/auth/login`
 or `/auth/register`.

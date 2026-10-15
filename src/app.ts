@@ -1,6 +1,7 @@
 import cors from 'cors'
 import express from 'express'
 import { errorHandler } from './middleware/errorHandler'
+import { adminRouter } from './routes/admin'
 import { authRouter } from './routes/auth'
 import { booksRouter } from './routes/books'
 import { healthRouter } from './routes/health'
@@ -34,6 +35,7 @@ app.use(resourcesRouter)
 app.use(bookingsRouter)
 app.use(profileRouter)
 app.use(recommendationsRouter)
+app.use(adminRouter)
 
 // More route modules land here as later tasks add them — each router
 // declares its own full paths (e.g. authRouter's '/auth/register'), so

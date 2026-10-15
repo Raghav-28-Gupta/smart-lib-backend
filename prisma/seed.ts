@@ -3,10 +3,15 @@
 // and screenshotted against (see book_repository.dart, booking_repository.dart,
 // auth_repository.dart, loan_repository.dart, profile_repository.dart).
 //
-// Safe to re-run: deletes only the rows this script owns (matched by the
-// fixed seed ids/emails below) before recreating them, so it won't touch
-// anything a developer created through the live API separately. It does
-// assume a migrated, otherwise-empty-of-these-ids database.
+// Re-runnable: it resets the seeded books, resources and seed accounts (the
+// fixed ids/emails below) before recreating them. The reset takes every loan,
+// booking and waitlist entry on those books and resources with it, including
+// ones made through the live API; other books, resources and accounts are left
+// alone. It assumes a migrated database.
+//
+// It also generates four weeks of past bookings and loans for the six seed
+// students (prisma/history.ts), ending yesterday, so the admin Dashboard has
+// history to show. The demo student's account gets none of it.
 //
 // Deliberately NOT reproduced: the booking mock's own pre-seeded bookings for
 // its demo user reference a resource ("Desk 4") that doesn't exist among the
@@ -18,6 +23,7 @@ import bcrypt from 'bcrypt'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { TIME_SLOTS } from '../src/config/constants'
 import { PrismaClient } from '../src/generated/prisma/client'
+import { generateHistory, HISTORY_SEED, mulberry32 } from './history'
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
 const prisma = new PrismaClient({ adapter })
@@ -50,9 +56,9 @@ const RESOURCES = [
   { id: 's2', type: 'seat' as const, name: 'Reading Room A · Desk 14', location: 'Reading Room A', capacity: 1, taken: ['9:00 AM', '10:00 AM', '3:00 PM', '4:00 PM'] },
   { id: 's3', type: 'seat' as const, name: 'Silent Zone · Desk 3', location: 'Silent Zone', capacity: 1, taken: [] as string[] },
   { id: 's4', type: 'seat' as const, name: 'Silent Zone · Desk 7', location: 'Silent Zone', capacity: 1, taken: ['1:00 PM', '2:00 PM', '6:00 PM'] },
-  { id: 'r1', type: 'room' as const, name: 'Group Room 201 · 4 seats', location: null, capacity: 4, taken: ['2:00 PM', '3:00 PM'] },
-  { id: 'r2', type: 'room' as const, name: 'Group Room 202 · 6 seats', location: null, capacity: 6, taken: TIME_SLOTS.map((s) => s.label) },
-  { id: 'r3', type: 'room' as const, name: 'Discussion Pod 1 · 2 seats', location: null, capacity: 2, taken: ['10:00 AM', '11:00 AM'] },
+  { id: 'r1', type: 'room' as const, name: 'Group Room 201 · 4 seats', location: 'Group study rooms', capacity: 4, taken: ['2:00 PM', '3:00 PM'] },
+  { id: 'r2', type: 'room' as const, name: 'Group Room 202 · 6 seats', location: 'Group study rooms', capacity: 6, taken: TIME_SLOTS.map((s) => s.label) },
+  { id: 'r3', type: 'room' as const, name: 'Discussion Pod 1 · 2 seats', location: 'Discussion pods', capacity: 2, taken: ['10:00 AM', '11:00 AM'] },
 ]
 
 // Mirrors loan_repository.dart's MockLoanRepository exactly, including
@@ -63,6 +69,10 @@ const DEMO_LOANS = [
   { bookId: 'b4', dueInDays: -3 }, // overdue
   { bookId: 'b8', dueInDays: 5 }, // waitlisted -- blocks renewal
 ] as const
+
+// Relative borrow weights for the generated history, so a few titles stand
+// out on the admin Dashboard. Books not listed weigh 1.
+const BOOK_POPULARITY: Record<string, number> = { b1: 6, b8: 5, b3: 4, b2: 3, b4: 3, b12: 3, b5: 2, b7: 2, b9: 2, b11: 2 }
 
 async function deleteExistingSeedData() {
   const existingUsers = await prisma.user.findMany({ where: { email: { in: SEED_USER_EMAILS } }, select: { id: true } })
@@ -97,6 +107,7 @@ async function main() {
     return () => seedStudents[i++ % seedStudents.length]
   })()
 
+  const copiesByBook: { id: string; copyIds: string[]; borrowedCopyIds: string[] }[] = []
   for (const b of BOOKS) {
     await prisma.book.create({
       data: { id: b.id, isbn: `978-seed-${b.id}`, title: b.title, author: b.author, genre: b.genre, description: b.description, totalCopies: b.totalCopies },
@@ -104,9 +115,13 @@ async function main() {
 
     const demoLoan = DEMO_LOANS.find((l) => l.bookId === b.id)
     const borrowedCount = b.totalCopies - b.availableCopies
+    const copies = { id: b.id, copyIds: [] as string[], borrowedCopyIds: [] as string[] }
     for (let i = 0; i < b.totalCopies; i++) {
       const isBorrowed = i < borrowedCount
       const copy = await prisma.bookCopy.create({ data: { bookId: b.id, status: isBorrowed ? 'borrowed' : 'available' } })
+      copies.copyIds.push(copy.id)
+      // A borrowed copy with no loan behind it can carry one of the history's open loans.
+      if (isBorrowed && !(demoLoan && i === 0)) copies.borrowedCopyIds.push(copy.id)
       // The first borrowed copy of a book that's in DEMO_LOANS is the one
       // Aditi holds; any other borrowed copies are left without a Loan row
       // since the mock has no data on who else holds them.
@@ -116,6 +131,7 @@ async function main() {
         await prisma.loan.create({ data: { userId: demoUser.id, bookCopyId: copy.id, borrowedAt, dueAt } })
       }
     }
+    copiesByBook.push(copies)
 
     const waitlistCount = 'waitlistCount' in b ? b.waitlistCount : 0
     for (let i = 0; i < waitlistCount; i++) {
@@ -142,10 +158,21 @@ async function main() {
     }
   }
 
+  const history = generateHistory(today, mulberry32(HISTORY_SEED), {
+    studentIds: seedStudents.map((s) => s.id),
+    resources: RESOURCES.map((r) => ({ id: r.id, type: r.type })),
+    books: copiesByBook,
+    popularity: BOOK_POPULARITY,
+  })
+  await prisma.resourceBooking.createMany({ data: history.bookings })
+  await prisma.loan.createMany({ data: history.loans })
+
   // eslint-disable-next-line no-console
   console.log(`Seeded ${BOOKS.length} books, ${RESOURCES.length} resources, and ${1 + seedStudents.length} users.`)
   // eslint-disable-next-line no-console
   console.log(`Demo login: ${DEMO_EMAIL} / ${DEMO_PASSWORD}`)
+  // eslint-disable-next-line no-console
+  console.log(`Generated ${history.bookings.length} past bookings and ${history.loans.length} past loans for the seed students.`)
 }
 
 main()

@@ -16,6 +16,8 @@
     "migrate:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "seed": "tsx prisma/seed.ts",
+    "create-admin": "tsx scripts/create-admin.ts",
+    "typecheck:scripts": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution nodenext --esModuleInterop --strict --skipLibCheck --ignoreConfig scripts/create-admin.ts",
     "postinstall": "prisma generate",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -1,6 +1,10 @@
 import 'dotenv/config'
 import { app } from './app'
+import { timeZoneWarning } from './config/timezone'
 import { prisma } from './lib/prisma'
+
+const tzWarning = timeZoneWarning(process.env)
+if (tzWarning) console.warn(tzWarning)
 
 const PORT = process.env.PORT ?? 3000
 const server = app.listen(PORT, () => console.log(`Node backend running on port ${PORT}`))
