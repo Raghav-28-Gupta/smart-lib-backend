@@ -9,6 +9,8 @@ export const MAX_STREAM_MS = 15 * 60_000
 
 /** The parts of an Express response a stream uses (a fake in the unit tests). */
 export interface StreamResponse {
+  /** True once the connection is gone. A real response has it; the unit tests' fake sets it. */
+  readonly destroyed?: boolean
   status(code: number): unknown
   set(headers: Record<string, string>): unknown
   flushHeaders(): void
@@ -21,6 +23,11 @@ export interface StreamResponse {
 const open = new Set<() => void>()
 
 export function openLiveStream(res: StreamResponse): void {
+  // The console can hang up while the route's async admin check is still
+  // running. Its 'close' has then already fired, so nothing would ever stop a
+  // stream opened on this response.
+  if (res.destroyed) return
+
   res.status(200)
   res.set({
     'Content-Type': 'text/event-stream; charset=utf-8',

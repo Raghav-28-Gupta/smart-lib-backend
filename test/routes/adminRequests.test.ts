@@ -160,6 +160,19 @@ describe('deciding requests', () => {
     expect((await decline(admin, 'borrow', second, { reason: 'x'.repeat(301) })).status).toBe(400)
   })
 
+  it('declines with no request body at all, keeping no reason', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { token: student } = await seedUser()
+    const id = await askToBorrow(student, (await seedBook(1)).id)
+
+    const res = await request(app).post(`/admin/requests/borrow/${id}/decline`).set('Authorization', `Bearer ${admin}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body.status).toBe('declined')
+    const row = await prisma.borrowRequest.findUniqueOrThrow({ where: { id } })
+    expect([row.status, row.declineReason]).toEqual(['declined', null])
+  })
+
   it('approving a room request books the slot; declining one frees it', async () => {
     const { token: admin } = await seedUser('admin')
     const { token: student } = await seedUser()

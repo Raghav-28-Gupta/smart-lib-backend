@@ -95,6 +95,18 @@ describe('POST /borrow-requests', () => {
     expect(await prisma.bookCopy.count({ where: { bookId: book.id, status: 'requested' } })).toBe(1)
   })
 
+  it('two quick requests for a title with one free copy say it is already requested', async () => {
+    const { token } = await seedUser()
+    const book = await seedBookWithCopies(1, 1)
+
+    const results = await Promise.all([ask(token, book.id), ask(token, book.id)])
+
+    expect(results.map((r) => r.status).sort()).toEqual([201, 409])
+    expect(results.find((r) => r.status === 409)!.body.error).toBe("You've already requested this book.")
+    expect(await prisma.borrowRequest.count({ where: { status: 'pending' } })).toBe(1)
+    expect(await prisma.bookCopy.count({ where: { bookId: book.id, status: 'requested' } })).toBe(1)
+  })
+
   it('says so when no copy is left', async () => {
     const { token } = await seedUser()
     const book = await seedBookWithCopies(0, 2)

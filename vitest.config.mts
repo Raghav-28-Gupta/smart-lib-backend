@@ -11,5 +11,8 @@ export default defineConfig({
     // other's state, so files run one at a time.
     fileParallelism: false,
     testTimeout: 15000,
+    // resetDb() runs in beforeEach hooks; a slow Neon round trip there would
+    // otherwise hit the 10 s default.
+    hookTimeout: 30000,
   },
 })

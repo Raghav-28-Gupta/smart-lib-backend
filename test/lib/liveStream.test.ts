@@ -10,6 +10,7 @@ class FakeResponse extends EventEmitter {
   flushed = false
   chunks: string[] = []
   ended = false
+  destroyed = false
   status(code: number) {
     this.statusCode = code
     return this
@@ -126,5 +127,22 @@ describe('openLiveStream', () => {
 
     expect(res.ended).toBe(true)
     expect(subscriberCount()).toBe(0)
+  })
+
+  it('opens nothing for a console that already went away', () => {
+    // The console can hang up while the route's async admin check is still
+    // running. The response is then destroyed and its 'close' has already
+    // fired, so no later 'close' would ever clean up a stream opened on it.
+    const res = new FakeResponse()
+    res.destroyed = true
+
+    openLiveStream(res)
+    vi.advanceTimersByTime(60_000)
+
+    expect(res.statusCode).toBe(0)
+    expect(res.flushed).toBe(false)
+    expect(res.chunks).toEqual([])
+    expect(subscriberCount()).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

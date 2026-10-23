@@ -86,6 +86,10 @@ export async function createBorrowRequest(userId: string, bookId: string): Promi
           })
         }
       }
+      // A double submit with one free copy ends up here: the other request took
+      // the copy before the unique index could object. It has committed by now.
+      const alreadyAsked = await tx.borrowRequest.findFirst({ where: { userId, bookId, status: 'pending' } })
+      if (alreadyAsked) throw new ConflictError("You've already requested this book.")
       throw new ConflictError('No available copies right now.')
     })
   } catch (e) {

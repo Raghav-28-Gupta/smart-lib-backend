@@ -10,7 +10,8 @@ import { onBookReturned } from './reservationService'
  * Moves a pending borrow request to `data.status` and hands its copy back: the
  * copy is available again, then the waitlist cascade runs (the next waiting
  * student gets a claim). Conditional on 'pending', so of two racing decisions
- * only one lands; returns false for the one that lost.
+ * only one lands; returns false for the one that lost. A failing cascade is
+ * logged, not thrown: the release has committed either way.
  */
 export async function releaseBorrowRequest(
   request: { id: string; bookId: string; bookCopyId: string },
@@ -22,7 +23,17 @@ export async function releaseBorrowRequest(
     await tx.bookCopy.updateMany({ where: { id: request.bookCopyId, status: 'requested' }, data: { status: 'available' } })
     return true
   })
-  if (released) await onBookReturned(request.bookId, data.decidedAt)
+  if (released) {
+    try {
+      await onBookReturned(request.bookId, data.decidedAt)
+    } catch (error) {
+      // Throwing here would answer 500 for a decision that stuck (without its
+      // event, and a retry would find it already settled), or abort the expiry
+      // sweep half way. The cascade re-runs lazily on the next waitlist read
+      // or join, or when a copy is returned.
+      console.error('Waitlist cascade failed after releasing a request:', error)
+    }
+  }
   return released
 }
 
