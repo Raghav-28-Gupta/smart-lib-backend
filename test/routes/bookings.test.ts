@@ -3,8 +3,11 @@ import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { app } from '../../src/app'
 import { GRACE_PERIOD_MINUTES, JWT_SECRET } from '../../src/config/constants'
+import type { Prisma } from '../../src/generated/prisma/client'
 import { prisma } from '../../src/lib/prisma'
+import { dayLabel, slotLabel } from '../../src/lib/timeLabels'
 import { resetDb } from '../helpers/db'
+import { recordEvents } from '../helpers/events'
 
 async function seedUser() {
   const user = await prisma.user.create({
@@ -419,5 +422,167 @@ describe('POST /bookings for a slot that is already under way', () => {
       .send({ resourceId: desk.id, startTime: iso(2027, 1, 10, 15), endTime: iso(2027, 1, 10, 16) })
     expect(res.status).toBe(201)
     expect(res.body.frontendStatus).toBe('inWindow')
+  })
+})
+
+describe('room requests', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+  })
+
+  function requestRoom(token: string, resourceId: string, hour = 14) {
+    return request(app)
+      .post('/bookings')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ resourceId, startTime: iso(2027, 1, 10, hour), endTime: iso(2027, 1, 10, hour + 1) })
+  }
+
+  it('creates a room booking as a request that holds the slot until the grace period ends', async () => {
+    const { token } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
+
+    const res = await requestRoom(token, room.id)
+
+    expect(res.status).toBe(201)
+    expect(res.body).toMatchObject({ status: 'requested', frontendStatus: 'requested', declineReason: null })
+    expect(new Date(res.body.expiresAt).getTime()).toBe(
+      new Date(iso(2027, 1, 10, 14)).getTime() + GRACE_PERIOD_MINUTES * 60_000,
+    )
+  })
+
+  it('refuses a second student the held slot, with alternatives', async () => {
+    const { token: first } = await seedUser()
+    const { token: second } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
+    await seedResource('room', 'Room 202')
+    await requestRoom(first, room.id)
+
+    const res = await requestRoom(second, room.id)
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This resource is already booked for that time.')
+    expect(res.body.details.alternatives.length).toBeGreaterThan(0)
+  })
+
+  it('announces a room request to the console, and a seat booking as activity', async () => {
+    const { user, token } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
+    const seat = await seedResource('seat', 'Desk 1')
+    recorder = recordEvents()
+
+    await requestRoom(token, room.id)
+    await request(app)
+      .post('/bookings')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ resourceId: seat.id, startTime: iso(2027, 1, 10, 9), endTime: iso(2027, 1, 10, 10) })
+
+    const start = new Date(iso(2027, 1, 10, 14))
+    const end = new Date(iso(2027, 1, 10, 15))
+    expect(recorder.events).toEqual([
+      {
+        type: 'request.created',
+        topics: ['requests'],
+        kind: 'room',
+        summary: `${user.name} wants Room 201 · ${dayLabel(start)} · ${slotLabel(start, end)}`,
+      },
+      { type: 'activity', topics: ['metrics'] },
+    ])
+  })
+
+  it('publishes nothing when the booking is refused', async () => {
+    const { token: first } = await seedUser()
+    const { token: second } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
+    await requestRoom(first, room.id)
+    recorder = recordEvents()
+
+    await requestRoom(second, room.id)
+
+    expect(recorder.events).toEqual([])
+  })
+
+  it('lets the student withdraw a request, which frees the slot', async () => {
+    const { token: first } = await seedUser()
+    const { token: second } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
+    const asked = await requestRoom(first, room.id)
+    recorder = recordEvents()
+
+    const res = await request(app).post(`/bookings/${asked.body.id}/cancel`).set('Authorization', `Bearer ${first}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body.status).toBe('cancelled')
+    expect(recorder.events).toEqual([{ type: 'request.cancelled', topics: ['requests'], kind: 'room' }])
+    expect((await requestRoom(second, room.id)).status).toBe(201)
+  })
+
+  it('cannot check in to a room that is still a request', async () => {
+    const { token } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
+    const asked = await requestRoom(token, room.id)
+
+    const res = await request(app).post(`/bookings/${asked.body.id}/checkin`).set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This booking cannot be checked into.')
+  })
+
+  it('reports check-ins and cancellations of booked seats as activity', async () => {
+    const { token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 1')
+    const now = new Date()
+    const startedAt = new Date(now.getTime() - 60_000)
+    const booked = await request(app)
+      .post('/bookings')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ resourceId: seat.id, startTime: startedAt.toISOString(), endTime: new Date(startedAt.getTime() + 3_600_000).toISOString() })
+    const later = await request(app)
+      .post('/bookings')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ resourceId: seat.id, startTime: iso(2027, 1, 10, 9), endTime: iso(2027, 1, 10, 10) })
+    recorder = recordEvents()
+
+    await request(app).post(`/bookings/${booked.body.id}/checkin`).set('Authorization', `Bearer ${token}`)
+    await request(app).post(`/bookings/${later.body.id}/cancel`).set('Authorization', `Bearer ${token}`)
+
+    expect(recorder.events).toEqual([
+      { type: 'activity', topics: ['metrics'] },
+      { type: 'activity', topics: ['metrics'] },
+    ])
+  })
+})
+
+describe('GET /bookings/me with room requests', () => {
+  beforeEach(resetDb)
+
+  it('shows pending requests, and declined or expired ones for a week', async () => {
+    const { user, token } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
+    const daysAgo = (d: number) => new Date(Date.now() - d * 24 * 60 * 60 * 1000)
+    const row = (hour: number, data: Partial<Prisma.ResourceBookingUncheckedCreateInput>) =>
+      prisma.resourceBooking.create({
+        data: {
+          userId: user.id,
+          resourceId: room.id,
+          startTime: new Date(iso(2027, 1, 10, hour)),
+          endTime: new Date(iso(2027, 1, 10, hour + 1)),
+          ...data,
+        },
+      })
+    await row(9, { status: 'requested' })
+    await row(10, { status: 'declined', decidedAt: daysAgo(1), declineReason: 'Reserved for an event' })
+    await row(11, { status: 'expired', decidedAt: daysAgo(2) })
+    await row(12, { status: 'declined', decidedAt: daysAgo(8) })
+    await row(13, { status: 'cancelled', decidedAt: daysAgo(1) })
+
+    const res = await request(app).get('/bookings/me').set('Authorization', `Bearer ${token}`)
+
+    expect(res.body.map((b: { frontendStatus: string }) => b.frontendStatus)).toEqual(['requested', 'declined', 'expired'])
+    expect(res.body[0].expiresAt).not.toBeNull()
+    expect(res.body[1].declineReason).toBe('Reserved for an event')
+    expect(res.body[2].declineReason).toBeNull()
   })
 })

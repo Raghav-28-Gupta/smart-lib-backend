@@ -1,10 +1,11 @@
 import jwt from 'jsonwebtoken'
 import request from 'supertest'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { app } from '../../src/app'
 import { WAITLIST_CLAIM_HOURS, JWT_SECRET } from '../../src/config/constants'
 import { prisma } from '../../src/lib/prisma'
 import { resetDb } from '../helpers/db'
+import { recordEvents } from '../helpers/events'
 
 async function seedUser() {
   const user = await prisma.user.create({
@@ -121,10 +122,10 @@ describe('the return -> claim -> expiry -> cascade lifecycle', () => {
   })
 })
 
-describe('borrowing while a claim is outstanding', () => {
+describe('requesting while a claim is outstanding', () => {
   beforeEach(resetDb)
 
-  it('blocks a non-claimant from borrowing the sole earmarked copy', async () => {
+  it('blocks a non-claimant from requesting the sole earmarked copy', async () => {
     const { user: claimant } = await seedUser()
     const { token: otherToken } = await seedUser()
     const book = await seedBookWithCopies(1, 1)
@@ -132,22 +133,42 @@ describe('borrowing while a claim is outstanding', () => {
       data: { userId: claimant.id, bookId: book.id, status: 'fulfilled', claimExpiresAt: new Date(Date.now() + 60_000) },
     })
 
-    const res = await request(app).post('/loans').set('Authorization', `Bearer ${otherToken}`).send({ bookId: book.id })
+    const res = await request(app).post('/borrow-requests').set('Authorization', `Bearer ${otherToken}`).send({ bookId: book.id })
     expect(res.status).toBe(409)
   })
 
-  it('lets the claimant borrow and clears their consumed reservation', async () => {
+  it('lets the claimant request it, which uses up the claim', async () => {
     const { user: claimant, token: claimantToken } = await seedUser()
     const book = await seedBookWithCopies(1, 1)
     await prisma.reservation.create({
       data: { userId: claimant.id, bookId: book.id, status: 'fulfilled', claimExpiresAt: new Date(Date.now() + 60_000) },
     })
 
-    const res = await request(app).post('/loans').set('Authorization', `Bearer ${claimantToken}`).send({ bookId: book.id })
+    const res = await request(app).post('/borrow-requests').set('Authorization', `Bearer ${claimantToken}`).send({ bookId: book.id })
     expect(res.status).toBe(201)
 
     const remaining = await request(app).get('/reservations/me').set('Authorization', `Bearer ${claimantToken}`)
     expect(remaining.body).toHaveLength(0)
+  })
+})
+
+describe('waitlist activity reaches the console', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => recorder?.stop())
+
+  it('reports joining and leaving as activity', async () => {
+    const { token } = await seedUser()
+    const book = await seedBookWithCopies(0, 1)
+    recorder = recordEvents()
+
+    const joined = await request(app).post('/reservations').set('Authorization', `Bearer ${token}`).send({ bookId: book.id })
+    await request(app).delete(`/reservations/${joined.body.id}`).set('Authorization', `Bearer ${token}`)
+
+    expect(recorder.events).toEqual([
+      { type: 'activity', topics: ['metrics'] },
+      { type: 'activity', topics: ['metrics'] },
+    ])
   })
 })
 

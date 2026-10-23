@@ -1,5 +1,6 @@
 import { WAITLIST_CLAIM_HOURS } from '../config/constants'
 import type { Reservation } from '../generated/prisma/client'
+import { publishActivity } from '../lib/events'
 import { ConflictError, ForbiddenError, NotFoundError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
 
@@ -90,6 +91,7 @@ export async function joinWaitlist(userId: string, bookId: string): Promise<Rese
   if (existing) throw new ConflictError("You're already on the waitlist for this title.")
 
   const reservation = await prisma.reservation.create({ data: { userId, bookId, requestedAt: now } })
+  publishActivity()
   return toReservationDto(reservation, now)
 }
 
@@ -121,13 +123,14 @@ export async function cancelReservation(userId: string, reservationId: string): 
   const wasFulfilled = reservation.status === 'fulfilled'
   const updated = await prisma.reservation.update({ where: { id: reservationId }, data: { status: 'cancelled' } })
   if (wasFulfilled) await rebalanceClaims(reservation.bookId, now)
+  publishActivity()
 
   return toReservationDto(updated, now)
 }
 
-// Used by loanService.borrowBook: blocks a non-claimant from taking a copy
-// that's earmarked for someone else's active claim, while still letting
-// unclaimed headroom (or the claimant's own claim) through.
+// Used by borrowRequestService.createBorrowRequest: blocks a non-claimant from
+// taking a copy that's earmarked for someone else's active claim, while still
+// letting unclaimed headroom (or the claimant's own claim) through.
 export async function assertNotReservedForAnother(userId: string, bookId: string, now: Date): Promise<void> {
   await rebalanceClaims(bookId, now)
   const [availableCopies, claimsByOthers] = await Promise.all([
@@ -144,10 +147,10 @@ export async function assertNotReservedForAnother(userId: string, bookId: string
   }
 }
 
-// Called by loanService.borrowBook after a successful borrow: if the
-// borrower was consuming their own active claim, that reservation is done —
-// deleted rather than tracked under a separate terminal status, since a
-// 'fulfilled' row's only meaning is "waiting to be claimed".
+// Called by borrowRequestService.createBorrowRequest after the request holds a
+// copy: if the borrower was consuming their own active claim, that reservation
+// is done — deleted rather than tracked under a separate terminal status, since
+// a 'fulfilled' row's only meaning is "waiting to be claimed".
 export async function consumeClaimIfAny(userId: string, bookId: string): Promise<void> {
   await prisma.reservation.deleteMany({ where: { userId, bookId, status: 'fulfilled' } })
 }

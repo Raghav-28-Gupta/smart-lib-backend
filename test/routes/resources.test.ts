@@ -124,4 +124,21 @@ describe('GET /resources/availability', () => {
     const res = await request(app).get(`/resources/availability?type=seat&date=${DATE}`)
     expect(res.status).toBe(200)
   })
+
+  it('marks a slot taken while a room request holds it', async () => {
+    const user = await seedUser()
+    const resource = await prisma.resource.create({ data: { type: 'room', name: 'Room 201' } })
+    await prisma.resourceBooking.create({
+      data: {
+        userId: user.id,
+        resourceId: resource.id,
+        startTime: atLocalHour(DATE, 14),
+        endTime: atLocalHour(DATE, 15),
+        status: 'requested',
+      },
+    })
+
+    const res = await request(app).get(`/resources/availability?type=room&date=${DATE}`)
+    expect(res.body[0].takenSlotsToday).toEqual(['2:00 PM'])
+  })
 })

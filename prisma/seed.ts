@@ -78,6 +78,8 @@ async function deleteExistingSeedData() {
   const existingUsers = await prisma.user.findMany({ where: { email: { in: SEED_USER_EMAILS } }, select: { id: true } })
   const userIds = existingUsers.map((u) => u.id)
 
+  // Borrow requests point at copies, loans and users, so they go first.
+  await prisma.borrowRequest.deleteMany({ where: { OR: [{ bookId: { in: SEED_BOOK_IDS } }, { userId: { in: userIds } }] } })
   await prisma.fine.deleteMany({ where: { userId: { in: userIds } } })
   await prisma.resourceBooking.deleteMany({ where: { resourceId: { in: SEED_RESOURCE_IDS } } })
   await prisma.reliabilityScoreLog.deleteMany({ where: { userId: { in: userIds } } })

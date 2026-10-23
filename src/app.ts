@@ -4,6 +4,7 @@ import { errorHandler } from './middleware/errorHandler'
 import { adminRouter } from './routes/admin'
 import { authRouter } from './routes/auth'
 import { booksRouter } from './routes/books'
+import { borrowRequestsRouter } from './routes/borrowRequests'
 import { healthRouter } from './routes/health'
 import { loansRouter } from './routes/loans'
 import { reservationsRouter } from './routes/reservations'
@@ -30,6 +31,7 @@ app.use(healthRouter)
 app.use(authRouter)
 app.use(booksRouter)
 app.use(loansRouter)
+app.use(borrowRequestsRouter)
 app.use(reservationsRouter)
 app.use(resourcesRouter)
 app.use(bookingsRouter)

@@ -1,5 +1,6 @@
 import { TIME_SLOTS } from '../config/constants'
 import { prisma } from '../lib/prisma'
+import { HOLDING_STATUSES } from './bookingService'
 
 export interface ResourceDto {
   id: string
@@ -26,7 +27,7 @@ export async function getAvailability(type: 'seat' | 'room', date: string): Prom
   const bookings = await prisma.resourceBooking.findMany({
     where: {
       resourceId: { in: resources.map((r) => r.id) },
-      status: { in: ['booked', 'checked_in'] },
+      status: { in: HOLDING_STATUSES },
       startTime: { lt: dayEnd },
       endTime: { gt: dayStart },
     },

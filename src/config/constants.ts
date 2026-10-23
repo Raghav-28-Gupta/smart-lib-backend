@@ -6,6 +6,13 @@ export const MAX_RENEWALS = 2
 export const GRACE_PERIOD_MINUTES = 15
 export const WAITLIST_CLAIM_HOURS = 48
 
+// Declined and expired requests stay in the student's lists this long, so the
+// student sees the answer.
+export const REQUEST_OUTCOME_VISIBLE_DAYS = 7
+
+// A borrow request holds its copy this long while it waits for a librarian.
+export const BORROW_REQUEST_HOURS = 24
+
 // Matches the frontend's kTimeSlots exactly (booking_repository.dart) — each
 // entry is a 1-hour slot starting at `hour` (24h clock, local time). There's
 // no per-user timezone concept anywhere in the project yet, so "date" is

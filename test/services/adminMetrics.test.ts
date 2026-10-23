@@ -58,6 +58,17 @@ describe('bookedPercent', () => {
     expect(bookedPercent(bookings, [seat('s1')], [TODAY])).toBe(18)
   })
 
+  it('counts only booked and checked-in bookings, not requests, declines or lapses', () => {
+    const bookings = [
+      booking('s1', TODAY, 10, 11, 'requested'),
+      booking('s1', TODAY, 11, 12, 'declined'),
+      booking('s1', TODAY, 12, 13, 'expired'),
+      booking('s1', TODAY, 15, 16, 'checked_in'),
+    ]
+    // 1 of 11 open hours -> 9%
+    expect(bookedPercent(bookings, [seat('s1')], [TODAY])).toBe(9)
+  })
+
   it('counts only the part of a booking inside open hours', () => {
     // 8:30-9:30 adds half an hour, 19:30-21:00 adds half an hour: 1 of 11 -> 9%
     const early: BookingRow = { resourceId: 's1', startTime: at(TODAY, 8, 30), endTime: at(TODAY, 9, 30), status: 'booked' }

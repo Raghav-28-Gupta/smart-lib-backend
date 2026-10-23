@@ -37,13 +37,20 @@ calling out up front:
 ## Database migration
 
 ```bash
-npx prisma migrate dev
+npx prisma migrate deploy
 ```
 
-The one migration in `prisma/migrations/` includes a hand-written block Prisma's
-schema language can't express — a Postgres `EXCLUDE` constraint that makes
-double-booking a resource a *database-level* impossibility rather than
-something application code has to get right on every code path:
+Some migrations carry hand-written SQL that Prisma's schema language can't
+express: the `EXCLUDE` constraint below (rewritten in
+`20261020120100_request_approvals` so pending room requests hold their slot)
+and a partial unique index allowing one pending borrow request per student and
+title. Create new migrations with `npx prisma migrate dev --create-only` and
+read the SQL before applying it. Prisma doesn't model these two, so a
+generated migration may try to drop them.
+
+The `EXCLUDE` constraint makes double-booking a resource a *database-level*
+impossibility rather than something application code has to get right on
+every code path:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS btree_gist;
@@ -53,7 +60,7 @@ ADD CONSTRAINT no_overlapping_bookings
 EXCLUDE USING gist (
   "resourceId" WITH =,
   tstzrange("startTime", "endTime") WITH &&
-) WHERE (status IN ('booked', 'checked_in'));
+) WHERE (status IN ('requested', 'booked', 'checked_in'));
 ```
 
 `routes`/`services/bookingService.ts` catches the resulting SQLSTATE `23P01`
@@ -215,7 +222,10 @@ next request takes about a minute while it wakes.
 | GET | `/auth/me` | ✓ | Current user |
 | GET | `/books/search?q=&genre=` | — | Catalog search |
 | GET | `/books/:id` | — | Book detail, with computed `availableCopies`/`heldCopies`/`waitlistCount` |
-| POST | `/loans` | ✓ | Borrow a book (`{ bookId }`) |
+| POST | `/loans` | ✓ | Retired: answers 409 asking older app versions to update (borrowing is a request now) |
+| POST | `/borrow-requests` | ✓ | Ask to borrow a book (`{ bookId }`); holds one copy for 24 hours |
+| GET | `/borrow-requests/me` | ✓ | Your pending requests, and those declined or expired in the last 7 days |
+| POST | `/borrow-requests/:id/cancel` | ✓ | Withdraw a pending request |
 | GET | `/loans/me` | ✓ | Active loans, with computed fine/renewal/overdue fields |
 | POST | `/loans/:id/renew` | ✓ | Renew (blocked by renewal cap or an active waitlist) |
 | POST | `/loans/:id/return` | ✓ | Return (creates a `Fine` if overdue; cascades the waitlist) |
@@ -223,16 +233,20 @@ next request takes about a minute while it wakes.
 | GET | `/reservations/me` | ✓ | Your queue position or active claim |
 | DELETE | `/reservations/:id` | ✓ | Leave the waitlist / decline a claim |
 | GET | `/resources/availability?type=&date=` | — | Seats/rooms with per-slot occupancy for a date |
-| POST | `/bookings` | ✓ | Book a resource (`{ resourceId, startTime, endTime }`); 409 + alternatives on conflict |
-| GET | `/bookings/me` | ✓ | Your bookings, with computed grace-window status |
+| POST | `/bookings` | ✓ | Book a seat, or request a room (`{ resourceId, startTime, endTime }`); 409 + alternatives on conflict |
+| GET | `/bookings/me` | ✓ | Your bookings and room requests, with computed grace-window status |
 | POST | `/bookings/:id/checkin` | ✓ | Check in within the grace window |
-| POST | `/bookings/:id/cancel` | ✓ | Cancel before check-in |
+| POST | `/bookings/:id/cancel` | ✓ | Cancel before check-in, or withdraw a room request |
 | GET | `/profile/reliability` | ✓ | Reliability score, tier, and recent history |
 | GET | `/recommendations/me` | ✓ | AI-backend recommendations, falling back to "popular right now" |
 | GET | `/admin/metrics/utilization` | admin | Booked share of open hours: today, the same weekday last week, and seats/rooms for the last 7 days |
 | GET | `/admin/metrics/circulation` | admin | Borrows, returns and top 5 titles over the last 7 days |
 | GET | `/admin/metrics/overdue` | admin | Loans overdue now and 24 hours ago |
 | GET | `/admin/metrics/demand` | admin | Booked share and busiest slot per area over the last 7 days |
+| GET | `/admin/requests` | admin | Pending borrow and room requests, oldest first, with counts |
+| POST | `/admin/requests/:kind/:id/approve` | admin | Approve (`kind` is `borrow` or `room`); 409 if it was already settled |
+| POST | `/admin/requests/:kind/:id/decline` | admin | Decline, with an optional `{ reason }` (up to 300 characters) |
+| GET | `/admin/events` | admin | Live updates for the console, as Server-Sent Events |
 | GET | `/health` | — | Is this service up |
 | GET | `/health/db` | — | Proves the Node → Postgres link |
 | GET | `/health/ai` | — | Proves the Node → FastAPI link |
@@ -256,6 +270,41 @@ curl localhost:3000/health/ai   # {"status":"ok","service":"ai-backend"}
 backend to be running — see `../ai-backend/README.md`. `/recommendations/me`
 degrades gracefully to its fallback when it isn't.
 
+## Request approvals
+
+Borrowing a book and booking a room are requests that a librarian approves in
+the admin console. Seats, renewals, returns, check-ins and the waitlist are
+instant.
+
+- A borrow request holds one copy (copy status `requested`) for 24 hours. A
+  room request holds its slot (booking status `requested`, covered by the
+  exclusion constraint) until the slot's 15-minute grace period ends.
+- Approving a borrow request creates the loan, so its 14 days start then.
+  Declining it, letting it lapse, or the student withdrawing it frees the copy
+  and runs the waitlist cascade.
+- Lapsed requests are expired by a sweep that runs at startup and every minute
+  (`src/services/requestHolds.ts`), and before the request paths read or write.
+- Students see declined and expired requests for 7 days.
+
+## Live events
+
+`GET /admin/events` streams Server-Sent Events to the admin console: `ready` on
+connect, then one event per change:
+
+```
+event: request.created
+data: {"topics":["requests"],"kind":"borrow","summary":"Aditi Sharma wants to borrow Clean Code"}
+```
+
+Events name what changed (`requests`, `metrics`), never the new state: the
+console refetches. A `: ping` comment goes out every 25 seconds, and each
+stream ends after 15 minutes, so the console reconnects and its token and role
+are checked again.
+
+The bus is in-process (`src/lib/events.ts`). That reaches every console while
+one instance serves the API, as on Render's free plan; several instances would
+need a shared bus such as Redis pub/sub.
+
 ## Response shape
 
 Most list/detail endpoints return **normalized fields alongside computed
@@ -264,10 +313,10 @@ ones** rather than one or the other — e.g. a book carries its raw
 (`heldCopies` = shelf copies earmarked for a waitlisted student's live claim,
 which only that student may borrow); a loan
 carries the raw Prisma `status` next to the frontend-facing `frontendStatus`
-(`normal`/`overdue`). Nothing here runs on a schedule — grace-window expiry,
-overdue status, and waitlist-claim expiry are all computed lazily, at read
-time or when an adjacent write happens (a return, a renewal), not by a
-background job.
+(`normal`/`overdue`). Apart from the request-lapse sweep (see *Request
+approvals*), nothing here runs on a schedule — grace-window expiry, overdue
+status, and waitlist-claim expiry are all computed lazily, at read time or
+when an adjacent write happens (a return, a renewal), not by a background job.
 
 ## Notes on Prisma 7
 

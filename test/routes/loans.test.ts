@@ -1,10 +1,11 @@
 import jwt from 'jsonwebtoken'
 import request from 'supertest'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { app } from '../../src/app'
 import { JWT_SECRET } from '../../src/config/constants'
 import { prisma } from '../../src/lib/prisma'
 import { resetDb } from '../helpers/db'
+import { recordEvents } from '../helpers/events'
 
 let userCounter = 0
 
@@ -38,43 +39,24 @@ async function addWaiters(bookId: string, count: number) {
   }
 }
 
-describe('POST /loans (borrow)', () => {
+describe('POST /loans', () => {
   beforeEach(resetDb)
 
-  it('creates a loan and claims one available copy', async () => {
-    const { token } = await seedUser()
-    const book = await seedBookWithCopies(2, 4)
-
-    const res = await request(app).post('/loans').set('Authorization', `Bearer ${token}`).send({ bookId: book.id })
-    expect(res.status).toBe(201)
-    expect(res.body).toMatchObject({ bookId: book.id, frontendStatus: 'normal', canRenew: true, fineAmount: 0 })
-
-    const bookRes = await request(app).get(`/books/${book.id}`)
-    expect(bookRes.body.availableCopies).toBe(1)
-  })
-
-  it('returns 409 when no copies are available', async () => {
-    const { token } = await seedUser()
-    const book = await seedBookWithCopies(0, 2)
-    const res = await request(app).post('/loans').set('Authorization', `Bearer ${token}`).send({ bookId: book.id })
-    expect(res.status).toBe(409)
-    // Not the waitlist-reservation message: no copy is reserved, there are
-    // simply none left.
-    expect(res.body.error).toBe('No available copies right now.')
-  })
-
-  it('returns 409 if the user already has this book on loan', async () => {
+  it('tells older app versions that borrowing needs approval now', async () => {
     const { token } = await seedUser()
     const book = await seedBookWithCopies(2, 2)
-    await request(app).post('/loans').set('Authorization', `Bearer ${token}`).send({ bookId: book.id })
+
     const res = await request(app).post('/loans').set('Authorization', `Bearer ${token}`).send({ bookId: book.id })
+
     expect(res.status).toBe(409)
+    expect(res.body.error).toBe("Borrowing now needs a librarian's approval. Update the SmartLib app to send a request.")
+    expect(await prisma.loan.count()).toBe(0)
   })
 
-  it('requires authentication', async () => {
-    const book = await seedBookWithCopies(1, 1)
-    const res = await request(app).post('/loans').send({ bookId: book.id })
-    expect(res.status).toBe(401)
+  it('still validates the body, and requires authentication', async () => {
+    const { token } = await seedUser()
+    expect((await request(app).post('/loans').set('Authorization', `Bearer ${token}`).send({})).status).toBe(400)
+    expect((await request(app).post('/loans').send({ bookId: 'b1' })).status).toBe(401)
   })
 })
 
@@ -85,7 +67,8 @@ describe('GET /loans/me', () => {
     const { token, user } = await seedUser()
     const { token: otherToken } = await seedUser()
     const book = await seedBookWithCopies(2, 2)
-    await request(app).post('/loans').set('Authorization', `Bearer ${token}`).send({ bookId: book.id })
+    const copy = await prisma.bookCopy.findFirstOrThrow({ where: { bookId: book.id } })
+    await prisma.loan.create({ data: { userId: user.id, bookCopyId: copy.id, dueAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) } })
 
     const mine = await request(app).get('/loans/me').set('Authorization', `Bearer ${token}`)
     expect(mine.body).toHaveLength(1)
@@ -283,5 +266,29 @@ describe('POST /loans/:id/return', () => {
 
     const res = await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${otherToken}`)
     expect(res.status).toBe(403)
+  })
+})
+
+describe('loan activity reaches the console', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => recorder?.stop())
+
+  it('reports a renewal and a return as activity', async () => {
+    const { user, token } = await seedUser()
+    const book = await seedBookWithCopies(1, 1)
+    const copy = await prisma.bookCopy.findFirstOrThrow({ where: { bookId: book.id } })
+    const loan = await prisma.loan.create({
+      data: { userId: user.id, bookCopyId: copy.id, dueAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000) },
+    })
+    recorder = recordEvents()
+
+    await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
+    await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${token}`)
+
+    expect(recorder.events).toEqual([
+      { type: 'activity', topics: ['metrics'] },
+      { type: 'activity', topics: ['metrics'] },
+    ])
   })
 })

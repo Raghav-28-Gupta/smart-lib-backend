@@ -1,8 +1,9 @@
 import { LOAN_PERIOD_DAYS, MAX_RENEWALS, FINE_PER_DAY_INR } from '../config/constants'
 import type { Loan } from '../generated/prisma/client'
+import { publishActivity } from '../lib/events'
 import { ConflictError, ForbiddenError, NotFoundError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
-import { assertNotReservedForAnother, consumeClaimIfAny, onBookReturned } from './reservationService'
+import { onBookReturned } from './reservationService'
 
 export interface LoanDto {
   id: string
@@ -70,49 +71,6 @@ async function toLoanDto(loan: Loan & { bookCopy: { bookId: string } }, now: Dat
   }
 }
 
-export async function borrowBook(userId: string, bookId: string): Promise<LoanDto> {
-  const existing = await prisma.loan.findFirst({
-    where: { userId, status: 'active', bookCopy: { bookId } },
-  })
-  if (existing) throw new ConflictError('You already have this book borrowed.')
-
-  const now = new Date()
-  await assertNotReservedForAnother(userId, bookId, now)
-
-  // Claims one available copy via a guarded conditional update, which is
-  // race-safe under Postgres's row locking without needing SELECT ... FOR
-  // UPDATE: if two requests race for the same copy, the second's updateMany
-  // re-checks status='available' against the now-committed row, affects 0
-  // rows, and falls through to the next candidate.
-  const loan = await prisma.$transaction(async (tx) => {
-    const candidates = await tx.bookCopy.findMany({
-      where: { bookId, status: 'available' },
-      select: { id: true },
-      take: 5,
-    })
-    for (const candidate of candidates) {
-      const { count } = await tx.bookCopy.updateMany({
-        where: { id: candidate.id, status: 'available' },
-        data: { status: 'borrowed' },
-      })
-      if (count === 1) {
-        return tx.loan.create({
-          data: {
-            userId,
-            bookCopyId: candidate.id,
-            dueAt: new Date(now.getTime() + LOAN_PERIOD_DAYS * 24 * 60 * 60 * 1000),
-          },
-          include: { bookCopy: { select: { bookId: true } } },
-        })
-      }
-    }
-    throw new ConflictError('No available copies right now.')
-  })
-
-  await consumeClaimIfAny(userId, bookId)
-  return toLoanDto(loan, now)
-}
-
 export async function listMyLoans(userId: string): Promise<LoanDto[]> {
   const now = new Date()
   const loans = await prisma.loan.findMany({
@@ -157,6 +115,7 @@ export async function renewLoan(userId: string, loanId: string): Promise<LoanDto
     },
     include: { bookCopy: { select: { bookId: true } } },
   })
+  publishActivity()
   return toLoanDto(updated, now)
 }
 
@@ -180,5 +139,6 @@ export async function returnLoan(userId: string, loanId: string): Promise<LoanDt
     prisma.bookCopy.update({ where: { id: loan.bookCopyId }, data: { status: 'available' } }),
   ])
   await onBookReturned(loan.bookCopy.bookId, now)
+  publishActivity()
   return toLoanDto(updated, now)
 }

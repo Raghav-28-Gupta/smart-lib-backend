@@ -26,6 +26,8 @@ enum CopyStatus {
   borrowed
   lost
   maintenance
+  // Set aside for a pending borrow request (see BorrowRequest).
+  requested
 }
 
 enum LoanStatus {
@@ -52,6 +54,18 @@ enum BookingStatus {
   no_show
   released
   completed
+  cancelled
+  // A room booking waiting for a librarian, and its two unhappy endings.
+  requested
+  declined
+  expired
+}
+
+enum BorrowRequestStatus {
+  pending
+  approved
+  declined
+  expired
   cancelled
 }
 
@@ -86,10 +100,14 @@ model User {
 
   loans           Loan[]
   reservations    Reservation[]
-  bookings        ResourceBooking[]
+  bookings        ResourceBooking[] @relation("BookingUser")
   fines           Fine[]
   reliabilityLogs ReliabilityScoreLog[]
   recommendations RecommendationCache[]
+
+  borrowRequests        BorrowRequest[]   @relation("BorrowRequester")
+  decidedBorrowRequests BorrowRequest[]   @relation("BorrowRequestDecider")
+  decidedBookings       ResourceBooking[] @relation("BookingDecider")
 }
 
 model Book {
@@ -105,6 +123,7 @@ model Book {
   copies          BookCopy[]
   reservations    Reservation[]
   recommendations RecommendationCache[]
+  borrowRequests  BorrowRequest[]
 }
 
 model BookCopy {
@@ -113,6 +132,8 @@ model BookCopy {
   book   Book       @relation(fields: [bookId], references: [id])
   status CopyStatus @default(available)
   loans  Loan[]
+
+  borrowRequests BorrowRequest[]
 }
 
 model Loan {
@@ -127,6 +148,8 @@ model Loan {
   renewedCount Int        @default(0)
   status       LoanStatus @default(active)
   fines        Fine[]
+
+  borrowRequest BorrowRequest?
 }
 
 model Reservation {
@@ -153,7 +176,7 @@ model Resource {
 model ResourceBooking {
   id                 String        @id @default(uuid())
   userId             String
-  user               User          @relation(fields: [userId], references: [id])
+  user               User          @relation("BookingUser", fields: [userId], references: [id])
   resourceId         String
   resource           Resource      @relation(fields: [resourceId], references: [id])
   // Timestamptz, not plain timestamp: the no_overlapping_bookings EXCLUDE
@@ -167,9 +190,46 @@ model ResourceBooking {
   gracePeriodMinutes Int           @default(15)
   checkedInAt        DateTime?     @db.Timestamptz(3)
   priorityScore      Float?
+  // Approval of room bookings (seats are booked directly). requestedAt is
+  // when the student asked; decidedAt when the row left 'requested'
+  // (approved, declined, expired or withdrawn); decidedBy the librarian who
+  // approved or declined.
+  requestedAt        DateTime      @default(now()) @db.Timestamptz(3)
+  decidedAt          DateTime?     @db.Timestamptz(3)
+  decidedById        String?
+  decidedBy          User?         @relation("BookingDecider", fields: [decidedById], references: [id])
+  declineReason      String?
 
   noShowEvent NoShowEvent?
   fines       Fine[]
+
+  @@index([status, startTime])
+}
+
+// A student's request to borrow a book, waiting for a librarian. The copy it
+// holds is set to CopyStatus.requested until the request is decided, lapses
+// or is withdrawn; approval creates the Loan. One pending request per student
+// and title is enforced by a partial unique index in the migration SQL
+// (Prisma's schema language cannot express a WHERE clause on an index).
+model BorrowRequest {
+  id            String              @id @default(uuid())
+  userId        String
+  user          User                @relation("BorrowRequester", fields: [userId], references: [id])
+  bookId        String
+  book          Book                @relation(fields: [bookId], references: [id])
+  bookCopyId    String
+  bookCopy      BookCopy            @relation(fields: [bookCopyId], references: [id])
+  status        BorrowRequestStatus @default(pending)
+  requestedAt   DateTime            @default(now()) @db.Timestamptz(3)
+  expiresAt     DateTime            @db.Timestamptz(3)
+  decidedAt     DateTime?           @db.Timestamptz(3)
+  decidedById   String?
+  decidedBy     User?               @relation("BorrowRequestDecider", fields: [decidedById], references: [id])
+  declineReason String?
+  loanId        String?             @unique
+  loan          Loan?               @relation(fields: [loanId], references: [id])
+
+  @@index([status, expiresAt])
 }
 
 model NoShowEvent {

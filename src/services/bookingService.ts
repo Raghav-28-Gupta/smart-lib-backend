@@ -1,9 +1,12 @@
-import { GRACE_PERIOD_MINUTES, RELIABILITY_ONTIME_BOOKING_BONUS, TIME_SLOTS } from '../config/constants'
+import { GRACE_PERIOD_MINUTES, RELIABILITY_ONTIME_BOOKING_BONUS, REQUEST_OUTCOME_VISIBLE_DAYS, TIME_SLOTS } from '../config/constants'
 import { Prisma } from '../generated/prisma/client'
-import type { ResourceBooking, ResourceType } from '../generated/prisma/client'
+import type { BookingStatus, ResourceBooking, ResourceType } from '../generated/prisma/client'
+import { publish, publishActivity } from '../lib/events'
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
+import { dayLabel, slotLabel } from '../lib/timeLabels'
 import { applyReliabilityDelta } from './reliabilityService'
+import { expireStaleRequests } from './requestHolds'
 
 export interface BookingDto {
   id: string
@@ -14,9 +17,24 @@ export interface BookingDto {
   startTime: Date
   endTime: Date
   status: string
-  frontendStatus: 'upcomingFar' | 'inWindow' | 'checkedIn' | 'released'
+  frontendStatus: 'requested' | 'declined' | 'expired' | 'upcomingFar' | 'inWindow' | 'checkedIn' | 'released'
   graceRemainingSeconds: number
   checkedInAt: Date | null
+  /** A room request's deadline: its start plus the grace period. Null otherwise. */
+  expiresAt: Date | null
+  /** Set only on a declined request, and only if the librarian gave one. */
+  declineReason: string | null
+}
+
+/**
+ * The statuses that occupy a slot. The no_overlapping_bookings constraint
+ * covers exactly these, so availability and conflict alternatives use them too.
+ */
+export const HOLDING_STATUSES: BookingStatus[] = ['requested', 'booked', 'checked_in']
+
+/** When a booking's check-in window closes -- and when a room request for it lapses. */
+export function graceEnd(booking: { startTime: Date; gracePeriodMinutes: number }): Date {
+  return new Date(booking.startTime.getTime() + booking.gracePeriodMinutes * 60 * 1000)
 }
 
 interface BookingAlternative {
@@ -51,19 +69,24 @@ function slotForHour(hour: number) {
 }
 
 // Computes the frontend's window-based status/countdown for a still-'booked'
-// row (checked_in is handled separately by the caller, which has the raw
-// status). No scheduler runs in this phase, so 'released' is purely a
-// read-time label -- the DB status stays 'booked' regardless.
+// row (checked_in and the request statuses are handled by the caller, which
+// has the raw status). No scheduler releases bookings, so 'released' is purely
+// a read-time label -- the DB status stays 'booked' regardless.
 function computeWindow(startTime: Date, gracePeriodMinutes: number, now: Date): { frontendStatus: 'upcomingFar' | 'inWindow' | 'released'; graceRemainingSeconds: number } {
-  const graceEnd = new Date(startTime.getTime() + gracePeriodMinutes * 60 * 1000)
+  const end = graceEnd({ startTime, gracePeriodMinutes })
   if (now < startTime) return { frontendStatus: 'upcomingFar', graceRemainingSeconds: 0 }
-  if (now <= graceEnd) return { frontendStatus: 'inWindow', graceRemainingSeconds: Math.floor((graceEnd.getTime() - now.getTime()) / 1000) }
+  if (now <= end) return { frontendStatus: 'inWindow', graceRemainingSeconds: Math.floor((end.getTime() - now.getTime()) / 1000) }
   return { frontendStatus: 'released', graceRemainingSeconds: 0 }
 }
 
 function toBookingDto(booking: ResourceBooking & { resource: { name: string; type: string } }, now: Date): BookingDto {
   const window = computeWindow(booking.startTime, booking.gracePeriodMinutes, now)
-  const frontendStatus = booking.status === 'checked_in' ? 'checkedIn' : window.frontendStatus
+  const frontendStatus: BookingDto['frontendStatus'] =
+    booking.status === 'requested' || booking.status === 'declined' || booking.status === 'expired'
+      ? booking.status
+      : booking.status === 'checked_in'
+        ? 'checkedIn'
+        : window.frontendStatus
 
   return {
     id: booking.id,
@@ -77,6 +100,8 @@ function toBookingDto(booking: ResourceBooking & { resource: { name: string; typ
     frontendStatus,
     graceRemainingSeconds: frontendStatus === 'inWindow' ? window.graceRemainingSeconds : 0,
     checkedInAt: booking.checkedInAt,
+    expiresAt: booking.status === 'requested' ? graceEnd(booking) : null,
+    declineReason: booking.status === 'declined' ? booking.declineReason : null,
   }
 }
 
@@ -102,7 +127,7 @@ async function findAlternatives(
 
   if (isOneHourSlot) {
     const sameResourceBookings = await prisma.resourceBooking.findMany({
-      where: { resourceId: resource.id, status: { in: ['booked', 'checked_in'] }, startTime: { lt: dayEnd }, endTime: { gt: dayStart } },
+      where: { resourceId: resource.id, status: { in: HOLDING_STATUSES }, startTime: { lt: dayEnd }, endTime: { gt: dayStart } },
       select: { startTime: true, endTime: true },
     })
     const requestedHour = startTime.getHours()
@@ -134,7 +159,7 @@ async function findAlternatives(
   })
   for (const other of otherResources) {
     const overlapping = await prisma.resourceBooking.findFirst({
-      where: { resourceId: other.id, status: { in: ['booked', 'checked_in'] }, startTime: { lt: endTime }, endTime: { gt: startTime } },
+      where: { resourceId: other.id, status: { in: HOLDING_STATUSES }, startTime: { lt: endTime }, endTime: { gt: startTime } },
     })
     if (!overlapping) {
       const slot = slotForHour(startTime.getHours())
@@ -166,6 +191,8 @@ export async function createBooking(userId: string, resourceId: string, startTim
 
   const resource = await prisma.resource.findUnique({ where: { id: resourceId } })
   if (!resource) throw new NotFoundError('Resource')
+  // Rooms wait for a librarian (and hold the slot meanwhile); seats are booked at once.
+  const isRoom = resource.type === 'room'
 
   try {
     // The no_overlapping_bookings constraint is what guarantees no double
@@ -182,10 +209,20 @@ export async function createBooking(userId: string, resourceId: string, startTim
       // cannot deserialize as a result column.
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${resourceId}))`
       return tx.resourceBooking.create({
-        data: { userId, resourceId, startTime, endTime },
-        include: { resource: { select: { name: true, type: true } } },
+        data: { userId, resourceId, startTime, endTime, status: isRoom ? 'requested' : 'booked', requestedAt: now },
+        include: { resource: { select: { name: true, type: true } }, user: { select: { name: true } } },
       })
     })
+    if (isRoom) {
+      publish({
+        type: 'request.created',
+        topics: ['requests'],
+        kind: 'room',
+        summary: `${booking.user.name} wants ${booking.resource.name} · ${dayLabel(startTime)} · ${slotLabel(startTime, endTime)}`,
+      })
+    } else {
+      publishActivity()
+    }
     return toBookingDto(booking, now)
   } catch (e) {
     if (isExclusionViolation(e)) {
@@ -198,8 +235,17 @@ export async function createBooking(userId: string, resourceId: string, startTim
 
 export async function listMyBookings(userId: string): Promise<BookingDto[]> {
   const now = new Date()
+  await expireStaleRequests(now)
+  const since = new Date(now.getTime() - REQUEST_OUTCOME_VISIBLE_DAYS * 24 * 60 * 60 * 1000)
   const bookings = await prisma.resourceBooking.findMany({
-    where: { userId, status: { not: 'cancelled' } },
+    where: {
+      userId,
+      OR: [
+        { status: { notIn: ['cancelled', 'declined', 'expired'] } },
+        // A request's answer stays visible for a week.
+        { status: { in: ['declined', 'expired'] }, decidedAt: { gte: since } },
+      ],
+    },
     include: { resource: { select: { name: true, type: true } } },
     orderBy: { startTime: 'asc' },
   })
@@ -234,17 +280,31 @@ export async function checkInBooking(userId: string, bookingId: string): Promise
     await applyReliabilityDelta(tx, userId, RELIABILITY_ONTIME_BOOKING_BONUS, 'On-time check-in for a resource booking')
     return result
   })
+  publishActivity()
   return toBookingDto(updated, now)
 }
 
 export async function cancelBooking(userId: string, bookingId: string): Promise<BookingDto> {
   const booking = await getOwnedBooking(userId, bookingId)
-  if (booking.status !== 'booked') throw new ConflictError('This booking cannot be cancelled.')
+  if (booking.status !== 'booked' && booking.status !== 'requested') {
+    throw new ConflictError('This booking cannot be cancelled.')
+  }
 
-  const updated = await prisma.resourceBooking.update({
+  const now = new Date()
+  const withdrawing = booking.status === 'requested'
+  // Conditional on the status just read, so a librarian's decision landing at
+  // the same moment wins cleanly instead of being overwritten.
+  const { count } = await prisma.resourceBooking.updateMany({
+    where: { id: bookingId, status: booking.status },
+    data: withdrawing ? { status: 'cancelled', decidedAt: now } : { status: 'cancelled' },
+  })
+  if (count === 0) throw new ConflictError('This booking cannot be cancelled.')
+
+  const updated = await prisma.resourceBooking.findUniqueOrThrow({
     where: { id: bookingId },
-    data: { status: 'cancelled' },
     include: { resource: { select: { name: true, type: true } } },
   })
-  return toBookingDto(updated, new Date())
+  if (withdrawing) publish({ type: 'request.cancelled', topics: ['requests'], kind: 'room' })
+  else publishActivity()
+  return toBookingDto(updated, now)
 }

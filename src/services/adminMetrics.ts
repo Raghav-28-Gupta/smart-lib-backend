@@ -60,14 +60,18 @@ function overlapHours(b: BookingRow, from: Date, to: Date): number {
   return ms > 0 ? ms / HOUR_MS : 0
 }
 
+// Only these are use of a seat or room. A pending request, a decline, a lapse
+// and a cancellation are not.
+const OCCUPYING = new Set(['booked', 'checked_in'])
+
 /**
- * Booked hours per slot label for these resources over these days. Cancelled
- * bookings don't count; anything outside the open slots never counts.
+ * Booked hours per slot label for these resources over these days. Only
+ * booked and checked-in bookings count; anything outside the open slots never counts.
  */
 function bookedHoursBySlot(bookings: BookingRow[], resourceIds: Set<string>, days: Date[]): Map<string, number> {
   const bySlot = new Map<string, number>(TIME_SLOTS.map((s) => [s.label, 0]))
   for (const b of bookings) {
-    if (b.status === 'cancelled' || !resourceIds.has(b.resourceId)) continue
+    if (!OCCUPYING.has(b.status) || !resourceIds.has(b.resourceId)) continue
     for (const day of days) {
       for (const slot of TIME_SLOTS) {
         const from = new Date(day.getFullYear(), day.getMonth(), day.getDate(), slot.hour)

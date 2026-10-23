@@ -89,13 +89,27 @@ To guarantee zero double-bookings at the database level, the `ResourceBooking` t
    EXCLUDE USING gist (
      "resourceId" WITH =,
      tstzrange("startTime", "endTime") WITH &&
-   ) WHERE (status IN ('booked', 'checked_in'));
+   ) WHERE (status IN ('requested', 'booked', 'checked_in'));
    ```
 3. Apply migration:
    ```bash
    npx prisma migrate dev
    ```
 4. **Keep the per-resource advisory lock in `createBooking`.** The constraint alone guarantees no double booking, but simultaneous inserts can make Postgres abort the losers with a deadlock (`40P01`, a 500 here) instead of `23P01`. This only reproduces on a low-latency database with warm connections (CI), never on Neon, so a green local `npm test` does not prove it. To check booking concurrency locally, run the suite against a Docker `postgres:16` (`TEST_DATABASE_URL=postgresql://...@localhost:5433/...`), as CI does.
+
+A pending room request (`requested`) holds its slot. `BorrowRequest` also
+carries a hand-written partial unique index, `BorrowRequest_one_pending_per_title`.
+Check every generated migration for a `DROP` of either before applying it.
+
+---
+
+## Live Events
+
+Every write that changes requests or Dashboard numbers publishes an event once
+it has committed (`src/lib/events.ts`: `publish`, or `publishActivity()` for a
+change that only moves Dashboard numbers). `GET /admin/events` streams them to
+the admin console. A new mutation the console should see must publish one,
+with a test using `recordEvents()` from `test/helpers/events.ts`.
 
 ---
 

@@ -21,7 +21,7 @@ async function resourcesAndBookings(from: Date, to: Date) {
   const [resources, bookings] = await Promise.all([
     prisma.resource.findMany({ select: { id: true, type: true, location: true } }),
     prisma.resourceBooking.findMany({
-      where: { status: { not: 'cancelled' }, startTime: { lt: to }, endTime: { gt: from } },
+      where: { status: { in: ['booked', 'checked_in'] }, startTime: { lt: to }, endTime: { gt: from } },
       select: { resourceId: true, startTime: true, endTime: true, status: true },
     }),
   ])
