@@ -69,6 +69,17 @@ interface BookingRow {
 // is not a booking yet, and the other three are not something to manage.
 const LISTED_STATUSES = Prisma.sql`('booked', 'checked_in', 'released', 'completed', 'cancelled')`
 
+// A room request the student withdrew is stored as cancelled with decidedAt set
+// and decidedById null (see cancelBooking). It never became a booking, so it is
+// not listed or found, like the other request outcomes. A booking the student
+// cancelled has decidedAt null, and one approved and cancelled later keeps its
+// decidedById, so both stay listed. adminRequestService.roomSettled tells approved
+// from withdrawn the same way. Keep isWithdrawnRequest and the SQL below in step.
+function isWithdrawnRequest(b: { status: BookingStatus; decidedAt: Date | null; decidedById: string | null }): boolean {
+  return b.status === 'cancelled' && b.decidedAt !== null && b.decidedById === null
+}
+const NOT_WITHDRAWN_REQUEST = Prisma.sql`NOT (b.status = 'cancelled' AND b."decidedAt" IS NOT NULL AND b."decidedById" IS NULL)`
+
 /**
  * The status a booking is shown as at `now`. Same rules as the student app
  * (bookingService.computeWindow): a booking is released once its grace period
@@ -121,7 +132,7 @@ function filteredBookings(q: Pick<AdminBookingListQuery, 'search' | 'status'> & 
       FROM "ResourceBooking" b
       JOIN "User" u ON u.id = b."userId"
       JOIN "Resource" r ON r.id = b."resourceId"
-      WHERE b.status IN ${LISTED_STATUSES}
+      WHERE b.status IN ${LISTED_STATUSES} AND ${NOT_WITHDRAWN_REQUEST}
     ) AS booking
     ${where}`
 }
@@ -179,6 +190,8 @@ interface BookingToManage {
   endTime: Date
   gracePeriodMinutes: number
   cancelledById: string | null
+  decidedAt: Date | null
+  decidedById: string | null
   resourceId: string
   resource: { name: string; type: ResourceType }
 }
@@ -192,6 +205,8 @@ async function findBookingToManage(client: PrismaClient | Prisma.TransactionClie
       endTime: true,
       gracePeriodMinutes: true,
       cancelledById: true,
+      decidedAt: true,
+      decidedById: true,
       resourceId: true,
       resource: { select: { name: true, type: true } },
     },
@@ -205,15 +220,20 @@ async function findBookingToManage(client: PrismaClient | Prisma.TransactionClie
  * Manageable means raw status booked and not past its grace end: the list's
  * canManage. The refusals follow the same derived rules the list shows (a
  * checked-in booking is finished once its end time is reached). Declined,
- * expired and no_show rows are not bookings the console lists, so they are not found.
+ * expired and no_show rows, and a room request the student withdrew, are not
+ * bookings the console lists, so they are not found.
  */
-function refuseUnlessManageable(booking: Pick<BookingToManage, 'status' | 'startTime' | 'endTime' | 'gracePeriodMinutes' | 'cancelledById'>, now: Date): void {
+function refuseUnlessManageable(
+  booking: Pick<BookingToManage, 'status' | 'startTime' | 'endTime' | 'gracePeriodMinutes' | 'cancelledById' | 'decidedAt' | 'decidedById'>,
+  now: Date,
+): void {
   switch (booking.status) {
     case 'booked':
       // Strictly after the grace end, like the list: at the very end it can still be checked into.
       if (now > graceEnd(booking)) throw new ConflictError('This booking has already been released.')
       return
     case 'cancelled':
+      if (isWithdrawnRequest(booking)) throw new NotFoundError('Booking')
       throw new ConflictError(booking.cancelledById ? 'Already cancelled by the library.' : 'The student already cancelled this booking.')
     case 'checked_in':
       throw new ConflictError(booking.endTime <= now ? 'This booking has already finished.' : 'The student already checked in.')

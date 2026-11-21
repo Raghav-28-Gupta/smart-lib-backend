@@ -6,8 +6,9 @@
 // Re-runnable: it resets the seeded books, resources and seed accounts (the
 // fixed ids/emails below) before recreating them. The reset takes every loan,
 // booking and waitlist entry on those books and resources with it, including
-// ones made through the live API; other books, resources and accounts are left
-// alone. It assumes a migrated database.
+// ones made through the live API, and the seed accounts' own bookings on any
+// other resource; other books, resources and accounts are left alone. It
+// assumes a migrated database.
 //
 // It also generates four weeks of past bookings and loans for the six seed
 // students (prisma/history.ts), ending yesterday, so the admin Dashboard has
@@ -81,7 +82,10 @@ async function deleteExistingSeedData() {
   // Borrow requests point at copies, loans and users, so they go first.
   await prisma.borrowRequest.deleteMany({ where: { OR: [{ bookId: { in: SEED_BOOK_IDS } }, { userId: { in: userIds } }] } })
   await prisma.fine.deleteMany({ where: { userId: { in: userIds } } })
-  await prisma.resourceBooking.deleteMany({ where: { resourceId: { in: SEED_RESOURCE_IDS } } })
+  // Bookings on the seed resources, and the seed accounts' own bookings on any
+  // resource: a student can book a resource the console added, and a librarian
+  // can move a booking onto one, and ResourceBooking.userId restricts the user delete.
+  await prisma.resourceBooking.deleteMany({ where: { OR: [{ resourceId: { in: SEED_RESOURCE_IDS } }, { userId: { in: userIds } }] } })
   await prisma.reliabilityScoreLog.deleteMany({ where: { userId: { in: userIds } } })
   await prisma.recommendationCache.deleteMany({ where: { userId: { in: userIds } } })
   await prisma.reservation.deleteMany({ where: { bookId: { in: SEED_BOOK_IDS } } })

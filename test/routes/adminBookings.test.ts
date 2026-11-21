@@ -964,3 +964,185 @@ describe('admin booking reassign', () => {
     expect(recorder.events).toEqual([{ type: 'booking.changed', topics: ['bookings', 'metrics'] }])
   })
 })
+
+// --- Withdrawn room requests --------------------------------------------------
+//
+// A student who withdraws a room request leaves status 'cancelled' with decidedAt
+// set and decidedById null. That is a request that never became a booking, so the
+// console does not list it, unlike a seat booking the student cancelled (decidedAt
+// null) or a room booking that was approved and then cancelled (decidedById kept).
+
+describe('admin bookings and withdrawn room requests', () => {
+  beforeEach(resetDb)
+
+  const slotAt = (hoursFromNow: number) => ({
+    startTime: new Date(Date.now() + hoursFromNow * HOUR_MS).toISOString(),
+    endTime: new Date(Date.now() + (hoursFromNow + 1) * HOUR_MS).toISOString(),
+  })
+  const studentBooks = (token: string, resourceId: string, hoursFromNow: number) =>
+    request(app).post('/bookings').set(auth(token)).send({ resourceId, ...slotAt(hoursFromNow) })
+  const studentCancels = (token: string, id: string) => request(app).post(`/bookings/${id}/cancel`).set(auth(token))
+  const approveRoomRequest = (token: string, id: string) => request(app).post(`/admin/requests/room/${id}/approve`).set(auth(token))
+
+  /** The student asks for a room through the real endpoint and returns the new booking's id. */
+  async function requestRoom(token: string, hoursFromNow: number): Promise<string> {
+    const room = await seedResource(undefined, 'room')
+    const res = await studentBooks(token, room.id, hoursFromNow)
+    expect(res.status).toBe(201)
+    expect(res.body.status).toBe('requested')
+    return res.body.id
+  }
+
+  async function withdrawnRequest(token: string, hoursFromNow: number): Promise<string> {
+    const id = await requestRoom(token, hoursFromNow)
+    expect((await studentCancels(token, id)).status).toBe(200)
+    expect(await storedBooking(id)).toMatchObject({ status: 'cancelled', decidedById: null, cancelledById: null })
+    expect((await storedBooking(id)).decidedAt).not.toBeNull()
+    return id
+  }
+
+  it('does not list a withdrawn room request, count it, or match it in any filter', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student, token } = await seedUser('student', { name: 'Asha Rao', email: 'asha@test.com' })
+    const now = Date.now()
+    const seat = await seedBooking(now, { userId: student.id, start: HOUR_MS, end: 2 * HOUR_MS })
+    const ownCancel = await seedBooking(now, { userId: student.id, start: 3 * HOUR_MS, end: 4 * HOUR_MS, status: 'cancelled' })
+    const withdrawn = await withdrawnRequest(token, 5)
+
+    const all = await list(admin)
+    const cancelled = await list(admin, '?status=cancelled')
+    const searched = await list(admin, '?search=asha')
+    const pageOfOne = await list(admin, '?status=cancelled&pageSize=1')
+    const pastTheEnd = await list(admin, '?status=cancelled&page=3&pageSize=1')
+
+    expect(ids(all)).toEqual([ownCancel.id, seat.id])
+    expect(all.body.total).toBe(2)
+    expect(ids(cancelled)).toEqual([ownCancel.id])
+    expect(cancelled.body.total).toBe(1)
+    expect(ids(searched)).toEqual([ownCancel.id, seat.id])
+    expect(searched.body.total).toBe(2)
+    expect(ids(pageOfOne)).toEqual([ownCancel.id])
+    expect(pageOfOne.body.total).toBe(1)
+    // The total behind a page past the end is counted by its own query, which must agree.
+    expect(pastTheEnd.body).toEqual({ bookings: [], total: 1, page: 3, pageSize: 1 })
+    expect([...ids(all), ...ids(cancelled), ...ids(searched)]).not.toContain(withdrawn)
+  })
+
+  it('a withdrawn room request alone leaves the list empty with a total of 0', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { token } = await seedUser()
+    await withdrawnRequest(token, 2)
+
+    const all = await list(admin)
+    const cancelled = await list(admin, '?status=cancelled')
+
+    expect(all.body).toEqual({ bookings: [], total: 0, page: 1, pageSize: 25 })
+    expect(cancelled.body).toEqual({ bookings: [], total: 0, page: 1, pageSize: 25 })
+  })
+
+  it('still lists a seat booking the student cancelled, as cancelled by the student', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student, token } = await seedUser()
+    const desk = await seedResource('Desk 20')
+    const booked = await studentBooks(token, desk.id, 2)
+    expect(booked.status).toBe(201)
+    expect((await studentCancels(token, booked.body.id)).status).toBe(200)
+    expect((await storedBooking(booked.body.id)).decidedAt).toBeNull()
+
+    const all = await list(admin)
+    const cancelled = await list(admin, '?status=cancelled')
+
+    expect(ids(all)).toEqual([booked.body.id])
+    expect(all.body.bookings[0]).toMatchObject({
+      student: { id: student.id },
+      resource: { id: desk.id, type: 'seat' },
+      status: 'cancelled',
+      cancelledBy: 'student',
+      cancelReason: null,
+      canManage: false,
+    })
+    expect(ids(cancelled)).toEqual([booked.body.id])
+    expect(cancelled.body.total).toBe(1)
+  })
+
+  it('still lists a room request that was approved and then cancelled by the student, as cancelled by the student', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student, token } = await seedUser()
+    const id = await requestRoom(token, 3)
+    expect((await approveRoomRequest(admin, id)).status).toBe(200)
+    expect((await studentCancels(token, id)).status).toBe(200)
+    expect(await storedBooking(id)).toMatchObject({ status: 'cancelled', cancelledById: null })
+    expect((await storedBooking(id)).decidedById).not.toBeNull()
+
+    const all = await list(admin)
+    const cancelled = await list(admin, '?status=cancelled')
+
+    expect(ids(all)).toEqual([id])
+    expect(all.body.bookings[0]).toMatchObject({
+      student: { id: student.id },
+      resource: { type: 'room' },
+      status: 'cancelled',
+      cancelledBy: 'student',
+      canManage: false,
+    })
+    expect(ids(cancelled)).toEqual([id])
+    expect(cancelled.body.total).toBe(1)
+  })
+
+  it('still lists a room request that was approved and then cancelled by a librarian, as cancelled by the library', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { token } = await seedUser()
+    const id = await requestRoom(token, 3)
+    expect((await approveRoomRequest(admin, id)).status).toBe(200)
+    // The cancel's own response is read back through the same list query.
+    const cancelRes = await cancel(admin, id, { reason: 'Room closed' })
+    expect(cancelRes.status).toBe(200)
+    expect(cancelRes.body).toMatchObject({ id, status: 'cancelled', cancelledBy: 'library', cancelReason: 'Room closed', canManage: false })
+
+    const all = await list(admin)
+    const cancelled = await list(admin, '?status=cancelled')
+
+    expect(ids(all)).toEqual([id])
+    expect(all.body.bookings[0]).toMatchObject({ status: 'cancelled', cancelledBy: 'library', cancelReason: 'Room closed' })
+    expect(ids(cancelled)).toEqual([id])
+    expect(cancelled.body.total).toBe(1)
+  })
+
+  it('an approved room booking can still be moved, and the reassign response reads it back', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { token } = await seedUser()
+    const id = await requestRoom(token, 3)
+    expect((await approveRoomRequest(admin, id)).status).toBe(200)
+    const target = await seedResource('Group Room 301', 'room')
+
+    const res = await reassign(admin, id, target.id)
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ id, resource: { id: target.id }, status: 'booked', canManage: true })
+    expect(ids(await list(admin))).toEqual([id])
+  })
+
+  it('cancel, reassign and reassign options on a withdrawn room request answer 404, never 500', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { token } = await seedUser()
+    const id = await withdrawnRequest(token, 3)
+    const target = await seedResource('Group Room 302', 'room')
+    const recorder = recordEvents()
+
+    try {
+      const cancelRes = await cancel(admin, id, { reason: 'Closed' })
+      const reassignRes = await reassign(admin, id, target.id)
+      const optionsRes = await reassignOptions(admin, id)
+
+      for (const res of [cancelRes, reassignRes, optionsRes]) {
+        expect(res.status).toBe(404)
+        expect(res.body.error).toBe('Booking not found')
+      }
+      expect(recorder.events).toEqual([])
+    } finally {
+      recorder.stop()
+    }
+    // Nothing was written: it is still the student's withdrawn request.
+    expect(await storedBooking(id)).toMatchObject({ status: 'cancelled', cancelledById: null, cancelReason: null, movedAt: null })
+  })
+})

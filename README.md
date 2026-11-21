@@ -318,11 +318,14 @@ the student's name or email or the resource name, ignoring case. `status` is
 including `requested` and `no_show`, is a 400. As for students, the status is
 worked out when it is read: a booking is `released` once its grace period has
 passed without a check-in, and a checked-in one is `completed` once its end time
-is reached. Room requests that are still pending, declined or expired are not
-listed (they live on the Requests page). Each booking carries `cancelledBy`
-(`student` or `library`), `cancelReason`, `movedFromName` and `canManage`, which
-is true exactly while the booking is `booked`. `page` starts at 1 and
-`pageSize` defaults to 25 (up to 100).
+is reached. Room requests that are still pending, declined or expired, or that
+the student withdrew, are not listed (they live on the Requests page). A room
+booking a librarian approved is listed, and stays listed if it is cancelled
+later, by the student or the library; so is a seat booking the student
+cancelled. Each booking carries `cancelledBy` (`student` or `library`),
+`cancelReason`, `movedFromName` and `canManage`, which is true exactly while the
+booking is `booked`. `page` starts at 1 and `pageSize` defaults to 25 (up to
+100).
 
 **Cancel and reassign.** Both are conditional updates on the booking still
 being `booked` and not past its grace period, so of a librarian and a student
@@ -330,8 +333,8 @@ acting at once only the first write lands, and a librarian who lost is told what
 happened with a 409: "Already cancelled by the library.", "The student already cancelled
 this booking.", "The student already checked in.", "This booking has already
 finished.", "This booking has already been released.", or, for a room request,
-"This is a room request. Decide it on the Requests page." An unknown booking is
-a 404. Neither changes the student's reliability score. A cancel records who
+"This is a room request. Decide it on the Requests page." An unknown booking, or
+a room request the student withdrew, is a 404. Neither changes the student's reliability score. A cancel records who
 did it, when and why (`cancelledById`, `cancelledAt`, `cancelReason`). A
 reassign keeps the booking's time and records the name of the resource it left
 and when (`movedFromName`, `movedAt`). It is refused with a 400 for a resource
