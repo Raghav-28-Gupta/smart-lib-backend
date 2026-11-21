@@ -274,21 +274,82 @@ describe('loan activity reaches the console', () => {
   let recorder: ReturnType<typeof recordEvents> | undefined
   afterEach(() => recorder?.stop())
 
-  it('reports a renewal and a return as activity', async () => {
+  async function seedLoanDue(dueAt: Date) {
     const { user, token } = await seedUser()
     const book = await seedBookWithCopies(1, 1)
     const copy = await prisma.bookCopy.findFirstOrThrow({ where: { bookId: book.id } })
-    const loan = await prisma.loan.create({
-      data: { userId: user.id, bookCopyId: copy.id, dueAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000) },
-    })
+    const loan = await prisma.loan.create({ data: { userId: user.id, bookCopyId: copy.id, dueAt } })
+    return { user, token, loan }
+  }
+
+  it('reports an on-time renewal as activity', async () => {
+    const { token, loan } = await seedLoanDue(new Date(Date.now() + 2 * 24 * 60 * 60 * 1000))
     recorder = recordEvents()
 
-    await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
-    await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${token}`)
+    const res = await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
 
+    expect(res.status).toBe(200)
+    expect(recorder.events).toEqual([{ type: 'activity', topics: ['metrics'] }])
+  })
+
+  it('returning an on-time loan publishes loan.changed on metrics and catalogue', async () => {
+    const { token, loan } = await seedLoanDue(new Date(Date.now() + 2 * 24 * 60 * 60 * 1000))
+    recorder = recordEvents()
+
+    const res = await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue'] }])
+  })
+
+  it('returning a past-due loan publishes loan.changed with fines too and writes the fine', async () => {
+    const { user, token, loan } = await seedLoanDue(new Date(Date.now() - 4 * 24 * 60 * 60 * 1000))
+    recorder = recordEvents()
+
+    const res = await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines'] }])
+    const fines = await prisma.fine.findMany({ where: { userId: user.id, relatedLoanId: loan.id } })
+    expect(fines).toHaveLength(1)
+    expect(fines[0].amount).toBe(40)
+  })
+
+  it('returning a loan under a day late still touches fines, though no fine is written', async () => {
+    const { user, token, loan } = await seedLoanDue(new Date(Date.now() - 2 * 60 * 60 * 1000))
+    recorder = recordEvents()
+
+    const res = await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines'] }])
+    expect(await prisma.fine.count({ where: { userId: user.id } })).toBe(0)
+  })
+
+  it('renewing a past-due loan publishes fine.changed', async () => {
+    const { token, loan } = await seedLoanDue(new Date(Date.now() - 2 * 24 * 60 * 60 * 1000))
+    recorder = recordEvents()
+
+    const res = await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
     expect(recorder.events).toEqual([
       { type: 'activity', topics: ['metrics'] },
-      { type: 'activity', topics: ['metrics'] },
+      { type: 'fine.changed', topics: ['fines'] },
     ])
+  })
+
+  it('a refused renewal publishes nothing and writes no fine', async () => {
+    const { user, token, loan } = await seedLoanDue(new Date(Date.now() - 2 * 24 * 60 * 60 * 1000))
+    const { user: waiter } = await seedUser()
+    const copy = await prisma.bookCopy.findUniqueOrThrow({ where: { id: loan.bookCopyId } })
+    await prisma.reservation.create({ data: { userId: waiter.id, bookId: copy.bookId, status: 'waiting' } })
+    recorder = recordEvents()
+
+    const renewal = await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
+
+    expect(renewal.status).toBe(409)
+    expect(recorder.events).toEqual([])
+    expect(await prisma.fine.count({ where: { userId: user.id } })).toBe(0)
   })
 })

@@ -78,12 +78,17 @@ enum BorrowRequestStatus {
 enum FineReason {
   overdue
   no_show
+  // A replacement charge for a lost book.
+  lost
 }
 
 enum FineStatus {
+  // Owed and never adjusted. The admin API calls it "outstanding".
   pending
   paid
   waived
+  // Owed, with the amount lowered by a librarian (see Fine.originalAmount).
+  adjusted
 }
 
 enum RecommendationMethod {
@@ -115,6 +120,8 @@ model User {
   decidedBorrowRequests BorrowRequest[]   @relation("BorrowRequestDecider")
   decidedBookings       ResourceBooking[] @relation("BookingDecider")
   cancelledBookings     ResourceBooking[] @relation("BookingCanceller")
+  adjustedFines         Fine[]            @relation("FineAdjuster")
+  recordedFinePayments  Fine[]            @relation("FinePaymentRecorder")
 }
 
 model Book {
@@ -275,6 +282,22 @@ model Fine {
   reason           FineReason
   status           FineStatus       @default(pending)
   createdAt        DateTime         @default(now())
+  // What the fine was before a librarian lowered it: set by the first
+  // adjustment and kept through later ones. Null means never adjusted.
+  originalAmount   Float?
+  // The latest adjustment or waive: when, by whom (null if the account is
+  // gone), and why.
+  adjustedAt       DateTime?
+  adjustedById     String?
+  adjustedBy       User?            @relation("FineAdjuster", fields: [adjustedById], references: [id], onDelete: SetNull)
+  adjustReason     String?
+  // Payment: when it was recorded and by which librarian (null if the account
+  // is gone).
+  paidAt           DateTime?
+  paidRecordedById String?
+  paidRecordedBy   User?            @relation("FinePaymentRecorder", fields: [paidRecordedById], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
 }
 
 model ReliabilityScoreLog {

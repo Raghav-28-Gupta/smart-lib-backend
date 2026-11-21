@@ -3,7 +3,11 @@ import {
   publish,
   publishActivity,
   publishBookingChange,
+  publishCatalogueChange,
+  publishFineChange,
+  publishLoanChange,
   publishResourceChange,
+  publishStudentChange,
   subscribe,
   subscriberCount,
   type LiveEvent,
@@ -74,5 +78,41 @@ describe('event bus', () => {
     stops.push(subscribe((e) => got.push(e)))
     publishResourceChange()
     expect(got).toEqual([{ type: 'resource.changed', topics: ['resources', 'metrics'] }])
+  })
+
+  it('publishFineChange publishes fine.changed on fines', () => {
+    const got: LiveEvent[] = []
+    stops.push(subscribe((e) => got.push(e)))
+    publishFineChange()
+    expect(got).toEqual([{ type: 'fine.changed', topics: ['fines'] }])
+  })
+
+  it('publishCatalogueChange publishes catalogue.changed on catalogue, plus any extra topics', () => {
+    const got: LiveEvent[] = []
+    stops.push(subscribe((e) => got.push(e)))
+    publishCatalogueChange()
+    publishCatalogueChange(['fines', 'metrics'])
+    expect(got).toEqual([
+      { type: 'catalogue.changed', topics: ['catalogue'] },
+      { type: 'catalogue.changed', topics: ['catalogue', 'fines', 'metrics'] },
+    ])
+  })
+
+  it('publishStudentChange publishes student.changed on students', () => {
+    const got: LiveEvent[] = []
+    stops.push(subscribe((e) => got.push(e)))
+    publishStudentChange()
+    expect(got).toEqual([{ type: 'student.changed', topics: ['students'] }])
+  })
+
+  it('publishLoanChange publishes loan.changed on metrics and catalogue, and on fines when the loan was past due', () => {
+    const got: LiveEvent[] = []
+    stops.push(subscribe((e) => got.push(e)))
+    publishLoanChange(false)
+    publishLoanChange(true)
+    expect(got).toEqual([
+      { type: 'loan.changed', topics: ['metrics', 'catalogue'] },
+      { type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines'] },
+    ])
   })
 })

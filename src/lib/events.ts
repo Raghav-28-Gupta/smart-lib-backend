@@ -5,7 +5,7 @@
 // is connected to this process; several instances would need a shared bus
 // (Redis pub/sub).
 
-export type LiveTopic = 'requests' | 'metrics' | 'bookings' | 'resources'
+export type LiveTopic = 'requests' | 'metrics' | 'bookings' | 'resources' | 'fines' | 'catalogue' | 'students'
 export type LiveEventType =
   | 'request.created'
   | 'request.decided'
@@ -14,6 +14,10 @@ export type LiveEventType =
   | 'activity'
   | 'booking.changed'
   | 'resource.changed'
+  | 'fine.changed'
+  | 'catalogue.changed'
+  | 'student.changed'
+  | 'loan.changed'
 
 export interface LiveEvent {
   type: LiveEventType
@@ -62,4 +66,29 @@ export function publishBookingChange(): void {
 /** A change to a resource: created, edited, taken offline or brought back. */
 export function publishResourceChange(): void {
   publish({ type: 'resource.changed', topics: ['resources', 'metrics'] })
+}
+
+/** A change to a fine row: created late, marked paid, adjusted or waived. */
+export function publishFineChange(): void {
+  publish({ type: 'fine.changed', topics: ['fines'] })
+}
+
+/** A change to books or copies: added, edited, or a copy's status moved. `extra` adds topics the same change also moves. */
+export function publishCatalogueChange(extra: LiveTopic[] = []): void {
+  publish({ type: 'catalogue.changed', topics: ['catalogue', ...extra] })
+}
+
+/** A change to what the student page shows that no other event covers: a manual reliability adjustment. */
+export function publishStudentChange(): void {
+  publish({ type: 'student.changed', topics: ['students'] })
+}
+
+/**
+ * A loan ended by a return: Dashboard numbers move and its copy is free again.
+ * `pastDue` is whether the loan was past its due date at that moment (even by
+ * less than a day), when its accruing row on the Fines page turns into a stored
+ * fine or disappears.
+ */
+export function publishLoanChange(pastDue: boolean): void {
+  publish({ type: 'loan.changed', topics: pastDue ? ['metrics', 'catalogue', 'fines'] : ['metrics', 'catalogue'] })
 }

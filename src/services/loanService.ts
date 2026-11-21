@@ -1,8 +1,9 @@
-import { LOAN_PERIOD_DAYS, MAX_RENEWALS, FINE_PER_DAY_INR } from '../config/constants'
+import { LOAN_PERIOD_DAYS, MAX_RENEWALS } from '../config/constants'
 import type { Loan } from '../generated/prisma/client'
-import { publishActivity } from '../lib/events'
+import { publishActivity, publishFineChange, publishLoanChange } from '../lib/events'
 import { ConflictError, ForbiddenError, NotFoundError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
+import { overdueFineAmount } from './fineRules'
 import { onBookReturned } from './reservationService'
 
 export interface LoanDto {
@@ -18,16 +19,6 @@ export interface LoanDto {
   fineAmount: number
   canRenew: boolean
   blockedReason: string | null
-}
-
-function daysOverdue(dueAt: Date, at: Date): number {
-  const ms = at.getTime() - dueAt.getTime()
-  if (ms <= 0) return 0
-  return Math.floor(ms / (24 * 60 * 60 * 1000))
-}
-
-function computeFineAmount(dueAt: Date, at: Date): number {
-  return daysOverdue(dueAt, at) * FINE_PER_DAY_INR
 }
 
 // Waitlist-block takes precedence over the renewal cap: someone else waiting
@@ -47,7 +38,7 @@ function computeRenewability(renewedCount: number, waitlistCount: number): { can
 async function toLoanDto(loan: Loan & { bookCopy: { bookId: string } }, now: Date): Promise<LoanDto> {
   const isActive = loan.status === 'active'
   const overdue = isActive && loan.dueAt < now
-  const fineAmount = isActive ? computeFineAmount(loan.dueAt, now) : 0
+  const fineAmount = isActive ? overdueFineAmount(loan.dueAt, now) : 0
   const waitlistCount = isActive
     ? await prisma.reservation.count({ where: { bookId: loan.bookCopy.bookId, status: 'waiting' } })
     : 0
@@ -100,10 +91,11 @@ export async function renewLoan(userId: string, loanId: string): Promise<LoanDto
   const { canRenew, blockedReason } = computeRenewability(loan.renewedCount, waitlistCount)
   if (!canRenew) throw new ConflictError(blockedReason ?? 'This loan cannot be renewed.')
 
-  const overdueDays = daysOverdue(loan.dueAt, now)
-  if (overdueDays > 0) {
+  const wasPastDue = loan.dueAt < now
+  const fineAmount = overdueFineAmount(loan.dueAt, now)
+  if (fineAmount > 0) {
     await prisma.fine.create({
-      data: { userId, relatedLoanId: loan.id, amount: overdueDays * FINE_PER_DAY_INR, reason: 'overdue' },
+      data: { userId, relatedLoanId: loan.id, amount: fineAmount, reason: 'overdue' },
     })
   }
 
@@ -116,6 +108,8 @@ export async function renewLoan(userId: string, loanId: string): Promise<LoanDto
     include: { bookCopy: { select: { bookId: true } } },
   })
   publishActivity()
+  // The accruing row on the Fines page is now a stored fine (or gone).
+  if (wasPastDue) publishFineChange()
   return toLoanDto(updated, now)
 }
 
@@ -123,10 +117,11 @@ export async function returnLoan(userId: string, loanId: string): Promise<LoanDt
   const loan = await getOwnedActiveLoan(userId, loanId)
   const now = new Date()
 
-  const overdueDays = daysOverdue(loan.dueAt, now)
-  if (overdueDays > 0) {
+  const wasPastDue = loan.dueAt < now
+  const fineAmount = overdueFineAmount(loan.dueAt, now)
+  if (fineAmount > 0) {
     await prisma.fine.create({
-      data: { userId, relatedLoanId: loan.id, amount: overdueDays * FINE_PER_DAY_INR, reason: 'overdue' },
+      data: { userId, relatedLoanId: loan.id, amount: fineAmount, reason: 'overdue' },
     })
   }
 
@@ -139,6 +134,6 @@ export async function returnLoan(userId: string, loanId: string): Promise<LoanDt
     prisma.bookCopy.update({ where: { id: loan.bookCopyId }, data: { status: 'available' } }),
   ])
   await onBookReturned(loan.bookCopy.bookId, now)
-  publishActivity()
+  publishLoanChange(wasPastDue)
   return toLoanDto(updated, now)
 }

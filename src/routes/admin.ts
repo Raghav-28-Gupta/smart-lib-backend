@@ -3,6 +3,7 @@ import { openLiveStream } from '../lib/liveStream'
 import { requireAdmin, requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
 import { adminBookingParamsSchema, adminBookingsQuerySchema, cancelBookingSchema, reassignBookingSchema } from '../schemas/adminBookings'
+import { adminFinesQuerySchema } from '../schemas/adminFines'
 import { adminRequestParamsSchema, declineRequestSchema } from '../schemas/adminRequests'
 import {
   adminResourceParamsSchema,
@@ -18,6 +19,7 @@ import {
   reassignBooking,
   type AdminBookingListQuery,
 } from '../services/adminBookingService'
+import { listFines, type AdminFineListQuery } from '../services/adminFineService'
 import { getCirculation, getDemand, getOverdue, getUtilization } from '../services/adminMetricsService'
 import { approveRequest, declineRequest, listPendingRequests, type RequestKind } from '../services/adminRequestService'
 import {
@@ -125,6 +127,10 @@ adminRouter.post(
     res.json(await reassignBooking(req.params.id as string, resourceId))
   },
 )
+
+adminRouter.get('/admin/fines', validate({ query: adminFinesQuerySchema }), async (req, res) => {
+  res.json(await listFines(req.validatedQuery as AdminFineListQuery))
+})
 
 // Live updates for the console, as Server-Sent Events (lib/liveStream.ts).
 adminRouter.get('/admin/events', (req, res) => {

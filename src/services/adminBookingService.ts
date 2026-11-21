@@ -13,6 +13,7 @@ import { Prisma } from '../generated/prisma/client'
 import type { BookingStatus, PrismaClient, ResourceType } from '../generated/prisma/client'
 import { publishBookingChange } from '../lib/events'
 import { ConflictError, NotFoundError, ValidationError } from '../lib/httpError'
+import { escapeLike } from '../lib/like'
 import { prisma } from '../lib/prisma'
 import { graceEnd, HOLDING_STATUSES, isExclusionViolation } from './bookingService'
 
@@ -96,11 +97,6 @@ function derivedStatusSql(now: Date): Prisma.Sql {
     WHEN b.status = 'booked' THEN 'booked'
     ELSE b.status::text
   END`
-}
-
-/** Makes `%`, `_` and the escape character itself match as plain text in LIKE/ILIKE. */
-function escapeLike(text: string): string {
-  return text.replace(/[\\%_]/g, '\\$&')
 }
 
 /**
