@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { openLiveStream } from '../lib/liveStream'
 import { requireAdmin, requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
-import { adminBookingsQuerySchema } from '../schemas/adminBookings'
+import { adminBookingParamsSchema, adminBookingsQuerySchema, cancelBookingSchema, reassignBookingSchema } from '../schemas/adminBookings'
 import { adminRequestParamsSchema, declineRequestSchema } from '../schemas/adminRequests'
 import {
   adminResourceParamsSchema,
@@ -11,7 +11,13 @@ import {
   takeOfflineSchema,
   updateResourceSchema,
 } from '../schemas/adminResources'
-import { listBookings, type AdminBookingListQuery } from '../services/adminBookingService'
+import {
+  cancelBookingAsLibrary,
+  listBookings,
+  listReassignOptions,
+  reassignBooking,
+  type AdminBookingListQuery,
+} from '../services/adminBookingService'
 import { getCirculation, getDemand, getOverdue, getUtilization } from '../services/adminMetricsService'
 import { approveRequest, declineRequest, listPendingRequests, type RequestKind } from '../services/adminRequestService'
 import {
@@ -97,6 +103,28 @@ adminRouter.post('/admin/resources/:id/online', validate({ params: adminResource
 adminRouter.get('/admin/bookings', validate({ query: adminBookingsQuerySchema }), async (req, res) => {
   res.json(await listBookings(req.validatedQuery as AdminBookingListQuery))
 })
+
+adminRouter.post(
+  '/admin/bookings/:id/cancel',
+  validate({ params: adminBookingParamsSchema, body: cancelBookingSchema }),
+  async (req, res) => {
+    const { reason } = req.body as { reason?: string }
+    res.json(await cancelBookingAsLibrary(req.params.id as string, req.user!.sub, reason ? reason : null))
+  },
+)
+
+adminRouter.get('/admin/bookings/:id/reassign-options', validate({ params: adminBookingParamsSchema }), async (req, res) => {
+  res.json(await listReassignOptions(req.params.id as string))
+})
+
+adminRouter.post(
+  '/admin/bookings/:id/reassign',
+  validate({ params: adminBookingParamsSchema, body: reassignBookingSchema }),
+  async (req, res) => {
+    const { resourceId } = req.body as { resourceId: string }
+    res.json(await reassignBooking(req.params.id as string, resourceId))
+  },
+)
 
 // Live updates for the console, as Server-Sent Events (lib/liveStream.ts).
 adminRouter.get('/admin/events', (req, res) => {

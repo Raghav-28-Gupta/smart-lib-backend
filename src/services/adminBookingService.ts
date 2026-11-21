@@ -4,8 +4,17 @@
 // status filter has to run in SQL too. One query returns a page with its
 // student and resource and, through count(*) OVER(), the total behind the
 // filters, so a page costs one round trip however many rows it holds.
+//
+// The librarian can also cancel a booking or move it to another resource of the
+// same type. Both are conditional updates on the booked status, so of a
+// librarian and a student acting at once only the first write lands; the other
+// is told what happened. Neither touches the student's reliability score.
 import { Prisma } from '../generated/prisma/client'
+import type { BookingStatus, PrismaClient, ResourceType } from '../generated/prisma/client'
+import { publishBookingChange } from '../lib/events'
+import { ConflictError, NotFoundError, ValidationError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
+import { graceEnd, HOLDING_STATUSES, isExclusionViolation } from './bookingService'
 
 export type AdminBookingStatus = 'booked' | 'released' | 'checked_in' | 'completed' | 'cancelled'
 
@@ -84,12 +93,14 @@ function escapeLike(text: string): string {
 }
 
 /**
- * The FROM and WHERE shared by the page query and the total-only query: every
- * listed booking with its student, resource and derived status, narrowed by the
- * status filter and the search. Values go in as bound parameters, never text.
+ * The FROM and WHERE shared by the page query, the total-only query and the
+ * single-booking read after a cancel or move: every listed booking with its
+ * student, resource and derived status, narrowed by the status filter, the
+ * search and, for one booking, its id. Values go in as bound parameters, never text.
  */
-function filteredBookings(q: Pick<AdminBookingListQuery, 'search' | 'status'>, now: Date): Prisma.Sql {
+function filteredBookings(q: Pick<AdminBookingListQuery, 'search' | 'status'> & { id?: string }, now: Date): Prisma.Sql {
   const conditions: Prisma.Sql[] = []
+  if (q.id) conditions.push(Prisma.sql`"id" = ${q.id}`)
   if (q.status) conditions.push(Prisma.sql`"derivedStatus" = ${q.status}`)
 
   const search = q.search?.trim()
@@ -151,4 +162,165 @@ export async function listBookings(q: AdminBookingListQuery, now = new Date()): 
   }
 
   return { bookings: rows.map(toDto), total, page: q.page, pageSize: q.pageSize }
+}
+
+// --- Cancel and reassign -------------------------------------------------------
+
+export interface ReassignOption {
+  id: string
+  name: string
+  location: string | null
+  capacity: number
+}
+
+interface BookingToManage {
+  status: BookingStatus
+  startTime: Date
+  endTime: Date
+  gracePeriodMinutes: number
+  cancelledById: string | null
+  resourceId: string
+  resource: { name: string; type: ResourceType }
+}
+
+async function findBookingToManage(client: PrismaClient | Prisma.TransactionClient, id: string): Promise<BookingToManage> {
+  const booking = await client.resourceBooking.findUnique({
+    where: { id },
+    select: {
+      status: true,
+      startTime: true,
+      endTime: true,
+      gracePeriodMinutes: true,
+      cancelledById: true,
+      resourceId: true,
+      resource: { select: { name: true, type: true } },
+    },
+  })
+  if (!booking) throw new NotFoundError('Booking')
+  return booking
+}
+
+/**
+ * Throws the specific refusal for a booking the librarian can no longer manage.
+ * Manageable means raw status booked and not past its grace end: the list's
+ * canManage. The refusals follow the same derived rules the list shows (a
+ * checked-in booking is finished once its end time is reached). Declined,
+ * expired and no_show rows are not bookings the console lists, so they are not found.
+ */
+function refuseUnlessManageable(booking: Pick<BookingToManage, 'status' | 'startTime' | 'endTime' | 'gracePeriodMinutes' | 'cancelledById'>, now: Date): void {
+  switch (booking.status) {
+    case 'booked':
+      // Strictly after the grace end, like the list: at the very end it can still be checked into.
+      if (now > graceEnd(booking)) throw new ConflictError('This booking has already been released.')
+      return
+    case 'cancelled':
+      throw new ConflictError(booking.cancelledById ? 'Already cancelled by the library.' : 'The student already cancelled this booking.')
+    case 'checked_in':
+      throw new ConflictError(booking.endTime <= now ? 'This booking has already finished.' : 'The student already checked in.')
+    case 'completed':
+      throw new ConflictError('This booking has already finished.')
+    case 'released':
+      throw new ConflictError('This booking has already been released.')
+    case 'requested':
+      throw new ConflictError('This is a room request. Decide it on the Requests page.')
+    default:
+      throw new NotFoundError('Booking')
+  }
+}
+
+async function findBookingDto(id: string, now: Date): Promise<AdminBookingDto> {
+  const [row] = await prisma.$queryRaw<BookingRow[]>(Prisma.sql`SELECT booking.* ${filteredBookings({ id }, now)}`)
+  if (!row) throw new NotFoundError('Booking')
+  return toDto(row)
+}
+
+/**
+ * Cancels a booking on the library's behalf and records who, when and why. The
+ * write is conditional on the status still being booked, so a student who
+ * checked in or cancelled a moment earlier wins and the librarian is told which.
+ */
+export async function cancelBookingAsLibrary(
+  bookingId: string,
+  adminId: string,
+  reason: string | null,
+  now = new Date(),
+): Promise<AdminBookingDto> {
+  refuseUnlessManageable(await findBookingToManage(prisma, bookingId), now)
+
+  const { count } = await prisma.resourceBooking.updateMany({
+    where: { id: bookingId, status: 'booked' },
+    data: { status: 'cancelled', cancelledById: adminId, cancelledAt: now, cancelReason: reason },
+  })
+  if (count === 0) {
+    // Someone else's write landed between the read and this one: say what it was.
+    refuseUnlessManageable(await findBookingToManage(prisma, bookingId), now)
+    throw new ConflictError('This booking can no longer be cancelled.')
+  }
+
+  publishBookingChange()
+  return findBookingDto(bookingId, now)
+}
+
+/**
+ * The resources a booking can move to: online, of the same type, not the one it
+ * is on, and with no holding booking (requested, booked or checked in)
+ * overlapping its time. A snapshot: reassignBooking re-checks under a lock.
+ */
+export async function listReassignOptions(bookingId: string, now = new Date()): Promise<ReassignOption[]> {
+  const booking = await findBookingToManage(prisma, bookingId)
+  refuseUnlessManageable(booking, now)
+
+  return prisma.resource.findMany({
+    where: {
+      type: booking.resource.type,
+      id: { not: booking.resourceId },
+      status: 'available',
+      bookings: { none: { status: { in: HOLDING_STATUSES }, startTime: { lt: booking.endTime }, endTime: { gt: booking.startTime } } },
+    },
+    orderBy: [{ name: 'asc' }, { id: 'asc' }],
+    select: { id: true, name: true, location: true, capacity: true },
+  })
+}
+
+/**
+ * Moves a booking to another resource of the same type, keeping its time, and
+ * records the name of the resource it left and when. Takes the target's
+ * advisory lock first, the way createBooking does, so simultaneous moves onto
+ * one resource queue up and the losers fail cleanly on the no_overlapping_bookings
+ * constraint (23P01) instead of being aborted as deadlock victims.
+ */
+export async function reassignBooking(bookingId: string, resourceId: string, now = new Date()): Promise<AdminBookingDto> {
+  try {
+    await prisma.$transaction(async (tx) => {
+      // $executeRaw, not $queryRaw: the function returns void, which Prisma
+      // cannot deserialize as a result column.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${resourceId}))`
+
+      const booking = await findBookingToManage(tx, bookingId)
+      refuseUnlessManageable(booking, now)
+      const target = await tx.resource.findUnique({ where: { id: resourceId } })
+      if (!target) throw new NotFoundError('Resource')
+      if (target.status === 'offline') throw new ConflictError('That resource is offline.')
+      if (target.type !== booking.resource.type) throw new ValidationError('A booking can only move to a resource of the same type.')
+      if (target.id === booking.resourceId) throw new ValidationError('That booking is already on that resource.')
+
+      // Conditional on the status and the resource just read: a student who
+      // checked in, or another librarian who moved it, wins and this one refuses.
+      const { count } = await tx.resourceBooking.updateMany({
+        where: { id: bookingId, status: 'booked', resourceId: booking.resourceId },
+        data: { resourceId, movedFromName: booking.resource.name, movedAt: now },
+      })
+      if (count === 0) {
+        refuseUnlessManageable(await findBookingToManage(tx, bookingId), now)
+        // Still booked, so it was moved to another resource in the meantime.
+        throw new ConflictError('This booking was just moved.')
+      }
+    })
+  } catch (e) {
+    if (isExclusionViolation(e)) throw new ConflictError('That resource is taken at this time.')
+    throw e
+  }
+
+  publishBookingChange()
+  return findBookingDto(bookingId, now)
 }

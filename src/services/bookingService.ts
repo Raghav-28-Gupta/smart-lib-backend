@@ -51,7 +51,7 @@ interface BookingAlternative {
 // which get their own known codes) -- an EXCLUDE-constraint violation surfaces
 // as a generic P2039 "Database error" wrapper with the real code only present
 // in the message text. Matching on it here is the only reliable option.
-function isExclusionViolation(e: unknown): boolean {
+export function isExclusionViolation(e: unknown): boolean {
   return (
     e instanceof Prisma.PrismaClientKnownRequestError &&
     e.code === 'P2039' &&
@@ -275,14 +275,21 @@ export async function checkInBooking(userId: string, bookingId: string): Promise
   if (window.frontendStatus === 'released') throw new ConflictError('The grace period for this booking has passed.')
 
   const updated = await prisma.$transaction(async (tx) => {
-    const result = await tx.resourceBooking.update({
-      where: { id: bookingId },
+    // Conditional on the status just read, like cancelBooking: a librarian's
+    // cancel or a release landing between that read and this write wins cleanly,
+    // instead of being overwritten by a check-in (and rewarded with the bonus).
+    const { count } = await tx.resourceBooking.updateMany({
+      where: { id: bookingId, status: 'booked' },
       data: { status: 'checked_in', checkedInAt: now },
+    })
+    if (count === 0) return null
+    await applyReliabilityDelta(tx, userId, RELIABILITY_ONTIME_BOOKING_BONUS, 'On-time check-in for a resource booking')
+    return tx.resourceBooking.findUniqueOrThrow({
+      where: { id: bookingId },
       include: { resource: { select: { name: true, type: true } } },
     })
-    await applyReliabilityDelta(tx, userId, RELIABILITY_ONTIME_BOOKING_BONUS, 'On-time check-in for a resource booking')
-    return result
   })
+  if (!updated) throw new ConflictError('This booking cannot be checked into.')
   publishBookingChange()
   return toBookingDto(updated, now)
 }

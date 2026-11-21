@@ -20,3 +20,11 @@ export const adminBookingsQuerySchema = z.object({
   page: z.coerce.number().int().min(1).max(MAX_BOOKING_PAGE).default(1),
   pageSize: z.coerce.number().int().min(1).max(MAX_BOOKING_PAGE_SIZE).default(25),
 })
+
+export const adminBookingParamsSchema = z.object({ id: z.string().min(1) })
+
+// Optional and trimmed; the route turns an empty reason into none. A cancel with
+// no body at all (Express 5 leaves req.body undefined) means no reason.
+export const cancelBookingSchema = z.object({ reason: z.string().trim().max(300).optional() }).default({})
+
+export const reassignBookingSchema = z.object({ resourceId: z.string().min(1) })
