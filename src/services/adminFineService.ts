@@ -41,7 +41,7 @@ export interface AdminFineDto {
   status: AdminFineStatus
   /** When the fine was created; for an accruing row, the loan's due date. */
   date: Date
-  /** The librarian's reason, for adjusted and waived fines. */
+  /** The librarian's reason for lowering or waiving the fine, kept after it is paid; null when it was never adjusted. */
   note: string | null
   /** The librarian who adjusted or waived it, or who recorded the payment; null when none, or the account is gone. */
   recordedBy: string | null
@@ -120,7 +120,7 @@ function filteredFines(
              COALESCE(f."originalAmount", f.amount) AS "originalAmount",
              CASE f.status WHEN 'pending' THEN 'outstanding' ELSE f.status::text END AS status,
              f."createdAt" AS "date",
-             CASE WHEN f.status IN ('adjusted', 'waived') THEN f."adjustReason" END AS note,
+             f."adjustReason" AS note,
              CASE f.status
                WHEN 'paid' THEN payer.name
                WHEN 'adjusted' THEN adjuster.name

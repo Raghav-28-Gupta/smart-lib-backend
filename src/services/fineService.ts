@@ -19,7 +19,7 @@ export interface StudentFineDto {
   status: 'outstanding' | 'adjusted' | 'paid' | 'waived'
   /** When the fine was created. */
   date: Date
-  /** The librarian's reason, for adjusted and waived fines only. */
+  /** The librarian's reason for lowering or waiving the fine, kept after it is paid; null when it was never adjusted. */
   note: string | null
 }
 
@@ -68,7 +68,7 @@ export async function listMyFines(userId: string): Promise<{ fines: StudentFineD
       originalAmount: fine.originalAmount ?? fine.amount,
       status: STATUS_TO_STUDENT[fine.status],
       date: fine.createdAt,
-      note: fine.status === 'adjusted' || fine.status === 'waived' ? fine.adjustReason : null,
+      note: fine.adjustReason,
     })),
     outstandingTotal: owed._sum.amount ?? 0,
   }

@@ -106,7 +106,7 @@ describe('GET /fines/me', () => {
       createdAt: new Date(t - 5 * DAY_MS),
     })
 
-    // Adjusted, then paid: shown as paid with no library note.
+    // Adjusted, then paid: shown as paid, still with the library's note that explains the lower amount.
     const paidLoan = await seedLoan(asha.id, 'Clean Code', new Date(t - 30 * DAY_MS))
     const paid = await seedFine({
       userId: asha.id,
@@ -168,7 +168,7 @@ describe('GET /fines/me', () => {
           originalAmount: 60,
           status: 'paid',
           date: paid.createdAt.toISOString(),
-          note: null,
+          note: 'Hardship',
         },
         {
           id: bare.id,
@@ -184,6 +184,30 @@ describe('GET /fines/me', () => {
       // Outstanding 30 + 10 and adjusted 20; the paid, waived and still-out loan add nothing.
       outstandingTotal: 60,
     })
+  })
+
+  it('a fine adjusted and then paid keeps its note on /fines/me', async () => {
+    const { user: student, token } = await seedUser('student', 'Asha Rao')
+    const { token: priyaToken } = await seedUser('admin', 'Priya Menon')
+    const { token: samToken } = await seedUser('admin', 'Sam Verma')
+    const t = Date.now()
+    const adjusted = await seedFine({ userId: student.id, amount: 150, createdAt: new Date(t - DAY_MS) })
+    const plain = await seedFine({ userId: student.id, amount: 30, createdAt: new Date(t - 2 * DAY_MS) })
+
+    // Through the librarian's own routes, as it happens in the library.
+    const lowered = await request(app).post(`/admin/fines/${adjusted.id}/adjust`).set(auth(priyaToken)).send({ amount: 40, reason: 'Hardship' })
+    const paidAdjusted = await request(app).post(`/admin/fines/${adjusted.id}/paid`).set(auth(samToken)).send({ amount: 40 })
+    const paidPlain = await request(app).post(`/admin/fines/${plain.id}/paid`).set(auth(samToken)).send({ amount: 30 })
+
+    const res = await mine(token)
+
+    expect([lowered.status, paidAdjusted.status, paidPlain.status]).toEqual([200, 200, 200])
+    // The student still sees why it is ₹40, was ₹150; a fine that was never adjusted has no note.
+    expect(res.body.fines).toEqual([
+      expect.objectContaining({ id: adjusted.id, status: 'paid', amount: 40, originalAmount: 150, note: 'Hardship' }),
+      expect.objectContaining({ id: plain.id, status: 'paid', amount: 30, originalAmount: 30, note: null }),
+    ])
+    expect(res.body.outstandingTotal).toBe(0)
   })
 
   it('outstandingTotal counts outstanding and adjusted, not paid or waived', async () => {

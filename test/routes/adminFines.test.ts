@@ -510,7 +510,7 @@ describe('admin fines list', () => {
     })
   })
 
-  it('a waived fine shows the note and librarian, a paid one the librarian who recorded the payment', async () => {
+  it('a waived fine shows the note and librarian, a paid one the librarian who recorded the payment and the note of any earlier adjustment', async () => {
     const { token: admin, user: priya } = await seedUser('admin', { name: 'Priya Menon' })
     const { user: sam } = await seedUser('admin', { name: 'Sam Verma' })
     const { user: student } = await seedUser()
@@ -522,7 +522,7 @@ describe('admin fines list', () => {
       adjustReason: 'Library error',
     })
     // Adjusted by Priya, then paid at Sam's desk: the payment is Sam's, and the
-    // note is for adjusted and waived fines only.
+    // note stays Priya's reason, so the lowered amount is still explained.
     const paid = await seedFineOnLoan(student.id, {
       status: 'paid',
       amount: 20,
@@ -537,7 +537,7 @@ describe('admin fines list', () => {
 
     const byId = new Map((res.body.fines as ListedFine[]).map((f) => [f.id, f]))
     expect(byId.get(waived.id)).toMatchObject({ status: 'waived', amount: 0, originalAmount: 40, note: 'Library error', recordedBy: 'Priya Menon' })
-    expect(byId.get(paid.id)).toMatchObject({ status: 'paid', amount: 20, originalAmount: 60, note: null, recordedBy: 'Sam Verma' })
+    expect(byId.get(paid.id)).toMatchObject({ status: 'paid', amount: 20, originalAmount: 60, note: 'Hardship', recordedBy: 'Sam Verma' })
     expect(byId.get(paidPlain.id)).toMatchObject({ status: 'paid', originalAmount: 20, note: null, recordedBy: 'Priya Menon' })
   })
 
@@ -698,8 +698,8 @@ describe('mark a fine paid', () => {
     const res = await pay(samToken, fine.id, { amount: 50 })
 
     expect(res.status).toBe(200)
-    // Paid at the lowered amount; the payment is Sam's and the adjustment's note is not shown on a paid fine.
-    expect(res.body).toMatchObject({ status: 'paid', amount: 50, originalAmount: 150, note: null, recordedBy: 'Sam Verma', canSettle: false })
+    // Paid at the lowered amount; the payment is Sam's and the adjustment's reason is still shown.
+    expect(res.body).toMatchObject({ status: 'paid', amount: 50, originalAmount: 150, note: 'Hardship', recordedBy: 'Sam Verma', canSettle: false })
     expect(await stored(fine.id)).toMatchObject({
       status: 'paid',
       amount: 50,
@@ -758,6 +758,29 @@ describe('mark a fine paid', () => {
     expect(res.status).toBe(200)
     expect(res.body).toMatchObject({ status: 'paid', amount: 50, originalAmount: 150 })
     expect(await stored(fine.id)).toMatchObject({ status: 'paid', amount: 50, paidRecordedById: sam.id })
+  })
+
+  it('a fine adjusted and then paid keeps its note on /admin/fines', async () => {
+    const { token: priyaToken } = await seedUser('admin', { name: 'Priya Menon' })
+    const { token: samToken } = await seedUser('admin', { name: 'Sam Verma' })
+    const { user: student } = await seedUser()
+    const adjusted = await seedFineOnLoan(student.id, { amount: 150 })
+    const plain = await seedFineOnLoan(student.id, { amount: 30 })
+
+    await adjust(priyaToken, adjusted.id, { amount: 40, reason: 'Hardship' })
+    const paid = await pay(samToken, adjusted.id, { amount: 40 })
+    await pay(samToken, plain.id, { amount: 30 })
+
+    // The payment response, the list and the student's page in the console all still say why it is ₹40, was ₹150.
+    expect(paid.status).toBe(200)
+    expect(paid.body).toMatchObject({ status: 'paid', amount: 40, originalAmount: 150, note: 'Hardship', recordedBy: 'Sam Verma' })
+    const listed = await list(samToken, '?status=paid')
+    const byId = new Map((listed.body.fines as ListedFine[]).map((f) => [f.id, f]))
+    expect(byId.get(adjusted.id)).toMatchObject({ status: 'paid', amount: 40, originalAmount: 150, note: 'Hardship', recordedBy: 'Sam Verma' })
+    // A fine that was never adjusted has no note to keep.
+    expect(byId.get(plain.id)).toMatchObject({ status: 'paid', amount: 30, originalAmount: 30, note: null, recordedBy: 'Sam Verma' })
+    const forStudent = await listFinesForStudent(student.id, 50)
+    expect(forStudent.find((f) => f.id === adjusted.id)).toMatchObject({ status: 'paid', note: 'Hardship', recordedBy: 'Sam Verma' })
   })
 
   it('paying with a stale amount after a partial adjust is 409 with the changed message and the fine stays adjusted', async () => {
