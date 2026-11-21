@@ -687,3 +687,136 @@ describe('GET /bookings/me with room requests', () => {
     expect(res.body[2].declineReason).toBeNull()
   })
 })
+
+describe('GET /bookings/me with library cancels and moves', () => {
+  beforeEach(resetDb)
+
+  const HOUR_MS = 60 * 60 * 1000
+  const daysAgo = (d: number) => new Date(Date.now() - d * 24 * HOUR_MS)
+
+  async function seedAdmin() {
+    const admin = await prisma.user.create({
+      data: { name: 'Librarian', email: `librarian${Math.random()}@test.com`, passwordHash: 'x', role: 'admin' },
+    })
+    const token = jwt.sign({ sub: admin.id, role: admin.role }, JWT_SECRET, { expiresIn: '1h' })
+    return { admin, token }
+  }
+
+  // A booked seat the student has not reached yet: tomorrow, so the grace period is never in play.
+  function seedBooking(userId: string, resourceId: string, data: Partial<Prisma.ResourceBookingUncheckedCreateInput> = {}) {
+    const start = new Date(Date.now() + 24 * HOUR_MS)
+    return prisma.resourceBooking.create({
+      data: { userId, resourceId, startTime: start, endTime: new Date(start.getTime() + HOUR_MS), ...data },
+    })
+  }
+
+  function myBookings(token: string) {
+    return request(app).get('/bookings/me').set('Authorization', `Bearer ${token}`)
+  }
+
+  it('a library-cancelled booking is listed as cancelledByLibrary with its reason', async () => {
+    const { user, token } = await seedUser()
+    const { token: adminToken } = await seedAdmin()
+    const seat = await seedResource('seat', 'Desk 1')
+    const booking = await seedBooking(user.id, seat.id)
+    const cancelled = await request(app)
+      .post(`/admin/bookings/${booking.id}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'The desk is being repaired' })
+    expect(cancelled.status).toBe(200)
+
+    const res = await myBookings(token)
+
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveLength(1)
+    expect(res.body[0]).toMatchObject({
+      id: booking.id,
+      status: 'cancelled',
+      frontendStatus: 'cancelledByLibrary',
+      cancelReason: 'The desk is being repaired',
+      graceRemainingSeconds: 0,
+      movedFrom: null,
+    })
+  })
+
+  it('it disappears after 7 days', async () => {
+    const { admin } = await seedAdmin()
+    const { user, token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 1')
+    const booking = await seedBooking(user.id, seat.id, {
+      status: 'cancelled',
+      cancelledById: admin.id,
+      cancelledAt: daysAgo(6),
+      cancelReason: 'The desk is being repaired',
+    })
+    expect((await myBookings(token)).body.map((b: { id: string }) => b.id)).toEqual([booking.id])
+
+    await prisma.resourceBooking.update({ where: { id: booking.id }, data: { cancelledAt: daysAgo(8) } })
+
+    expect((await myBookings(token)).body).toEqual([])
+  })
+
+  it('a cancel by the student is still not listed', async () => {
+    const { user, token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 1')
+    const room = await seedResource('room', 'Room 201')
+    const booking = await seedBooking(user.id, seat.id)
+    const pending = await seedBooking(user.id, room.id, { status: 'requested' })
+
+    const seatCancel = await request(app).post(`/bookings/${booking.id}/cancel`).set('Authorization', `Bearer ${token}`)
+    const withdraw = await request(app).post(`/bookings/${pending.id}/cancel`).set('Authorization', `Bearer ${token}`)
+
+    expect(seatCancel.status).toBe(200)
+    expect(withdraw.status).toBe(200)
+    expect((await myBookings(token)).body).toEqual([])
+  })
+
+  it('a moved booking shows the new resource name and movedFrom', async () => {
+    const { user, token } = await seedUser()
+    const { token: adminToken } = await seedAdmin()
+    const oldDesk = await seedResource('seat', 'Desk 1')
+    const newDesk = await seedResource('seat', 'Desk 2')
+    const booking = await seedBooking(user.id, oldDesk.id)
+    const moved = await request(app)
+      .post(`/admin/bookings/${booking.id}/reassign`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ resourceId: newDesk.id })
+    expect(moved.status).toBe(200)
+
+    const res = await myBookings(token)
+
+    expect(res.body).toHaveLength(1)
+    expect(res.body[0]).toMatchObject({
+      id: booking.id,
+      resourceId: newDesk.id,
+      resourceName: 'Desk 2',
+      movedFrom: 'Desk 1',
+      frontendStatus: 'upcomingFar',
+      cancelReason: null,
+    })
+  })
+
+  it('movedFrom is null after 7 days', async () => {
+    const { user, token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 2')
+    const booking = await seedBooking(user.id, seat.id, { movedFromName: 'Desk 1', movedAt: daysAgo(6) })
+    expect((await myBookings(token)).body[0].movedFrom).toBe('Desk 1')
+
+    await prisma.resourceBooking.update({ where: { id: booking.id }, data: { movedAt: daysAgo(8) } })
+
+    const res = await myBookings(token)
+    expect(res.body).toHaveLength(1)
+    expect(res.body[0]).toMatchObject({ resourceName: 'Desk 2', movedFrom: null })
+  })
+
+  it('an existing booking has null cancelReason and movedFrom', async () => {
+    const { user, token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 1')
+    await seedBooking(user.id, seat.id)
+
+    const res = await myBookings(token)
+
+    expect(res.body).toHaveLength(1)
+    expect(res.body[0]).toMatchObject({ frontendStatus: 'upcomingFar', cancelReason: null, movedFrom: null })
+  })
+})

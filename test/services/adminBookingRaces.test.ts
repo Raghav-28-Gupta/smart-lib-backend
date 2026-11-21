@@ -180,8 +180,8 @@ describe('races on one booking', () => {
 
 // --- Interleavings pinned with a row lock --------------------------------------
 
-/** Polls until some other session is stuck waiting for a lock (the action under test, on the held row). */
-async function waitUntilAWriterIsBlocked(): Promise<void> {
+/** Polls until some other session is stuck waiting for a lock (the action under test, on what the test holds). */
+async function waitUntilAWriterIsBlocked(what = 'the booking row'): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt++) {
     const [{ blocked }] = await prisma.$queryRaw<[{ blocked: number }]>`
       SELECT count(*)::int AS blocked FROM pg_stat_activity
@@ -189,7 +189,7 @@ async function waitUntilAWriterIsBlocked(): Promise<void> {
     if (blocked > 0) return
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
-  throw new Error('The action never blocked on the booking row')
+  throw new Error(`The action never blocked on ${what}`)
 }
 
 /**
@@ -332,5 +332,71 @@ describe('a booking changed between the action reading it and writing it', () =>
     // The other librarian's move stands; ours wrote nothing.
     expect(await stored(booking.id)).toMatchObject({ resourceId: theirs.id, status: 'booked', movedFromName: 'Their source' })
     expect(recorder.events).toEqual([])
+  }, 60_000)
+
+  it("a student cancel that read the booking before a librarian cancel landed cannot overwrite the library's cancel", async () => {
+    const { user: librarian } = await seedUser('admin')
+    const { token, user: student } = await seedUser()
+    const booking = await seedUpcomingBooking(student.id)
+    recorder = recordEvents()
+
+    const res = await readThenCompete(
+      booking.id,
+      () => studentCancel(token, booking.id),
+      (tx) =>
+        tx.resourceBooking.update({
+          where: { id: booking.id },
+          data: { status: 'cancelled', cancelledById: librarian.id, cancelledAt: new Date(), cancelReason: 'Closed' },
+        }),
+    )
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This booking cannot be cancelled.')
+    expect(await stored(booking.id)).toMatchObject({ status: 'cancelled', cancelledById: librarian.id, cancelReason: 'Closed' })
+    expect(recorder.events).toEqual([])
+  }, 60_000)
+
+  it("a student cancel that read the booking before the librarian's reassign landed still cancels it, on its new resource", async () => {
+    const { token, user: student } = await seedUser()
+    const booking = await seedUpcomingBooking(student.id)
+    const target = await seedSeat()
+
+    // Not a loss for either side: the cancel only needs the booking to be booked, wherever it sits.
+    const res = await readThenCompete(
+      booking.id,
+      () => studentCancel(token, booking.id),
+      (tx) => tx.resourceBooking.update({ where: { id: booking.id }, data: { resourceId: target.id, movedFromName: 'Old desk', movedAt: new Date() } }),
+    )
+
+    expect(res.status).toBe(200)
+    expect(await stored(booking.id)).toMatchObject({ status: 'cancelled', resourceId: target.id, cancelledById: null })
+  }, 60_000)
+
+  it("a reassign holds the target's advisory lock, like createBooking, so moves onto one resource queue up instead of deadlocking", async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const booking = await seedUpcomingBooking(student.id)
+    const target = await seedSeat()
+    let pending: Promise<request.Response> | undefined
+
+    try {
+      // Another transaction (a student booking that resource, say) holds the lock.
+      await prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${target.id}))`
+          pending = Promise.resolve(libraryReassign(admin, booking.id, target.id))
+          await waitUntilAWriterIsBlocked("the target's advisory lock")
+          // Still waiting, so it has not touched the booking.
+          expect(await stored(booking.id)).toMatchObject({ resourceId: booking.resourceId, movedFromName: null })
+        },
+        { timeout: 30_000, maxWait: 30_000 },
+      )
+    } finally {
+      await pending
+    }
+
+    const res = await pending!
+    expect(res.status).toBe(200)
+    expect(await stored(booking.id)).toMatchObject({ resourceId: target.id, status: 'booked' })
   }, 60_000)
 })

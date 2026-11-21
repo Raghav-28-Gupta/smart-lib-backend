@@ -105,11 +105,15 @@ Check every generated migration for a `DROP` of either before applying it.
 
 ## Live Events
 
-Every write that changes requests or Dashboard numbers publishes an event once
-it has committed (`src/lib/events.ts`: `publish`, or `publishActivity()` for a
-change that only moves Dashboard numbers). `GET /admin/events` streams them to
-the admin console. A new mutation the console should see must publish one,
-with a test using `recordEvents()` from `test/helpers/events.ts`.
+Every write that changes requests, bookings, resources or Dashboard numbers
+publishes an event once it has committed (`src/lib/events.ts`: `publish`;
+`publishActivity()` for a change that only moves Dashboard numbers;
+`publishBookingChange()` for a booking that is not a request, on the `bookings`
+and `metrics` topics; `publishResourceChange()` for a resource added, edited,
+taken offline or brought back, on the `resources` and `metrics` topics).
+`GET /admin/events` streams them to the admin console. A new mutation the
+console should see must publish one, with a test using `recordEvents()` from
+`test/helpers/events.ts`.
 
 ---
 

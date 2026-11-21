@@ -234,7 +234,7 @@ next request takes about a minute while it wakes.
 | DELETE | `/reservations/:id` | ✓ | Leave the waitlist / decline a claim |
 | GET | `/resources/availability?type=&date=` | — | Seats/rooms with per-slot occupancy for a date |
 | POST | `/bookings` | ✓ | Book a seat, or request a room (`{ resourceId, startTime, endTime }`); 409 + alternatives on conflict |
-| GET | `/bookings/me` | ✓ | Your bookings and room requests, with computed grace-window status |
+| GET | `/bookings/me` | ✓ | Your bookings and room requests, with computed grace-window status; also a booking the library cancelled or moved, for 7 days (see *Bookings and resources*) |
 | POST | `/bookings/:id/checkin` | ✓ | Check in within the grace window |
 | POST | `/bookings/:id/cancel` | ✓ | Cancel before check-in, or withdraw a room request |
 | GET | `/profile/reliability` | ✓ | Reliability score, tier, and recent history |
@@ -246,6 +246,15 @@ next request takes about a minute while it wakes.
 | GET | `/admin/requests` | admin | Pending borrow and room requests, oldest first, with counts |
 | POST | `/admin/requests/:kind/:id/approve` | admin | Approve (`kind` is `borrow` or `room`); 409 if it was already settled |
 | POST | `/admin/requests/:kind/:id/decline` | admin | Decline, with an optional `{ reason }` (up to 300 characters) |
+| GET | `/admin/resources?type=` | admin | Every seat and room (`type` is `seat` or `room`; omit for both), by name, with its status and how many bookings it still holds (`upcomingBookings`) |
+| POST | `/admin/resources` | admin | Add one: `{ type, name, location?, capacity }` (name and location up to 100 characters, capacity a whole number 1-100); answers 201 |
+| PATCH | `/admin/resources/:id` | admin | Change `name`, `location` and/or `capacity` (at least one; a blank `location` clears it); the type cannot change |
+| POST | `/admin/resources/:id/offline` | admin | Take it offline, with an optional `{ note }` (up to 300 characters); 409 if it already is |
+| POST | `/admin/resources/:id/online` | admin | Bring it back and clear the note; 409 if it already is |
+| GET | `/admin/bookings?search=&status=&page=&pageSize=` | admin | Bookings, newest start time first, 25 per page (up to 100), with the total behind the filters |
+| POST | `/admin/bookings/:id/cancel` | admin | Cancel a booking for the library, with an optional `{ reason }` (up to 300 characters); 409 if it can no longer be cancelled |
+| GET | `/admin/bookings/:id/reassign-options` | admin | Resources the booking could move to: online, same type, free for its time |
+| POST | `/admin/bookings/:id/reassign` | admin | Move the booking to another resource of the same type (`{ resourceId }`), keeping its time |
 | GET | `/admin/events` | admin | Live updates for the console, as Server-Sent Events |
 | GET | `/health` | — | Is this service up |
 | GET | `/health/db` | — | Proves the Node → Postgres link |
@@ -286,6 +295,64 @@ instant.
   (`src/services/requestHolds.ts`), and before the request paths read or write.
 - Students see declined and expired requests for 7 days.
 
+## Bookings and resources
+
+The admin console manages resources (seats and rooms) and the bookings on them.
+All nine routes sit behind the `/admin` guard, like the rest.
+
+**Resources.** A resource is `available` or `offline`. Offline means no new
+bookings: `POST /bookings` answers 409 ("This resource is offline right now."),
+`GET /resources/availability` leaves it out, a conflict never suggests it as an
+alternative, and no booking can be moved onto it. Bookings that already exist
+stay, which is why the list carries `upcomingBookings` (requested, booked or
+checked-in bookings that have not ended). Taking a resource offline can carry a
+note; bringing it back clears the note. A new resource needs a type, a name and
+a capacity; the type is fixed after that. A name or location over 100
+characters, a capacity outside 1-100, a note over 300 characters, or a `PATCH`
+with no field to change is a 400.
+
+**The bookings list.** `GET /admin/bookings` returns
+`{ bookings, total, page, pageSize }`. `search` (up to 100 characters) matches
+the student's name or email or the resource name, ignoring case. `status` is
+`booked`, `released`, `checked_in`, `completed` or `cancelled`; anything else,
+including `requested` and `no_show`, is a 400. As for students, the status is
+worked out when it is read: a booking is `released` once its grace period has
+passed without a check-in, and a checked-in one is `completed` once its end time
+is reached. Room requests that are still pending, declined or expired are not
+listed (they live on the Requests page). Each booking carries `cancelledBy`
+(`student` or `library`), `cancelReason`, `movedFromName` and `canManage`, which
+is true exactly while the booking is `booked`. `page` starts at 1 and
+`pageSize` defaults to 25 (up to 100).
+
+**Cancel and reassign.** Both are conditional updates on the booking still
+being `booked` and not past its grace period, so of a librarian and a student
+acting at once only the first write lands, and a librarian who lost is told what
+happened with a 409: "Already cancelled by the library.", "The student already cancelled
+this booking.", "The student already checked in.", "This booking has already
+finished.", "This booking has already been released.", or, for a room request,
+"This is a room request. Decide it on the Requests page." An unknown booking is
+a 404. Neither changes the student's reliability score. A cancel records who
+did it, when and why (`cancelledById`, `cancelledAt`, `cancelReason`). A
+reassign keeps the booking's time and records the name of the resource it left
+and when (`movedFromName`, `movedAt`). It is refused with a 400 for a resource
+of the other type or the one it is already on, and with a 409 for an offline
+resource ("That resource is offline.") or one that is taken at that time ("That
+resource is taken at this time."; the exclusion constraint decides, under the
+same per-resource lock as `POST /bookings`). `reassign-options` lists the
+online resources of the same type with nothing holding the booking's time, by
+name, as `{ id, name, location, capacity }`; it is a snapshot, and the reassign
+re-checks.
+
+**What students see.** `GET /bookings/me` shows a booking the library cancelled
+(the library cancelled it exactly when `cancelledById` is set) with
+`frontendStatus: 'cancelledByLibrary'` and, if the librarian gave one, its
+`cancelReason` (null for every other booking). It stays listed for 7 days
+after `cancelledAt` and then drops off, the way declined and expired requests
+do. A student's own cancel is not listed, as before. A booking the library moved
+shows the new resource's name and id, and `movedFrom`, the old resource's name,
+for 7 days after `movedAt` (null otherwise). The booking's `status` stays the
+raw database value (`cancelled` for a library cancel).
+
 ## Live events
 
 `GET /admin/events` streams Server-Sent Events to the admin console: `ready` on
@@ -296,8 +363,11 @@ event: request.created
 data: {"topics":["requests"],"kind":"borrow","summary":"Aditi Sharma wants to borrow Clean Code"}
 ```
 
-Events name what changed (`requests`, `metrics`), never the new state: the
-console refetches. A `: ping` comment goes out every 25 seconds, and each
+Events name what changed (`requests`, `metrics`, `bookings`, `resources`),
+never the new state: the console refetches. A booking that is not a request
+changing (a seat booked, a check-in, a cancel or a move) sends
+`booking.changed`; a resource added, edited, taken offline or brought back
+sends `resource.changed`. A `: ping` comment goes out every 25 seconds, and each
 stream ends after 15 minutes, so the console reconnects and its token and role
 are checked again.
 

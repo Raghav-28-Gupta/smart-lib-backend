@@ -17,13 +17,17 @@ export interface BookingDto {
   startTime: Date
   endTime: Date
   status: string
-  frontendStatus: 'requested' | 'declined' | 'expired' | 'upcomingFar' | 'inWindow' | 'checkedIn' | 'released'
+  frontendStatus: 'requested' | 'declined' | 'expired' | 'cancelledByLibrary' | 'upcomingFar' | 'inWindow' | 'checkedIn' | 'released'
   graceRemainingSeconds: number
   checkedInAt: Date | null
   /** A room request's deadline: its start plus the grace period. Null otherwise. */
   expiresAt: Date | null
   /** Set only on a declined request, and only if the librarian gave one. */
   declineReason: string | null
+  /** Set only when the library cancelled the booking, and only if the librarian gave a reason. */
+  cancelReason: string | null
+  /** The name of the resource the library moved this booking from, for REQUEST_OUTCOME_VISIBLE_DAYS after the move. Null otherwise. */
+  movedFrom: string | null
 }
 
 /**
@@ -79,10 +83,19 @@ function computeWindow(startTime: Date, gracePeriodMinutes: number, now: Date): 
   return { frontendStatus: 'released', graceRemainingSeconds: 0 }
 }
 
+// How far back an outcome the student did not cause (a decline, an expiry, a
+// library cancel or move) is still shown to them.
+function outcomeVisibleSince(now: Date): Date {
+  return new Date(now.getTime() - REQUEST_OUTCOME_VISIBLE_DAYS * 24 * 60 * 60 * 1000)
+}
+
 function toBookingDto(booking: ResourceBooking & { resource: { name: string; type: string } }, now: Date): BookingDto {
   const window = computeWindow(booking.startTime, booking.gracePeriodMinutes, now)
-  const frontendStatus: BookingDto['frontendStatus'] =
-    booking.status === 'requested' || booking.status === 'declined' || booking.status === 'expired'
+  // The library cancelled it exactly when cancelledById is set: a student's own cancel leaves it null.
+  const cancelledByLibrary = booking.status === 'cancelled' && booking.cancelledById !== null
+  const frontendStatus: BookingDto['frontendStatus'] = cancelledByLibrary
+    ? 'cancelledByLibrary'
+    : booking.status === 'requested' || booking.status === 'declined' || booking.status === 'expired'
       ? booking.status
       : booking.status === 'checked_in'
         ? 'checkedIn'
@@ -102,6 +115,8 @@ function toBookingDto(booking: ResourceBooking & { resource: { name: string; typ
     checkedInAt: booking.checkedInAt,
     expiresAt: booking.status === 'requested' ? graceEnd(booking) : null,
     declineReason: booking.status === 'declined' ? booking.declineReason : null,
+    cancelReason: cancelledByLibrary ? booking.cancelReason : null,
+    movedFrom: booking.movedAt !== null && booking.movedAt >= outcomeVisibleSince(now) ? booking.movedFromName : null,
   }
 }
 
@@ -239,7 +254,7 @@ export async function createBooking(userId: string, resourceId: string, startTim
 export async function listMyBookings(userId: string): Promise<BookingDto[]> {
   const now = new Date()
   await expireStaleRequests(now)
-  const since = new Date(now.getTime() - REQUEST_OUTCOME_VISIBLE_DAYS * 24 * 60 * 60 * 1000)
+  const since = outcomeVisibleSince(now)
   const bookings = await prisma.resourceBooking.findMany({
     where: {
       userId,
@@ -247,6 +262,9 @@ export async function listMyBookings(userId: string): Promise<BookingDto[]> {
         { status: { notIn: ['cancelled', 'declined', 'expired'] } },
         // A request's answer stays visible for a week.
         { status: { in: ['declined', 'expired'] }, decidedAt: { gte: since } },
+        // So does a booking the library cancelled. A student's own cancel leaves
+        // cancelledById null and stays hidden.
+        { status: 'cancelled', cancelledById: { not: null }, cancelledAt: { gte: since } },
       ],
     },
     include: { resource: { select: { name: true, type: true } } },
