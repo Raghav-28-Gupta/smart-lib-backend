@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { openLiveStream } from '../lib/liveStream'
 import { requireAdmin, requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
+import { adminBookingsQuerySchema } from '../schemas/adminBookings'
 import { adminRequestParamsSchema, declineRequestSchema } from '../schemas/adminRequests'
 import {
   adminResourceParamsSchema,
@@ -10,6 +11,7 @@ import {
   takeOfflineSchema,
   updateResourceSchema,
 } from '../schemas/adminResources'
+import { listBookings, type AdminBookingListQuery } from '../services/adminBookingService'
 import { getCirculation, getDemand, getOverdue, getUtilization } from '../services/adminMetricsService'
 import { approveRequest, declineRequest, listPendingRequests, type RequestKind } from '../services/adminRequestService'
 import {
@@ -90,6 +92,10 @@ adminRouter.post(
 
 adminRouter.post('/admin/resources/:id/online', validate({ params: adminResourceParamsSchema }), async (req, res) => {
   res.json(await bringOnline(req.params.id as string))
+})
+
+adminRouter.get('/admin/bookings', validate({ query: adminBookingsQuerySchema }), async (req, res) => {
+  res.json(await listBookings(req.validatedQuery as AdminBookingListQuery))
 })
 
 // Live updates for the console, as Server-Sent Events (lib/liveStream.ts).
