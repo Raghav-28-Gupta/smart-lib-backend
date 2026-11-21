@@ -3,7 +3,7 @@ import { openLiveStream } from '../lib/liveStream'
 import { requireAdmin, requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
 import { adminBookingParamsSchema, adminBookingsQuerySchema, cancelBookingSchema, reassignBookingSchema } from '../schemas/adminBookings'
-import { adminFinesQuerySchema } from '../schemas/adminFines'
+import { adjustFineSchema, adminFineParamsSchema, adminFinesQuerySchema, markFinePaidSchema } from '../schemas/adminFines'
 import { adminRequestParamsSchema, declineRequestSchema } from '../schemas/adminRequests'
 import {
   adminResourceParamsSchema,
@@ -19,7 +19,7 @@ import {
   reassignBooking,
   type AdminBookingListQuery,
 } from '../services/adminBookingService'
-import { listFines, type AdminFineListQuery } from '../services/adminFineService'
+import { adjustFine, listFines, markFinePaid, type AdminFineListQuery } from '../services/adminFineService'
 import { getCirculation, getDemand, getOverdue, getUtilization } from '../services/adminMetricsService'
 import { approveRequest, declineRequest, listPendingRequests, type RequestKind } from '../services/adminRequestService'
 import {
@@ -131,6 +131,24 @@ adminRouter.post(
 adminRouter.get('/admin/fines', validate({ query: adminFinesQuerySchema }), async (req, res) => {
   res.json(await listFines(req.validatedQuery as AdminFineListQuery))
 })
+
+adminRouter.post(
+  '/admin/fines/:id/paid',
+  validate({ params: adminFineParamsSchema, body: markFinePaidSchema }),
+  async (req, res) => {
+    const { amount } = req.body as { amount: number }
+    res.json(await markFinePaid(req.params.id as string, req.user!.sub, amount))
+  },
+)
+
+adminRouter.post(
+  '/admin/fines/:id/adjust',
+  validate({ params: adminFineParamsSchema, body: adjustFineSchema }),
+  async (req, res) => {
+    const { amount, reason } = req.body as { amount: number; reason: string }
+    res.json(await adjustFine(req.params.id as string, req.user!.sub, amount, reason))
+  },
+)
 
 // Live updates for the console, as Server-Sent Events (lib/liveStream.ts).
 adminRouter.get('/admin/events', (req, res) => {

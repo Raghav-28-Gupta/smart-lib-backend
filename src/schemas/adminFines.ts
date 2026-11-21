@@ -20,3 +20,23 @@ export const adminFinesQuerySchema = z.object({
   page: z.coerce.number().int().min(1).max(MAX_FINE_PAGE).default(1),
   pageSize: z.coerce.number().int().min(1).max(MAX_FINE_PAGE_SIZE).default(25),
 })
+
+// A fine's id is a uuid, but an accruing row's id (a loan's) is on the same list;
+// any non-empty text is let through and the service answers 404 for one that is
+// not a stored fine.
+export const adminFineParamsSchema = z.object({ id: z.string().min(1) })
+
+export const MAX_FINE_REASON_LENGTH = 300
+
+// The amount the librarian saw and collected, in whole rupees. The payment is
+// recorded only if the fine is still exactly that amount (see markFinePaid), so
+// one that a colleague lowered a moment ago is not recorded as paid in full.
+export const markFinePaidSchema = z.object({ amount: z.number().int().min(0) })
+
+// Whole rupees, never below 0. That the amount is LOWER than the fine's current
+// one depends on the stored row, so the service checks it. The reason is
+// required: it is what the student sees as the library's note.
+export const adjustFineSchema = z.object({
+  amount: z.number().int().min(0),
+  reason: z.string().trim().min(1).max(MAX_FINE_REASON_LENGTH),
+})

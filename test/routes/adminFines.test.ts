@@ -7,6 +7,7 @@ import type { FineReason, FineStatus, LoanStatus, Prisma } from '../../src/gener
 import { prisma } from '../../src/lib/prisma'
 import { listFines, listFinesForStudent } from '../../src/services/adminFineService'
 import { resetDb } from '../helpers/db'
+import { recordEvents } from '../helpers/events'
 
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
@@ -603,5 +604,486 @@ describe('listFinesForStudent', () => {
     expect(all[1]).toMatchObject({ status: 'accruing', amount: 20, item: 'Clean Code', date: new Date(t - (2 * DAY_MS + HOUR_MS)) })
     expect(capped.map((f) => f.id)).toEqual([newest.id, accruing.id])
     expect(nobody).toEqual([])
+  })
+})
+
+// --- Mark paid, waive or adjust ------------------------------------------------------
+
+const FINE_CHANGED = { type: 'fine.changed', topics: ['fines'] }
+// The body is the amount the librarian saw and collected; the write refuses if the fine has moved off it.
+const pay = (token: string, id: string, body?: unknown) => {
+  const req = request(app).post(`/admin/fines/${id}/paid`).set(auth(token))
+  return body === undefined ? req : req.send(body as object)
+}
+const adjust = (token: string, id: string, body?: unknown) => {
+  const req = request(app).post(`/admin/fines/${id}/adjust`).set(auth(token))
+  return body === undefined ? req : req.send(body as object)
+}
+const stored = (id: string) => prisma.fine.findUniqueOrThrow({ where: { id } })
+
+describe('mark a fine paid and waive or adjust it: access', () => {
+  beforeEach(resetDb)
+
+  it('401/403 on both routes', async () => {
+    const { token: student } = await seedUser()
+    const { user: owner } = await seedUser()
+    const fine = await seedFineOnLoan(owner.id, { amount: 150 })
+    const payUrl = `/admin/fines/${fine.id}/paid`
+    const adjustUrl = `/admin/fines/${fine.id}/adjust`
+    const body = { amount: 50, reason: 'Hardship' }
+
+    expect((await request(app).post(payUrl).send({ amount: 150 })).status).toBe(401)
+    expect((await request(app).post(adjustUrl).send(body)).status).toBe(401)
+    expect((await request(app).post(payUrl).set('Authorization', 'Bearer not-a-token').send({ amount: 150 })).status).toBe(401)
+    expect((await pay(student, fine.id, { amount: 150 })).status).toBe(403)
+    expect((await adjust(student, fine.id, body)).status).toBe(403)
+    // None of those touched the fine.
+    expect(await stored(fine.id)).toMatchObject({ status: 'pending', amount: 150, originalAmount: null, paidAt: null, adjustedAt: null })
+  })
+})
+
+describe('mark a fine paid', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+  })
+
+  it('marks an outstanding fine paid and records who and when', async () => {
+    const { token, user: librarian } = await seedUser('admin', { name: 'Priya Menon' })
+    const { user: student } = await seedUser('student', { name: 'Asha Rao', email: 'asha@test.com' })
+    const fine = await seedFineOnLoan(student.id, { amount: 150 }, 'Refactoring')
+    const before = new Date()
+
+    const res = await pay(token, fine.id, { amount: 150 })
+
+    const after = new Date()
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({
+      id: fine.id,
+      kind: 'fine',
+      student: { id: student.id, name: 'Asha Rao', email: 'asha@test.com' },
+      reason: 'overdue',
+      item: 'Refactoring',
+      amount: 150,
+      originalAmount: 150,
+      status: 'paid',
+      date: fine.createdAt.toISOString(),
+      note: null,
+      recordedBy: 'Priya Menon',
+      canSettle: false,
+    })
+    const row = await stored(fine.id)
+    expect(row).toMatchObject({ status: 'paid', paidRecordedById: librarian.id, amount: 150, originalAmount: null, adjustedById: null })
+    expect(row.paidAt!.getTime()).toBeGreaterThanOrEqual(before.getTime())
+    expect(row.paidAt!.getTime()).toBeLessThanOrEqual(after.getTime())
+    // What the console would list for it is exactly what the write returned.
+    const listed = await list(token, '?status=paid')
+    expect(listed.body.fines).toEqual([res.body])
+  })
+
+  it('marks an adjusted fine paid', async () => {
+    const { user: priya } = await seedUser('admin', { name: 'Priya Menon' })
+    const { token: samToken, user: sam } = await seedUser('admin', { name: 'Sam Verma' })
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, {
+      status: 'adjusted',
+      amount: 50,
+      originalAmount: 150,
+      adjustedById: priya.id,
+      adjustReason: 'Hardship',
+    })
+
+    const res = await pay(samToken, fine.id, { amount: 50 })
+
+    expect(res.status).toBe(200)
+    // Paid at the lowered amount; the payment is Sam's and the adjustment's note is not shown on a paid fine.
+    expect(res.body).toMatchObject({ status: 'paid', amount: 50, originalAmount: 150, note: null, recordedBy: 'Sam Verma', canSettle: false })
+    expect(await stored(fine.id)).toMatchObject({
+      status: 'paid',
+      amount: 50,
+      originalAmount: 150,
+      adjustedById: priya.id,
+      adjustReason: 'Hardship',
+      paidRecordedById: sam.id,
+    })
+  })
+
+  it('paying a paid fine is 409 "This fine is already paid."', async () => {
+    const { user: first } = await seedUser('admin', { name: 'Priya Menon' })
+    const { token: secondToken } = await seedUser('admin', { name: 'Sam Verma' })
+    const { user: student } = await seedUser()
+    const paidAt = new Date(Date.now() - DAY_MS)
+    const fine = await seedFineOnLoan(student.id, { status: 'paid', paidRecordedById: first.id })
+    await prisma.fine.update({ where: { id: fine.id }, data: { paidAt } })
+
+    const res = await pay(secondToken, fine.id, { amount: 20 })
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This fine is already paid.')
+    // The first payment's record is untouched.
+    expect(await stored(fine.id)).toMatchObject({ status: 'paid', paidRecordedById: first.id, paidAt })
+  })
+
+  it('paying a waived fine is 409 "This fine was waived."', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, {
+      status: 'waived',
+      amount: 0,
+      originalAmount: 40,
+      adjustedById: librarian.id,
+      adjustReason: 'Library error',
+    })
+
+    const res = await pay(token, fine.id, { amount: 0 })
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This fine was waived.')
+    expect(await stored(fine.id)).toMatchObject({ status: 'waived', paidAt: null, paidRecordedById: null })
+  })
+
+  it('paying with the amount shown succeeds', async () => {
+    const { token: priyaToken } = await seedUser('admin')
+    const { token: samToken, user: sam } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+
+    // The console shows ₹150; after a librarian lowers it the console shows ₹50, and paying that works.
+    const adjusted = await adjust(priyaToken, fine.id, { amount: 50, reason: 'Hardship' })
+    const res = await pay(samToken, fine.id, { amount: adjusted.body.amount })
+
+    expect(adjusted.body.amount).toBe(50)
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ status: 'paid', amount: 50, originalAmount: 150 })
+    expect(await stored(fine.id)).toMatchObject({ status: 'paid', amount: 50, paidRecordedById: sam.id })
+  })
+
+  it('paying with a stale amount after a partial adjust is 409 with the changed message and the fine stays adjusted', async () => {
+    const { token: priyaToken, user: priya } = await seedUser('admin')
+    const { token: samToken } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+    await adjust(priyaToken, fine.id, { amount: 50, reason: 'Hardship' })
+    recorder = recordEvents()
+
+    // Sam's console still shows ₹150 and he collected ₹150.
+    const res = await pay(samToken, fine.id, { amount: 150 })
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This fine was just changed to ₹50. Check it before marking it paid.')
+    expect(await stored(fine.id)).toMatchObject({
+      status: 'adjusted',
+      amount: 50,
+      originalAmount: 150,
+      adjustedById: priya.id,
+      paidAt: null,
+      paidRecordedById: null,
+    })
+    expect(recorder.events).toEqual([])
+  })
+
+  it('a lower amount than the fine has is just as stale', async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+
+    const lower = await pay(token, fine.id, { amount: 149 })
+    const zero = await pay(token, fine.id, { amount: 0 })
+
+    expect(lower.status).toBe(409)
+    expect(lower.body.error).toBe('This fine was just changed to ₹150. Check it before marking it paid.')
+    expect(zero.status).toBe(409)
+    expect(await stored(fine.id)).toMatchObject({ status: 'pending', amount: 150, paidAt: null })
+  })
+
+  it('a paid or waived fine says so even when the amount sent is stale', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const paid = await seedFineOnLoan(student.id, { status: 'paid', amount: 20, originalAmount: 60, paidRecordedById: librarian.id })
+    const waived = await seedFineOnLoan(student.id, { status: 'waived', amount: 0, originalAmount: 40, adjustedById: librarian.id, adjustReason: 'x' })
+
+    const paidRes = await pay(token, paid.id, { amount: 60 })
+    const waivedRes = await pay(token, waived.id, { amount: 40 })
+
+    expect(paidRes.status).toBe(409)
+    expect(paidRes.body.error).toBe('This fine is already paid.')
+    expect(waivedRes.status).toBe(409)
+    expect(waivedRes.body.error).toBe('This fine was waived.')
+  })
+
+  it('paying without an amount, or with a negative, fractional or text amount, is 400', async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+    const invalid: Array<[string, unknown]> = [
+      ['no body', undefined],
+      ['an empty body', {}],
+      ['a negative amount', { amount: -1 }],
+      ['a fractional amount', { amount: 149.5 }],
+      ['an amount as text', { amount: '150' }],
+      ['a null amount', { amount: null }],
+    ]
+    recorder = recordEvents()
+
+    for (const [what, body] of invalid) {
+      const res = await pay(token, fine.id, body)
+      expect(res.status, what).toBe(400)
+    }
+
+    expect(await stored(fine.id)).toMatchObject({ status: 'pending', amount: 150, paidAt: null, paidRecordedById: null })
+    expect(recorder.events).toEqual([])
+  })
+
+  it("an accruing row's id answers 404", async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const { copy } = await seedBook()
+    const loan = await seedLoan(student.id, copy.id, new Date(Date.now() - 3 * DAY_MS - HOUR_MS))
+    // The row is on the list, with the loan's id...
+    expect(ids(await list(token))).toEqual([loan.id])
+
+    const byLoanId = await pay(token, loan.id, { amount: 30 })
+    const unknown = await pay(token, 'no-such-fine', { amount: 30 })
+
+    // ...but that is not a fine id.
+    expect(byLoanId.status).toBe(404)
+    expect(byLoanId.body.error).toBe('Fine not found')
+    expect(unknown.status).toBe(404)
+    expect(unknown.body.error).toBe('Fine not found')
+  })
+
+  it('each success publishes fine.changed once, refusals publish nothing', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { token: studentToken, user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 90 })
+    const waived = await seedFineOnLoan(student.id, { status: 'waived', amount: 0, originalAmount: 10, adjustedById: librarian.id, adjustReason: 'x' })
+    recorder = recordEvents()
+
+    await pay(studentToken, fine.id, { amount: 90 }) // 403
+    await pay(token, 'no-such-fine', { amount: 90 }) // 404
+    await pay(token, waived.id, { amount: 0 }) // 409
+    await pay(token, fine.id, { amount: 80 }) // 409, the fine is ₹90
+    await pay(token, fine.id) // 400, no amount
+    expect(recorder.events).toEqual([])
+
+    expect((await pay(token, fine.id, { amount: 90 })).status).toBe(200)
+    expect(recorder.events).toEqual([FINE_CHANGED])
+
+    expect((await pay(token, fine.id, { amount: 90 })).status).toBe(409) // already paid
+    expect(recorder.events).toEqual([FINE_CHANGED])
+  })
+})
+
+describe('waive or adjust a fine', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+  })
+
+  it('adjust to a lower amount sets adjusted, keeps originalAmount, note and librarian', async () => {
+    const { token, user: librarian } = await seedUser('admin', { name: 'Priya Menon' })
+    const { user: student } = await seedUser('student', { name: 'Asha Rao', email: 'asha@test.com' })
+    const fine = await seedFineOnLoan(student.id, { amount: 150 }, 'Refactoring')
+    const before = new Date()
+
+    // Spaces around the reason are not kept.
+    const res = await adjust(token, fine.id, { amount: 50, reason: '  Hardship  ' })
+
+    const after = new Date()
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({
+      id: fine.id,
+      kind: 'fine',
+      student: { id: student.id, name: 'Asha Rao', email: 'asha@test.com' },
+      reason: 'overdue',
+      item: 'Refactoring',
+      amount: 50,
+      originalAmount: 150,
+      status: 'adjusted',
+      date: fine.createdAt.toISOString(),
+      note: 'Hardship',
+      recordedBy: 'Priya Menon',
+      canSettle: true,
+    })
+    const row = await stored(fine.id)
+    expect(row).toMatchObject({ status: 'adjusted', amount: 50, originalAmount: 150, adjustedById: librarian.id, adjustReason: 'Hardship', paidAt: null })
+    expect(row.adjustedAt!.getTime()).toBeGreaterThanOrEqual(before.getTime())
+    expect(row.adjustedAt!.getTime()).toBeLessThanOrEqual(after.getTime())
+    const listed = await list(token, '?status=adjusted')
+    expect(listed.body.fines).toEqual([res.body])
+  })
+
+  it('adjust to 0 waives', async () => {
+    const { token, user: librarian } = await seedUser('admin', { name: 'Priya Menon' })
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+
+    const res = await adjust(token, fine.id, { amount: 0, reason: 'Library error' })
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ status: 'waived', amount: 0, originalAmount: 150, note: 'Library error', recordedBy: 'Priya Menon', canSettle: false })
+    expect(await stored(fine.id)).toMatchObject({ status: 'waived', amount: 0, originalAmount: 150, adjustedById: librarian.id, adjustReason: 'Library error' })
+  })
+
+  it('a second adjust keeps the first originalAmount', async () => {
+    const { token: firstToken, user: first } = await seedUser('admin', { name: 'Priya Menon' })
+    const { token: secondToken, user: second } = await seedUser('admin', { name: 'Sam Verma' })
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+
+    const one = await adjust(firstToken, fine.id, { amount: 100, reason: 'First reason' })
+    const afterFirst = await stored(fine.id)
+    const two = await adjust(secondToken, fine.id, { amount: 40, reason: 'Second reason' })
+
+    expect(one.status).toBe(200)
+    expect(one.body).toMatchObject({ status: 'adjusted', amount: 100, originalAmount: 150 })
+    expect(two.status).toBe(200)
+    // The original is the amount before the FIRST adjustment; the note and librarian are the latest.
+    expect(two.body).toMatchObject({ status: 'adjusted', amount: 40, originalAmount: 150, note: 'Second reason', recordedBy: 'Sam Verma' })
+    const row = await stored(fine.id)
+    expect(row).toMatchObject({ amount: 40, originalAmount: 150, adjustedById: second.id, adjustReason: 'Second reason' })
+    expect(afterFirst.adjustedById).toBe(first.id)
+    expect(row.adjustedAt!.getTime()).toBeGreaterThanOrEqual(afterFirst.adjustedAt!.getTime())
+  })
+
+  it('an adjusted fine can be waived', async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+
+    await adjust(token, fine.id, { amount: 60, reason: 'Hardship' })
+    const res = await adjust(token, fine.id, { amount: 0, reason: 'Waived after talking to the student' })
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ status: 'waived', amount: 0, originalAmount: 150, note: 'Waived after talking to the student' })
+  })
+
+  it('adjust to the same or a higher amount is 400 "The new amount must be lower than ₹150."', async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+
+    // The last two are far past a 32-bit integer: a 400, never a database overflow (a 500).
+    for (const amount of [150, 151, 1_000_000, 10_000_000_000, Number.MAX_SAFE_INTEGER]) {
+      const res = await adjust(token, fine.id, { amount, reason: 'Hardship' })
+      expect(res.status, `amount ${amount}`).toBe(400)
+      expect(res.body.error, `amount ${amount}`).toBe('The new amount must be lower than ₹150.')
+    }
+    expect(await stored(fine.id)).toMatchObject({ status: 'pending', amount: 150, originalAmount: null, adjustedAt: null, adjustedById: null, adjustReason: null })
+
+    // Once lowered, the bar is the new amount.
+    await adjust(token, fine.id, { amount: 100, reason: 'Hardship' })
+    const same = await adjust(token, fine.id, { amount: 100, reason: 'Again' })
+    const higher = await adjust(token, fine.id, { amount: 120, reason: 'Again' })
+    expect(same.status).toBe(400)
+    expect(same.body.error).toBe('The new amount must be lower than ₹100.')
+    expect(higher.status).toBe(400)
+    expect(higher.body.error).toBe('The new amount must be lower than ₹100.')
+    expect(await stored(fine.id)).toMatchObject({ amount: 100, originalAmount: 150, adjustReason: 'Hardship' })
+  })
+
+  it('adjust without a reason, with a blank reason, a 301-character reason, a negative or a fractional amount is 400', async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+    const invalid: Array<[string, unknown]> = [
+      ['no reason', { amount: 50 }],
+      ['an empty reason', { amount: 50, reason: '' }],
+      ['a blank reason', { amount: 50, reason: '   ' }],
+      ['a 301-character reason', { amount: 50, reason: 'a'.repeat(301) }],
+      ['a reason that is not text', { amount: 50, reason: 7 }],
+      ['a negative amount', { amount: -1, reason: 'Hardship' }],
+      ['a fractional amount', { amount: 49.5, reason: 'Hardship' }],
+      ['an amount as text', { amount: '50', reason: 'Hardship' }],
+      ['no amount', { reason: 'Hardship' }],
+      ['no body', undefined],
+    ]
+    recorder = recordEvents()
+
+    for (const [what, body] of invalid) {
+      const res = await adjust(token, fine.id, body)
+      expect(res.status, what).toBe(400)
+    }
+
+    expect(await stored(fine.id)).toMatchObject({ status: 'pending', amount: 150, originalAmount: null, adjustedById: null, adjustReason: null })
+    expect(recorder.events).toEqual([])
+  })
+
+  it('a reason of exactly 300 characters is accepted, spaces around it do not count', async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+    const reason = 'a'.repeat(300)
+
+    const res = await adjust(token, fine.id, { amount: 50, reason: `  ${reason}  ` })
+
+    expect(res.status).toBe(200)
+    expect(res.body.note).toBe(reason)
+  })
+
+  it('adjusting a paid fine is 409 "This fine is already paid."', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { status: 'paid', amount: 150, paidRecordedById: librarian.id })
+
+    const res = await adjust(token, fine.id, { amount: 50, reason: 'Too late' })
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This fine is already paid.')
+    expect(await stored(fine.id)).toMatchObject({ status: 'paid', amount: 150, originalAmount: null, adjustedById: null })
+  })
+
+  it('adjusting a waived fine is 409 "This fine was waived."', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { status: 'waived', amount: 0, originalAmount: 40, adjustedById: librarian.id, adjustReason: 'Library error' })
+
+    const res = await adjust(token, fine.id, { amount: 0, reason: 'Again' })
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This fine was waived.')
+    expect(await stored(fine.id)).toMatchObject({ status: 'waived', amount: 0, originalAmount: 40, adjustReason: 'Library error' })
+  })
+
+  it("an accruing row's id answers 404", async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const { copy } = await seedBook()
+    const loan = await seedLoan(student.id, copy.id, new Date(Date.now() - 3 * DAY_MS - HOUR_MS))
+    expect(ids(await list(token))).toEqual([loan.id])
+
+    const byLoanId = await adjust(token, loan.id, { amount: 0, reason: 'Waive it' })
+    const unknown = await adjust(token, 'no-such-fine', { amount: 0, reason: 'Waive it' })
+
+    expect(byLoanId.status).toBe(404)
+    expect(byLoanId.body.error).toBe('Fine not found')
+    expect(unknown.status).toBe(404)
+    expect(unknown.body.error).toBe('Fine not found')
+  })
+
+  it('each success publishes fine.changed once, refusals publish nothing', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { token: studentToken, user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+    const paid = await seedFineOnLoan(student.id, { status: 'paid', amount: 20, paidRecordedById: librarian.id })
+    recorder = recordEvents()
+
+    await adjust(studentToken, fine.id, { amount: 50, reason: 'x' }) // 403
+    await adjust(token, 'no-such-fine', { amount: 50, reason: 'x' }) // 404
+    await adjust(token, fine.id, { amount: 150, reason: 'x' }) // 400, not lower
+    await adjust(token, fine.id, { amount: 50 }) // 400, no reason
+    await adjust(token, paid.id, { amount: 5, reason: 'x' }) // 409
+    expect(recorder.events).toEqual([])
+
+    expect((await adjust(token, fine.id, { amount: 50, reason: 'Hardship' })).status).toBe(200)
+    expect(recorder.events).toEqual([FINE_CHANGED])
+    expect((await adjust(token, fine.id, { amount: 0, reason: 'Waive' })).status).toBe(200)
+    expect(recorder.events).toEqual([FINE_CHANGED, FINE_CHANGED])
+    expect((await adjust(token, fine.id, { amount: 0, reason: 'Again' })).status).toBe(409) // waived
+    expect(recorder.events).toEqual([FINE_CHANGED, FINE_CHANGED])
   })
 })
