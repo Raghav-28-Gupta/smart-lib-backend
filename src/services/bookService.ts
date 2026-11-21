@@ -18,7 +18,14 @@ export interface BookDto {
   waitlistCount: number
 }
 
-function toBookDto(book: Book, availableCopies: number, heldCopies: number, waitlistCount: number): BookDto {
+interface BookCounts {
+  totalCopies: number
+  availableCopies: number
+  heldCopies: number
+  waitlistCount: number
+}
+
+function toBookDto(book: Book, counts: BookCounts): BookDto {
   return {
     id: book.id,
     isbn: book.isbn,
@@ -27,23 +34,36 @@ function toBookDto(book: Book, availableCopies: number, heldCopies: number, wait
     genre: book.genre,
     description: book.description,
     publishedYear: book.publishedYear,
-    totalCopies: book.totalCopies,
-    availableCopies,
-    heldCopies,
-    waitlistCount,
+    ...counts,
   }
 }
 
-// availableCopies/waitlistCount aren't stored columns — they're computed by
-// counting BookCopy/Reservation rows, same as the frontend mock repository
-// derives them from its in-memory Book fields. Batches both counts into two
-// groupBy queries instead of N+1 individual counts per book.
+// A book's total is the copies the library still has: every copy except one
+// marked lost (a copy in maintenance or out on loan is still the library's).
+// Counted from the copies, so adding a copy or marking one lost can never leave
+// a stored number wrong; the Book.totalCopies column is no longer read.
+// Batched in one groupBy for any number of books; a book with none has no entry.
+export async function totalCopiesByBook(bookIds: string[]): Promise<Map<string, number>> {
+  if (bookIds.length === 0) return new Map()
+  const groups = await prisma.bookCopy.groupBy({
+    by: ['bookId'],
+    where: { bookId: { in: bookIds }, status: { not: 'lost' } },
+    _count: true,
+  })
+  return new Map(groups.map((g) => [g.bookId, g._count]))
+}
+
+// totalCopies/availableCopies/waitlistCount aren't read from stored columns —
+// they're computed by counting BookCopy/Reservation rows, same as the frontend
+// mock repository derives them from its in-memory Book fields. Batches the
+// counts into a few groupBy queries instead of N+1 individual counts per book.
 async function attachComputedCounts(books: Book[]): Promise<BookDto[]> {
   if (books.length === 0) return []
 
   const bookIds = books.map((b) => b.id)
   const now = new Date()
-  const [availableGroups, heldGroups, waitlistGroups] = await Promise.all([
+  const [totalMap, availableGroups, heldGroups, waitlistGroups] = await Promise.all([
+    totalCopiesByBook(bookIds),
     prisma.bookCopy.groupBy({
       by: ['bookId'],
       where: { bookId: { in: bookIds }, status: 'available' },
@@ -68,7 +88,12 @@ async function attachComputedCounts(books: Book[]): Promise<BookDto[]> {
   const waitlistMap = new Map(waitlistGroups.map((g) => [g.bookId, g._count]))
 
   return books.map((b) =>
-    toBookDto(b, availableMap.get(b.id) ?? 0, heldMap.get(b.id) ?? 0, waitlistMap.get(b.id) ?? 0),
+    toBookDto(b, {
+      totalCopies: totalMap.get(b.id) ?? 0,
+      availableCopies: availableMap.get(b.id) ?? 0,
+      heldCopies: heldMap.get(b.id) ?? 0,
+      waitlistCount: waitlistMap.get(b.id) ?? 0,
+    }),
   )
 }
 

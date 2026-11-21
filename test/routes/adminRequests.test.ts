@@ -100,6 +100,23 @@ describe('GET /admin/requests', () => {
       },
     })
   })
+
+  it("shows a request's book total from its copies that are not lost", async () => {
+    const { token: admin } = await seedUser('admin')
+    const { token: student } = await seedUser()
+    // The Book.totalCopies column says 99; the copies say 3 on the shelf plus 2 lost.
+    const book = await prisma.book.create({
+      data: { isbn: `isbn-${Math.random()}`, title: 'Clean Code', author: 'Robert C. Martin', totalCopies: 99 },
+    })
+    await prisma.bookCopy.createMany({
+      data: [...Array(3).fill('available'), ...Array(2).fill('lost')].map((status) => ({ bookId: book.id, status })),
+    })
+    await askToBorrow(student, book.id)
+
+    const res = await request(app).get('/admin/requests').set('Authorization', `Bearer ${admin}`)
+
+    expect(res.body.requests[0].book).toMatchObject({ availableCopies: 2, totalCopies: 3 })
+  })
 })
 
 describe('deciding requests', () => {

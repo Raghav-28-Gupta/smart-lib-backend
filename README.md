@@ -381,8 +381,9 @@ need a shared bus such as Redis pub/sub.
 ## Response shape
 
 Most list/detail endpoints return **normalized fields alongside computed
-ones** rather than one or the other — e.g. a book carries its raw
-`totalCopies` next to the computed `availableCopies`/`heldCopies`/`waitlistCount`
+ones** rather than one or the other — e.g. a book's `totalCopies` (its
+copies that are not lost; the `Book.totalCopies` column is no longer read) and
+its `availableCopies`/`heldCopies`/`waitlistCount` are all counted from rows
 (`heldCopies` = shelf copies earmarked for a waitlisted student's live claim,
 which only that student may borrow); a loan
 carries the raw Prisma `status` next to the frontend-facing `frontendStatus`

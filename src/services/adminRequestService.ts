@@ -7,6 +7,7 @@ import { publish } from '../lib/events'
 import { ConflictError, NotFoundError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
 import { graceEnd } from './bookingService'
+import { totalCopiesByBook } from './bookService'
 import { expireStaleRequests, releaseBorrowRequest } from './requestHolds'
 import { settledMessage, type Settled } from './requestMessages'
 
@@ -39,7 +40,7 @@ export async function listPendingRequests(
   const [borrows, rooms] = await Promise.all([
     prisma.borrowRequest.findMany({
       where: { status: 'pending' },
-      include: { user: studentFields, book: { select: { id: true, title: true, author: true, totalCopies: true } } },
+      include: { user: studentFields, book: { select: { id: true, title: true, author: true } } },
     }),
     prisma.resourceBooking.findMany({
       where: { status: 'requested' },
@@ -48,10 +49,13 @@ export async function listPendingRequests(
   ])
 
   const bookIds = [...new Set(borrows.map((b) => b.bookId))]
-  const available =
+  // The total is the same count a student sees (bookService), not the stored column.
+  const [available, totalByBook] = await Promise.all([
     bookIds.length === 0
       ? []
-      : await prisma.bookCopy.groupBy({ by: ['bookId'], where: { bookId: { in: bookIds }, status: 'available' }, _count: true })
+      : prisma.bookCopy.groupBy({ by: ['bookId'], where: { bookId: { in: bookIds }, status: 'available' }, _count: true }),
+    totalCopiesByBook(bookIds),
+  ])
   const availableByBook = new Map(available.map((g) => [g.bookId, g._count]))
 
   const requests: AdminRequestDto[] = [
@@ -66,7 +70,7 @@ export async function listPendingRequests(
         title: b.book.title,
         author: b.book.author,
         availableCopies: availableByBook.get(b.bookId) ?? 0,
-        totalCopies: b.book.totalCopies,
+        totalCopies: totalByBook.get(b.bookId) ?? 0,
       },
     })),
     ...rooms.map((r) => ({

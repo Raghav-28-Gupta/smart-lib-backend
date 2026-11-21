@@ -34,6 +34,8 @@ enum LoanStatus {
   active
   returned
   overdue
+  // Closed because the copy was marked lost: not returned, not overdue.
+  lost
 }
 
 enum ReservationStatus {
@@ -132,6 +134,8 @@ model Book {
   genre         String?
   description   String?
   publishedYear Int?
+  // No longer read: a book's total is counted from its copies that are not lost
+  // (bookService.totalCopiesByBook). Kept so the seed and older rows still load.
   totalCopies   Int     @default(1)
 
   copies          BookCopy[]
@@ -141,11 +145,14 @@ model Book {
 }
 
 model BookCopy {
-  id     String     @id @default(uuid())
-  bookId String
-  book   Book       @relation(fields: [bookId], references: [id])
-  status CopyStatus @default(available)
-  loans  Loan[]
+  id      String     @id @default(uuid())
+  bookId  String
+  book    Book       @relation(fields: [bookId], references: [id])
+  status  CopyStatus @default(available)
+  loans   Loan[]
+  // Handed out by the database (migration console_catalogue: next_copy_barcode()),
+  // SL-00001 and up, so every way of adding a copy gets one.
+  barcode String     @unique @default(dbgenerated("next_copy_barcode()"))
 
   borrowRequests BorrowRequest[]
 }
@@ -159,6 +166,8 @@ model Loan {
   borrowedAt   DateTime   @default(now())
   dueAt        DateTime
   returnedAt   DateTime?
+  // When a librarian marked the copy lost while this loan was open.
+  lostAt       DateTime?
   renewedCount Int        @default(0)
   status       LoanStatus @default(active)
   fines        Fine[]

@@ -171,3 +171,39 @@ describe('heldCopies', () => {
     expect(byTitle).toEqual({ 'Clean Code': 1, 'Design Patterns': 0 })
   })
 })
+
+// The book's total is counted from its copies, not read from the Book.totalCopies
+// column (which the seed still sets and nothing else keeps right). Every test
+// here sets the column to a number that disagrees with the copies on purpose.
+describe('totalCopies', () => {
+  beforeEach(resetDb)
+
+  async function bookWithCopies(statuses: Array<'available' | 'borrowed' | 'lost' | 'maintenance' | 'requested'>, title = 'Clean Code') {
+    const book = await prisma.book.create({
+      data: { isbn: `isbn-${Math.random()}`, title, author: 'Robert C. Martin', totalCopies: 99 },
+    })
+    await prisma.bookCopy.createMany({ data: statuses.map((status) => ({ bookId: book.id, status })) })
+    return book
+  }
+
+  it('totalCopies counts copies that are not lost', async () => {
+    const book = await bookWithCopies(['available', 'available', 'borrowed', 'requested', 'maintenance', 'lost', 'lost'])
+    const other = await bookWithCopies(['lost'], 'Design Patterns')
+
+    const one = await request(app).get(`/books/${book.id}`)
+    expect(one.body).toMatchObject({ totalCopies: 5, availableCopies: 2 })
+
+    // Search batches the count for every book it lists, and a book whose only copy is lost has none.
+    const search = await request(app).get('/books/search')
+    const totals = Object.fromEntries(search.body.map((b: { id: string; totalCopies: number }) => [b.id, b.totalCopies]))
+    expect(totals).toEqual({ [book.id]: 5, [other.id]: 0 })
+  })
+
+  it('a copy in maintenance counts toward the total but not as available', async () => {
+    const book = await bookWithCopies(['available', 'maintenance'])
+
+    const res = await request(app).get(`/books/${book.id}`)
+
+    expect(res.body).toMatchObject({ totalCopies: 2, availableCopies: 1 })
+  })
+})
