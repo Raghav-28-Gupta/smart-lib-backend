@@ -48,6 +48,12 @@ enum ResourceType {
   room
 }
 
+enum ResourceStatus {
+  available
+  // Offline means "no new bookings"; bookings that already exist stay.
+  offline
+}
+
 enum BookingStatus {
   booked
   checked_in
@@ -100,7 +106,7 @@ model User {
 
   loans           Loan[]
   reservations    Reservation[]
-  bookings        ResourceBooking[] @relation("BookingUser")
+  bookings        ResourceBooking[]     @relation("BookingUser")
   fines           Fine[]
   reliabilityLogs ReliabilityScoreLog[]
   recommendations RecommendationCache[]
@@ -108,6 +114,7 @@ model User {
   borrowRequests        BorrowRequest[]   @relation("BorrowRequester")
   decidedBorrowRequests BorrowRequest[]   @relation("BorrowRequestDecider")
   decidedBookings       ResourceBooking[] @relation("BookingDecider")
+  cancelledBookings     ResourceBooking[] @relation("BookingCanceller")
 }
 
 model Book {
@@ -164,11 +171,14 @@ model Reservation {
 }
 
 model Resource {
-  id       String       @id @default(uuid())
-  type     ResourceType
-  name     String
-  location String?
-  capacity Int          @default(1)
+  id         String         @id @default(uuid())
+  type       ResourceType
+  name       String
+  location   String?
+  capacity   Int            @default(1)
+  status     ResourceStatus @default(available)
+  // The optional note given when a librarian takes the resource offline.
+  statusNote String?
 
   bookings ResourceBooking[]
 }
@@ -199,11 +209,22 @@ model ResourceBooking {
   decidedById        String?
   decidedBy          User?         @relation("BookingDecider", fields: [decidedById], references: [id])
   declineReason      String?
+  // A librarian's cancel. A booking is library-cancelled exactly when
+  // cancelledById is set; a student's own cancel leaves all three null.
+  cancelledAt        DateTime?     @db.Timestamptz(3)
+  cancelledById      String?
+  cancelledBy        User?         @relation("BookingCanceller", fields: [cancelledById], references: [id])
+  cancelReason       String?
+  // A librarian's reassign: the name of the resource the booking was moved
+  // from, and when.
+  movedFromName      String?
+  movedAt            DateTime?     @db.Timestamptz(3)
 
   noShowEvent NoShowEvent?
   fines       Fine[]
 
   @@index([status, startTime])
+  @@index([startTime])
 }
 
 // A student's request to borrow a book, waiting for a librarian. The copy it

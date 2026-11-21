@@ -202,7 +202,7 @@ async function approveRoom(id: string, adminId: string, now: Date): Promise<Deci
   })
   if (count === 0) return refuseSettledRoom(id)
 
-  publish({ type: 'request.decided', topics: ['requests', 'metrics'], kind: 'room' })
+  publish({ type: 'request.decided', topics: ['requests', 'metrics', 'bookings'], kind: 'room' })
   return { id, kind: 'room', status: 'approved', decidedAt: now }
 }
 

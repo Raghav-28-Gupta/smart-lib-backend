@@ -1,7 +1,7 @@
 import { GRACE_PERIOD_MINUTES, RELIABILITY_ONTIME_BOOKING_BONUS, REQUEST_OUTCOME_VISIBLE_DAYS, TIME_SLOTS } from '../config/constants'
 import { Prisma } from '../generated/prisma/client'
 import type { BookingStatus, ResourceBooking, ResourceType } from '../generated/prisma/client'
-import { publish, publishActivity } from '../lib/events'
+import { publish, publishBookingChange } from '../lib/events'
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
 import { dayLabel, slotLabel } from '../lib/timeLabels'
@@ -152,9 +152,10 @@ async function findAlternatives(
     }
   }
 
-  // Same window elsewhere is only useful if the window is still ahead.
+  // Same window elsewhere is only useful if the window is still ahead, and an
+  // offline resource takes no new bookings.
   const otherResources = startTime <= now ? [] : await prisma.resource.findMany({
-    where: { type: resource.type, id: { not: resource.id } },
+    where: { type: resource.type, id: { not: resource.id }, status: 'available' },
     orderBy: { name: 'asc' },
   })
   for (const other of otherResources) {
@@ -191,6 +192,8 @@ export async function createBooking(userId: string, resourceId: string, startTim
 
   const resource = await prisma.resource.findUnique({ where: { id: resourceId } })
   if (!resource) throw new NotFoundError('Resource')
+  // Offline means no new bookings. Bookings made before it went offline stay.
+  if (resource.status === 'offline') throw new ConflictError('This resource is offline right now.')
   // Rooms wait for a librarian (and hold the slot meanwhile); seats are booked at once.
   const isRoom = resource.type === 'room'
 
@@ -221,7 +224,7 @@ export async function createBooking(userId: string, resourceId: string, startTim
         summary: `${booking.user.name} wants ${booking.resource.name} · ${dayLabel(startTime)} · ${slotLabel(startTime, endTime)}`,
       })
     } else {
-      publishActivity()
+      publishBookingChange()
     }
     return toBookingDto(booking, now)
   } catch (e) {
@@ -280,7 +283,7 @@ export async function checkInBooking(userId: string, bookingId: string): Promise
     await applyReliabilityDelta(tx, userId, RELIABILITY_ONTIME_BOOKING_BONUS, 'On-time check-in for a resource booking')
     return result
   })
-  publishActivity()
+  publishBookingChange()
   return toBookingDto(updated, now)
 }
 
@@ -305,6 +308,6 @@ export async function cancelBooking(userId: string, bookingId: string): Promise<
     include: { resource: { select: { name: true, type: true } } },
   })
   if (withdrawing) publish({ type: 'request.cancelled', topics: ['requests'], kind: 'room' })
-  else publishActivity()
+  else publishBookingChange()
   return toBookingDto(updated, now)
 }

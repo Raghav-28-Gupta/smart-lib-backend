@@ -141,4 +141,14 @@ describe('GET /resources/availability', () => {
     const res = await request(app).get(`/resources/availability?type=room&date=${DATE}`)
     expect(res.body[0].takenSlotsToday).toEqual(['2:00 PM'])
   })
+
+  it('availability leaves out offline resources', async () => {
+    await prisma.resource.create({ data: { type: 'seat', name: 'Desk 1' } })
+    await prisma.resource.create({ data: { type: 'seat', name: 'Desk 2', status: 'offline', statusNote: 'Wobbly leg' } })
+
+    const res = await request(app).get(`/resources/availability?type=seat&date=${DATE}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body.map((r: { name: string }) => r.name)).toEqual(['Desk 1'])
+  })
 })

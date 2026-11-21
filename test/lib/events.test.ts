@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { publish, publishActivity, subscribe, subscriberCount, type LiveEvent } from '../../src/lib/events'
+import {
+  publish,
+  publishActivity,
+  publishBookingChange,
+  publishResourceChange,
+  subscribe,
+  subscriberCount,
+  type LiveEvent,
+} from '../../src/lib/events'
 
 const created: LiveEvent = {
   type: 'request.created',
@@ -52,5 +60,19 @@ describe('event bus', () => {
     stops.push(subscribe((e) => got.push(e)))
     publishActivity()
     expect(got).toEqual([{ type: 'activity', topics: ['metrics'] }])
+  })
+
+  it('publishBookingChange publishes booking.changed on bookings and metrics', () => {
+    const got: LiveEvent[] = []
+    stops.push(subscribe((e) => got.push(e)))
+    publishBookingChange()
+    expect(got).toEqual([{ type: 'booking.changed', topics: ['bookings', 'metrics'] }])
+  })
+
+  it('publishResourceChange publishes resource.changed on resources and metrics', () => {
+    const got: LiveEvent[] = []
+    stops.push(subscribe((e) => got.push(e)))
+    publishResourceChange()
+    expect(got).toEqual([{ type: 'resource.changed', topics: ['resources', 'metrics'] }])
   })
 })

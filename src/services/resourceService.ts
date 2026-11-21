@@ -17,7 +17,8 @@ function parseDateParts(date: string): { year: number; month: number; day: numbe
 }
 
 export async function getAvailability(type: 'seat' | 'room', date: string): Promise<ResourceDto[]> {
-  const resources = await prisma.resource.findMany({ where: { type }, orderBy: { name: 'asc' } })
+  // Offline resources take no new bookings, so students are not shown them.
+  const resources = await prisma.resource.findMany({ where: { type, status: 'available' }, orderBy: { name: 'asc' } })
   if (resources.length === 0) return []
 
   const { year, month, day } = parseDateParts(date)

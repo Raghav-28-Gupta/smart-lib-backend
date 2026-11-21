@@ -5,8 +5,15 @@
 // is connected to this process; several instances would need a shared bus
 // (Redis pub/sub).
 
-export type LiveTopic = 'requests' | 'metrics'
-export type LiveEventType = 'request.created' | 'request.decided' | 'request.expired' | 'request.cancelled' | 'activity'
+export type LiveTopic = 'requests' | 'metrics' | 'bookings' | 'resources'
+export type LiveEventType =
+  | 'request.created'
+  | 'request.decided'
+  | 'request.expired'
+  | 'request.cancelled'
+  | 'activity'
+  | 'booking.changed'
+  | 'resource.changed'
 
 export interface LiveEvent {
   type: LiveEventType
@@ -45,4 +52,14 @@ export function subscriberCount(): number {
 /** For the many actions that only move Dashboard numbers. */
 export function publishActivity(): void {
   publish({ type: 'activity', topics: ['metrics'] })
+}
+
+/** A change to a booking row that is not a request: seat booked, checked in, cancelled, reassigned. */
+export function publishBookingChange(): void {
+  publish({ type: 'booking.changed', topics: ['bookings', 'metrics'] })
+}
+
+/** A change to a resource: created, edited, taken offline or brought back. */
+export function publishResourceChange(): void {
+  publish({ type: 'resource.changed', topics: ['resources', 'metrics'] })
 }

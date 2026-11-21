@@ -425,6 +425,76 @@ describe('POST /bookings for a slot that is already under way', () => {
   })
 })
 
+describe('offline resources', () => {
+  beforeEach(resetDb)
+
+  function tomorrowAt(hour: number) {
+    const d = new Date()
+    d.setDate(d.getDate() + 1)
+    d.setHours(hour, 0, 0, 0)
+    return d
+  }
+
+  function book(token: string, resourceId: string, start: Date) {
+    return request(app)
+      .post('/bookings')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ resourceId, startTime: start.toISOString(), endTime: new Date(start.getTime() + 3_600_000).toISOString() })
+  }
+
+  it('booking an offline resource answers 409 with the offline message and no alternatives', async () => {
+    const { token } = await seedUser()
+    const desk = await seedResource('seat', 'Desk 1')
+    await seedResource('seat', 'Desk 2')
+    await prisma.resource.update({ where: { id: desk.id }, data: { status: 'offline', statusNote: 'Wobbly leg' } })
+
+    const res = await book(token, desk.id, tomorrowAt(10))
+
+    expect(res.status).toBe(409)
+    expect(res.body).toEqual({ error: 'This resource is offline right now.' })
+    expect(await prisma.resourceBooking.count()).toBe(0)
+  })
+
+  it('alternatives never suggest an offline resource', async () => {
+    const { token: holder } = await seedUser()
+    const { token } = await seedUser()
+    const desk = await seedResource('seat', 'Desk 1')
+    const spare = await seedResource('seat', 'Desk 2')
+    expect((await book(holder, desk.id, tomorrowAt(10))).status).toBe(201)
+    await prisma.resource.update({ where: { id: spare.id }, data: { status: 'offline' } })
+
+    const res = await book(token, desk.id, tomorrowAt(10))
+
+    expect(res.status).toBe(409)
+    const alternatives = res.body.details.alternatives as Array<{ resourceId: string }>
+    expect(alternatives.some((a) => a.resourceId === spare.id)).toBe(false)
+    // The same desk's other free hours are still offered.
+    expect(alternatives.some((a) => a.resourceId === desk.id)).toBe(true)
+  })
+
+  it('a student can still check in to and cancel a booking on a resource that went offline', async () => {
+    const { user, token } = await seedUser()
+    const desk = await seedResource('seat', 'Desk 1')
+    const current = await prisma.resourceBooking.create({
+      data: { userId: user.id, resourceId: desk.id, startTime: new Date(Date.now() - 1000), endTime: new Date(Date.now() + 60 * 60 * 1000) },
+    })
+    const later = await book(token, desk.id, tomorrowAt(10))
+    expect(later.status).toBe(201)
+    await prisma.resource.update({ where: { id: desk.id }, data: { status: 'offline' } })
+
+    const listed = await request(app).get('/bookings/me').set('Authorization', `Bearer ${token}`)
+    expect(listed.body).toHaveLength(2)
+
+    const checkedIn = await request(app).post(`/bookings/${current.id}/checkin`).set('Authorization', `Bearer ${token}`)
+    expect(checkedIn.status).toBe(200)
+    expect(checkedIn.body.frontendStatus).toBe('checkedIn')
+
+    const cancelled = await request(app).post(`/bookings/${later.body.id}/cancel`).set('Authorization', `Bearer ${token}`)
+    expect(cancelled.status).toBe(200)
+    expect(cancelled.body.status).toBe('cancelled')
+  })
+})
+
 describe('room requests', () => {
   beforeEach(resetDb)
   let recorder: ReturnType<typeof recordEvents> | undefined
@@ -467,31 +537,6 @@ describe('room requests', () => {
     expect(res.body.details.alternatives.length).toBeGreaterThan(0)
   })
 
-  it('announces a room request to the console, and a seat booking as activity', async () => {
-    const { user, token } = await seedUser()
-    const room = await seedResource('room', 'Room 201')
-    const seat = await seedResource('seat', 'Desk 1')
-    recorder = recordEvents()
-
-    await requestRoom(token, room.id)
-    await request(app)
-      .post('/bookings')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ resourceId: seat.id, startTime: iso(2027, 1, 10, 9), endTime: iso(2027, 1, 10, 10) })
-
-    const start = new Date(iso(2027, 1, 10, 14))
-    const end = new Date(iso(2027, 1, 10, 15))
-    expect(recorder.events).toEqual([
-      {
-        type: 'request.created',
-        topics: ['requests'],
-        kind: 'room',
-        summary: `${user.name} wants Room 201 · ${dayLabel(start)} · ${slotLabel(start, end)}`,
-      },
-      { type: 'activity', topics: ['metrics'] },
-    ])
-  })
-
   it('publishes nothing when the booking is refused', async () => {
     const { token: first } = await seedUser()
     const { token: second } = await seedUser()
@@ -529,29 +574,85 @@ describe('room requests', () => {
     expect(res.status).toBe(409)
     expect(res.body.error).toBe('This booking cannot be checked into.')
   })
+})
 
-  it('reports check-ins and cancellations of booked seats as activity', async () => {
-    const { token } = await seedUser()
-    const seat = await seedResource('seat', 'Desk 1')
-    const now = new Date()
-    const startedAt = new Date(now.getTime() - 60_000)
-    const booked = await request(app)
+describe('booking changes reach the console', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+  })
+
+  function tomorrowAt(hour: number) {
+    const d = new Date()
+    d.setDate(d.getDate() + 1)
+    d.setHours(hour, 0, 0, 0)
+    return d
+  }
+
+  function book(token: string, resourceId: string, start: Date) {
+    return request(app)
       .post('/bookings')
       .set('Authorization', `Bearer ${token}`)
-      .send({ resourceId: seat.id, startTime: startedAt.toISOString(), endTime: new Date(startedAt.getTime() + 3_600_000).toISOString() })
-    const later = await request(app)
-      .post('/bookings')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ resourceId: seat.id, startTime: iso(2027, 1, 10, 9), endTime: iso(2027, 1, 10, 10) })
+      .send({ resourceId, startTime: start.toISOString(), endTime: new Date(start.getTime() + 3_600_000).toISOString() })
+  }
+
+  it('requesting a room publishes request.created and no booking.changed', async () => {
+    const { user, token } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
     recorder = recordEvents()
 
-    await request(app).post(`/bookings/${booked.body.id}/checkin`).set('Authorization', `Bearer ${token}`)
-    await request(app).post(`/bookings/${later.body.id}/cancel`).set('Authorization', `Bearer ${token}`)
+    const start = tomorrowAt(14)
+    const end = new Date(start.getTime() + 3_600_000)
+    const res = await book(token, room.id, start)
 
+    expect(res.status).toBe(201)
     expect(recorder.events).toEqual([
-      { type: 'activity', topics: ['metrics'] },
-      { type: 'activity', topics: ['metrics'] },
+      {
+        type: 'request.created',
+        topics: ['requests'],
+        kind: 'room',
+        summary: `${user.name} wants Room 201 · ${dayLabel(start)} · ${slotLabel(start, end)}`,
+      },
     ])
+  })
+
+  it('a seat booking publishes booking.changed', async () => {
+    const { token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 1')
+    recorder = recordEvents()
+
+    const res = await book(token, seat.id, tomorrowAt(9))
+
+    expect(res.status).toBe(201)
+    expect(recorder.events).toEqual([{ type: 'booking.changed', topics: ['bookings', 'metrics'] }])
+  })
+
+  it('a check-in publishes booking.changed', async () => {
+    const { token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 1')
+    const booked = await book(token, seat.id, new Date(Date.now() - 60_000))
+    expect(booked.status).toBe(201)
+    recorder = recordEvents()
+
+    const res = await request(app).post(`/bookings/${booked.body.id}/checkin`).set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    expect(recorder.events).toEqual([{ type: 'booking.changed', topics: ['bookings', 'metrics'] }])
+  })
+
+  it('a student cancelling a booked seat publishes booking.changed', async () => {
+    const { token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 1')
+    const booked = await book(token, seat.id, tomorrowAt(9))
+    expect(booked.status).toBe(201)
+    recorder = recordEvents()
+
+    const res = await request(app).post(`/bookings/${booked.body.id}/cancel`).set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    expect(recorder.events).toEqual([{ type: 'booking.changed', topics: ['bookings', 'metrics'] }])
   })
 })
 

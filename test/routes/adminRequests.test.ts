@@ -180,7 +180,6 @@ describe('deciding requests', () => {
     const room = await prisma.resource.create({ data: { type: 'room', name: 'Group Room 201' } })
     const approvedId = await askForRoom(student, room.id, 10)
     const declinedId = await askForRoom(student, room.id, 14)
-    recorder = recordEvents()
 
     expect((await approve(admin, 'room', approvedId)).status).toBe(200)
     expect((await decline(admin, 'room', declinedId)).status).toBe(200)
@@ -189,10 +188,30 @@ describe('deciding requests', () => {
     expect(mine.body.map((b: { frontendStatus: string }) => b.frontendStatus)).toEqual(['upcomingFar', 'declined'])
     expect((await requestRoom(other, room.id, 14)).status).toBe(201)
     expect((await requestRoom(other, room.id, 10)).status).toBe(409)
-    expect(recorder.events.slice(0, 2)).toEqual([
-      { type: 'request.decided', topics: ['requests', 'metrics'], kind: 'room' },
-      { type: 'request.decided', topics: ['requests'], kind: 'room' },
-    ])
+  })
+
+  it('approving a room request publishes request.decided with topics requests, metrics and bookings', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { token: student } = await seedUser()
+    const room = await prisma.resource.create({ data: { type: 'room', name: 'Group Room 201' } })
+    const id = await askForRoom(student, room.id, 10)
+    recorder = recordEvents()
+
+    expect((await approve(admin, 'room', id)).status).toBe(200)
+
+    expect(recorder.events).toEqual([{ type: 'request.decided', topics: ['requests', 'metrics', 'bookings'], kind: 'room' }])
+  })
+
+  it('declining a room request publishes request.decided without the bookings topic', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { token: student } = await seedUser()
+    const room = await prisma.resource.create({ data: { type: 'room', name: 'Group Room 201' } })
+    const id = await askForRoom(student, room.id, 14)
+    recorder = recordEvents()
+
+    expect((await decline(admin, 'room', id)).status).toBe(200)
+
+    expect(recorder.events).toEqual([{ type: 'request.decided', topics: ['requests'], kind: 'room' }])
   })
 
   it('two librarians approving at once: one wins, the other is told who', async () => {

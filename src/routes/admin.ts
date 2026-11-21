@@ -3,8 +3,23 @@ import { openLiveStream } from '../lib/liveStream'
 import { requireAdmin, requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
 import { adminRequestParamsSchema, declineRequestSchema } from '../schemas/adminRequests'
+import {
+  adminResourceParamsSchema,
+  adminResourcesQuerySchema,
+  createResourceSchema,
+  takeOfflineSchema,
+  updateResourceSchema,
+} from '../schemas/adminResources'
 import { getCirculation, getDemand, getOverdue, getUtilization } from '../services/adminMetricsService'
 import { approveRequest, declineRequest, listPendingRequests, type RequestKind } from '../services/adminRequestService'
+import {
+  bringOnline,
+  createResource,
+  listResources,
+  takeOffline,
+  updateResource,
+  type AdminResourceType,
+} from '../services/adminResourceService'
 
 export const adminRouter = Router()
 
@@ -46,6 +61,36 @@ adminRouter.post(
     res.json(await declineRequest(kind, id, req.user!.sub, reason ? reason : null))
   },
 )
+
+adminRouter.get('/admin/resources', validate({ query: adminResourcesQuerySchema }), async (req, res) => {
+  const { type } = req.validatedQuery as { type?: AdminResourceType }
+  res.json(await listResources(type))
+})
+
+adminRouter.post('/admin/resources', validate({ body: createResourceSchema }), async (req, res) => {
+  res.status(201).json(await createResource(req.body as Parameters<typeof createResource>[0]))
+})
+
+adminRouter.patch(
+  '/admin/resources/:id',
+  validate({ params: adminResourceParamsSchema, body: updateResourceSchema }),
+  async (req, res) => {
+    res.json(await updateResource(req.params.id as string, req.body as Parameters<typeof updateResource>[1]))
+  },
+)
+
+adminRouter.post(
+  '/admin/resources/:id/offline',
+  validate({ params: adminResourceParamsSchema, body: takeOfflineSchema }),
+  async (req, res) => {
+    const { note } = req.body as { note?: string }
+    res.json(await takeOffline(req.params.id as string, note ? note : null))
+  },
+)
+
+adminRouter.post('/admin/resources/:id/online', validate({ params: adminResourceParamsSchema }), async (req, res) => {
+  res.json(await bringOnline(req.params.id as string))
+})
 
 // Live updates for the console, as Server-Sent Events (lib/liveStream.ts).
 adminRouter.get('/admin/events', (req, res) => {
