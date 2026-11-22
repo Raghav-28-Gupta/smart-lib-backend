@@ -8,6 +8,7 @@ import { borrowRequestsRouter } from './routes/borrowRequests'
 import { finesRouter } from './routes/fines'
 import { healthRouter } from './routes/health'
 import { loansRouter } from './routes/loans'
+import { noticesRouter } from './routes/notices'
 import { reservationsRouter } from './routes/reservations'
 import { bookingsRouter } from './routes/bookings'
 import { profileRouter } from './routes/profile'
@@ -39,6 +40,7 @@ app.use(bookingsRouter)
 app.use(profileRouter)
 app.use(recommendationsRouter)
 app.use(finesRouter)
+app.use(noticesRouter)
 app.use(adminRouter)
 
 // More route modules land here as later tasks add them — each router

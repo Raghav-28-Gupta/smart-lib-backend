@@ -99,6 +99,22 @@ enum RecommendationMethod {
   hybrid
 }
 
+enum NoticeKind {
+  overdue_reminder
+  overdue_escalation
+  dispute_outcome
+  report_outcome
+}
+
+// What happened when the library tried to email a notice. `skipped` is also
+// the default a notice is written with, and the final answer when email is not
+// set up or the address is a placeholder: nothing was attempted.
+enum EmailStatus {
+  sent
+  failed
+  skipped
+}
+
 model User {
   id               String   @id @default(uuid())
   name             String
@@ -125,6 +141,8 @@ model User {
   adjustedFines         Fine[]                @relation("FineAdjuster")
   recordedFinePayments  Fine[]                @relation("FinePaymentRecorder")
   adjustedReliability   ReliabilityScoreLog[] @relation("ReliabilityAdjuster")
+  notices               Notice[]              @relation("NoticeRecipient")
+  authoredNotices       Notice[]              @relation("NoticeAuthor")
 }
 
 model Book {
@@ -174,6 +192,7 @@ model Loan {
   fines        Fine[]
 
   borrowRequest BorrowRequest?
+  notices       Notice[]
 }
 
 model Reservation {
@@ -307,7 +326,38 @@ model Fine {
   paidRecordedById String?
   paidRecordedBy   User?            @relation("FinePaymentRecorder", fields: [paidRecordedById], references: [id], onDelete: SetNull)
 
+  notices Notice[]
+
   @@index([createdAt])
+}
+
+// One library message to one student: an overdue reminder or formal notice, or
+// the outcome of a fine dispute or problem report. Written in the same
+// transaction as the action that caused it; the email (if any) is attempted
+// after the commit and its outcome recorded here. The student sees it in the app
+// for REQUEST_OUTCOME_VISIBLE_DAYS (GET /notices/me).
+model Notice {
+  id          String      @id @default(uuid())
+  userId      String
+  user        User        @relation("NoticeRecipient", fields: [userId], references: [id])
+  kind        NoticeKind
+  title       String
+  body        String
+  // The loan or fine it concerns, cleared when that row is deleted (the text is
+  // already rendered, so the notice stays).
+  loanId      String?
+  loan        Loan?       @relation(fields: [loanId], references: [id], onDelete: SetNull)
+  fineId      String?
+  fine        Fine?       @relation(fields: [fineId], references: [id], onDelete: SetNull)
+  // The librarian whose action caused it (null if the account is gone).
+  createdById String?
+  createdBy   User?       @relation("NoticeAuthor", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime    @default(now())
+  emailStatus EmailStatus @default(skipped)
+  // When the email was attempted: set for `sent` and `failed`, null for `skipped`.
+  emailedAt   DateTime?
+
+  @@index([userId, createdAt])
 }
 
 model ReliabilityScoreLog {

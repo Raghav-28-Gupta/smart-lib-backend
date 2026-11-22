@@ -143,7 +143,8 @@ export async function renewLoan(userId: string, loanId: string): Promise<LoanDto
   })
 
   // The new due date reaches the Catalogue and student pages; a loan that was past due also
-  // turns its accruing row on the Fines page into a stored fine (or removes it).
+  // turns its accruing row on the Fines page into a stored fine (or removes it), and its overdue
+  // item leaves the Needs attention queue (publishLoanChange adds both topics when past due).
   publishLoanChange(wasPastDue)
   return toLoanDto(updated, now)
 }

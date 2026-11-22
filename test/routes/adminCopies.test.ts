@@ -622,7 +622,8 @@ describe('admin copy actions', () => {
       expect(await lostFineOf(firstLoan.id)).toMatchObject({ status: 'pending', amount: 400 })
     })
 
-    it('events carry catalogue, fines and metrics for a loss on loan, catalogue and fines for a waived restore', async () => {
+    // Closing the loan removes its overdue item from the Needs attention queue, so that topic moves too.
+    it('marking a copy lost while on loan publishes catalogue.changed on catalogue, fines, metrics and attention', async () => {
       const { token: admin } = await seedUser('admin')
       const { user: student } = await seedUser('student', 'Asha Rao')
       const book = await seedBook('Dune')
@@ -630,13 +631,21 @@ describe('admin copy actions', () => {
       recorder = recordEvents()
 
       expect((await lost(admin, copy.id, { replacementCharge: 400, borrowerId: student.id })).status).toBe(200)
-      expect(recorder.events).toEqual([{ type: 'catalogue.changed', topics: ['catalogue', 'fines', 'metrics'] }])
+
+      expect(recorder.events).toEqual([{ type: 'catalogue.changed', topics: ['catalogue', 'fines', 'metrics', 'attention'] }])
+    })
+
+    it('restoring a lost copy with the replacement charge waived publishes catalogue.changed on catalogue and fines', async () => {
+      const { token: admin } = await seedUser('admin')
+      const { user: student } = await seedUser('student', 'Asha Rao')
+      const book = await seedBook('Dune')
+      const { copy } = await seedOnLoan(book.id, student.id, 5 * DAY_MS)
+      expect((await lost(admin, copy.id, { replacementCharge: 400, borrowerId: student.id })).status).toBe(200)
+      recorder = recordEvents()
 
       expect((await restore(admin, copy.id, { waiveReplacementCharge: true })).status).toBe(200)
-      expect(recorder.events).toEqual([
-        { type: 'catalogue.changed', topics: ['catalogue', 'fines', 'metrics'] },
-        { type: 'catalogue.changed', topics: ['catalogue', 'fines'] },
-      ])
+
+      expect(recorder.events).toEqual([{ type: 'catalogue.changed', topics: ['catalogue', 'fines'] }])
     })
   })
 

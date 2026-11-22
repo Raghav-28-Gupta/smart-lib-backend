@@ -13,6 +13,14 @@ export const REQUEST_OUTCOME_VISIBLE_DAYS = 7
 // A borrow request holds its copy this long while it waits for a librarian.
 export const BORROW_REQUEST_HOURS = 24
 
+// The demo accounts the seed creates. They are placeholders, never real
+// inboxes, so the mailer (lib/mailer.ts) never sends to them.
+export const DEMO_EMAIL_PATTERN = /^(aditi\.sharma|seed\.student\d+)@thapar\.edu$/i
+
+// The most an email send may take before it counts as failed; it is never
+// retried and never holds up the action that caused it.
+export const MAIL_TIMEOUT_MS = 5000
+
 // Matches the frontend's kTimeSlots exactly (booking_repository.dart) — each
 // entry is a 1-hour slot starting at `hour` (24h clock, local time). There's
 // no per-user timezone concept anywhere in the project yet, so "date" is

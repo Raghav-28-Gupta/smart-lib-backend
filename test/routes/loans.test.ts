@@ -381,14 +381,37 @@ describe('loan activity reaches the console', () => {
     expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue'] }])
   })
 
-  it('returning a past-due loan publishes loan.changed with fines too and writes the fine', async () => {
+  it('a past-due return and a past-due renewal carry attention; an on-time one does not', async () => {
+    const DAY = 24 * 60 * 60 * 1000
+    const cases = [
+      { action: 'return', dueAt: new Date(Date.now() + 2 * DAY), attention: false },
+      { action: 'renew', dueAt: new Date(Date.now() + 2 * DAY), attention: false },
+      { action: 'return', dueAt: new Date(Date.now() - 3 * DAY), attention: true },
+      { action: 'renew', dueAt: new Date(Date.now() - 3 * DAY), attention: true },
+    ]
+    for (const { action, dueAt, attention } of cases) {
+      const { token, loan } = await seedLoanDue(dueAt)
+      recorder = recordEvents()
+
+      const res = await request(app).post(`/loans/${loan.id}/${action}`).set('Authorization', `Bearer ${token}`)
+
+      expect(res.status).toBe(200)
+      expect(recorder.events).toHaveLength(1)
+      expect(recorder.events[0].type).toBe('loan.changed')
+      // A late return or renewal removes the loan's overdue item from the Needs attention queue.
+      expect(recorder.events[0].topics.includes('attention'), `${action} due ${attention ? 'in the past' : 'ahead'}`).toBe(attention)
+      recorder.stop()
+    }
+  })
+
+  it('returning a past-due loan publishes loan.changed with fines and attention too and writes the fine', async () => {
     const { user, token, loan } = await seedLoanDue(new Date(Date.now() - 4 * 24 * 60 * 60 * 1000))
     recorder = recordEvents()
 
     const res = await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${token}`)
 
     expect(res.status).toBe(200)
-    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines'] }])
+    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines', 'attention'] }])
     const fines = await prisma.fine.findMany({ where: { userId: user.id, relatedLoanId: loan.id } })
     expect(fines).toHaveLength(1)
     expect(fines[0].amount).toBe(40)
@@ -401,18 +424,18 @@ describe('loan activity reaches the console', () => {
     const res = await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${token}`)
 
     expect(res.status).toBe(200)
-    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines'] }])
+    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines', 'attention'] }])
     expect(await prisma.fine.count({ where: { userId: user.id } })).toBe(0)
   })
 
-  it('renewing a past-due loan publishes one loan.changed with fines too', async () => {
+  it('renewing a past-due loan publishes one loan.changed with fines and attention too', async () => {
     const { token, loan } = await seedLoanDue(new Date(Date.now() - 2 * 24 * 60 * 60 * 1000))
     recorder = recordEvents()
 
     const res = await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
 
     expect(res.status).toBe(200)
-    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines'] }])
+    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines', 'attention'] }])
   })
 
   it('a refused renewal publishes nothing and writes no fine', async () => {

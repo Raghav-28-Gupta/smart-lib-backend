@@ -247,8 +247,9 @@ export async function markCopyMaintenance(copyId: string, now = new Date()): Pro
 export async function markCopyLost(copyId: string, input: LostCopyInput = {}, now = new Date()): Promise<AdminBookDto> {
   const bookId = await bookOf(copyId)
   const onLoan = await prisma.$transaction((tx) => loseCopy(tx, copyId, bookId, input, now))
-  // A loan closed as lost also moves the student's fines and the Dashboard's numbers.
-  publishCatalogueChange(onLoan ? ['fines', 'metrics'] : [])
+  // A loan closed as lost also moves the student's fines and the Dashboard's numbers,
+  // and removes its overdue item from the Needs attention queue.
+  publishCatalogueChange(onLoan ? ['fines', 'metrics', 'attention'] : [])
   return getAdminBook(bookId)
 }
 

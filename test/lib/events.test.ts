@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   publish,
   publishActivity,
+  publishAttentionChange,
   publishBookingChange,
   publishCatalogueChange,
   publishFineChange,
@@ -105,14 +106,21 @@ describe('event bus', () => {
     expect(got).toEqual([{ type: 'student.changed', topics: ['students'] }])
   })
 
-  it('publishLoanChange publishes loan.changed on metrics and catalogue, and on fines when the loan was past due', () => {
+  it('publishAttentionChange publishes attention.changed on attention', () => {
+    const got: LiveEvent[] = []
+    stops.push(subscribe((e) => got.push(e)))
+    publishAttentionChange()
+    expect(got).toEqual([{ type: 'attention.changed', topics: ['attention'] }])
+  })
+
+  it('publishLoanChange publishes loan.changed on metrics and catalogue, and on fines and attention when the loan was past due', () => {
     const got: LiveEvent[] = []
     stops.push(subscribe((e) => got.push(e)))
     publishLoanChange(false)
     publishLoanChange(true)
     expect(got).toEqual([
       { type: 'loan.changed', topics: ['metrics', 'catalogue'] },
-      { type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines'] },
+      { type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines', 'attention'] },
     ])
   })
 })
