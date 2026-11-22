@@ -35,6 +35,7 @@ async function loadLoans(where: Prisma.LoanWhereInput): Promise<LoanRow[]> {
       borrowedAt: true,
       dueAt: true,
       returnedAt: true,
+      lostAt: true,
       bookCopy: { select: { book: { select: { id: true, title: true } } } },
     },
   })
@@ -44,6 +45,7 @@ async function loadLoans(where: Prisma.LoanWhereInput): Promise<LoanRow[]> {
     borrowedAt: r.borrowedAt,
     dueAt: r.dueAt,
     returnedAt: r.returnedAt,
+    lostAt: r.lostAt,
   }))
 }
 
@@ -66,9 +68,15 @@ export async function getCirculation(now = new Date()): Promise<CirculationDto> 
 }
 
 export async function getOverdue(now = new Date()): Promise<OverdueDto> {
-  // Anything overdue now or 24 hours ago was due before now, and was either
-  // still out or returned after that earlier moment.
+  // Anything overdue now or 24 hours ago was due before now, and was still out
+  // at that earlier moment: neither returned nor marked lost before it.
   const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000)
-  const loans = await loadLoans({ dueAt: { lt: now }, OR: [{ returnedAt: null }, { returnedAt: { gt: dayAgo } }] })
+  const loans = await loadLoans({
+    dueAt: { lt: now },
+    AND: [
+      { OR: [{ returnedAt: null }, { returnedAt: { gt: dayAgo } }] },
+      { OR: [{ lostAt: null }, { lostAt: { gt: dayAgo } }] },
+    ],
+  })
   return computeOverdue(loans, now)
 }

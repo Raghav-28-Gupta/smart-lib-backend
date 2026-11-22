@@ -79,15 +79,17 @@ const LISTED_STATUSES = Prisma.sql`('booked', 'checked_in', 'released', 'complet
 function isWithdrawnRequest(b: { status: BookingStatus; decidedAt: Date | null; decidedById: string | null }): boolean {
   return b.status === 'cancelled' && b.decidedAt !== null && b.decidedById === null
 }
-const NOT_WITHDRAWN_REQUEST = Prisma.sql`NOT (b.status = 'cancelled' AND b."decidedAt" IS NOT NULL AND b."decidedById" IS NULL)`
+export const NOT_WITHDRAWN_REQUEST = Prisma.sql`NOT (b.status = 'cancelled' AND b."decidedAt" IS NOT NULL AND b."decidedById" IS NULL)`
 
 /**
  * The status a booking is shown as at `now`. Same rules as the student app
  * (bookingService.computeWindow): a booking is released once its grace period
  * has passed (strictly: at the very end of the grace period it is still
  * booked), and a checked-in one is completed once its end time is reached.
+ * Requested, declined, expired and no_show pass through as stored. Also used by
+ * adminStudentService for a student's booking history.
  */
-function derivedStatusSql(now: Date): Prisma.Sql {
+export function derivedStatusSql(now: Date): Prisma.Sql {
   return Prisma.sql`CASE
     WHEN b.status = 'cancelled' THEN 'cancelled'
     WHEN b.status = 'completed' THEN 'completed'

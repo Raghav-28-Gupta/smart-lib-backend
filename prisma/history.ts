@@ -4,7 +4,12 @@
 // nothing collides with the seed's "taken slots today", with the student
 // app's fixtures, or with anything booked from now on. Only the seed
 // students own these rows; the demo student's account is untouched.
+//
+// Each late return also gets its overdue fine, so the admin Fines page has
+// every state to show. Seeded fines name no librarian: nobody recorded the
+// payments or made the adjustments.
 import { LOAN_PERIOD_DAYS, TIME_SLOTS } from '../src/config/constants'
+import { overdueFineAmount } from '../src/services/fineRules'
 
 export const HISTORY_DAYS = 28
 export const HISTORY_SEED = 20261015
@@ -29,6 +34,8 @@ export interface HistoryBooking {
 }
 
 export interface HistoryLoan {
+  /** `hist-loan-<n>`, so the output is comparable between runs and the fines can point at it. */
+  id: string
   userId: string
   bookCopyId: string
   borrowedAt: Date
@@ -37,8 +44,33 @@ export interface HistoryLoan {
   status: 'active' | 'returned'
 }
 
+/** An overdue fine the way the console leaves it: the columns a librarian would have set, minus the librarian. */
+export interface HistoryFine {
+  userId: string
+  relatedLoanId: string
+  amount: number
+  reason: 'overdue'
+  /** When the loan came back late. */
+  createdAt: Date
+  status: 'pending' | 'paid' | 'waived' | 'adjusted'
+  paidAt: Date | null
+  /** What the fine was before it was lowered or waived; null when never adjusted. */
+  originalAmount: number | null
+  adjustedAt: Date | null
+  adjustReason: string | null
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000
 const CHECK_IN_RATE = 0.8
+// Where a loan's single roll lands: below ON_TIME_BELOW it comes back on time,
+// below LATE_BELOW it comes back late, above that it is still out. The on-time
+// and late branches each draw exactly one more random number and the still-out
+// branch none, so moving ON_TIME_BELOW changes which loans are late without
+// shifting the random stream: the bookings are identical either way.
+const ON_TIME_BELOW = 0.6
+const LATE_BELOW = 0.9
+const WAIVE_REASON = 'First late return'
+const ADJUST_REASON = 'Returned during exam week'
 
 /** mulberry32: a small seeded PRNG, so the seed's history is reproducible. */
 export function mulberry32(seed: number): () => number {
@@ -66,7 +98,7 @@ export function generateHistory(
   today: Date,
   random: () => number,
   inputs: HistoryInputs,
-): { bookings: HistoryBooking[]; loans: HistoryLoan[] } {
+): { bookings: HistoryBooking[]; loans: HistoryLoan[]; fines: HistoryFine[] } {
   const midnight = new Date(today.getFullYear(), today.getMonth(), today.getDate())
   const pick = <T,>(items: T[]): T => items[Math.floor(random() * items.length)]
 
@@ -83,7 +115,7 @@ export function generateHistory(
   const freeCopies = new Map(inputs.books.map((b) => [b.id, [...b.borrowedCopyIds]]))
   const nextCopy = new Map<string, number>()
 
-  const makeLoan = (day: Date): HistoryLoan => {
+  const makeLoan = (day: Date, id: string): HistoryLoan => {
     const book = pickBook()
     const userId = pick(inputs.studentIds)
     const borrowedAt = new Date(
@@ -92,21 +124,21 @@ export function generateHistory(
     const dueAt = new Date(borrowedAt.getTime() + LOAN_PERIOD_DAYS * DAY_MS)
     const roll = random()
     let returnedAt: Date | null =
-      roll < 0.75
+      roll < ON_TIME_BELOW
         ? new Date(borrowedAt.getTime() + (3 + Math.floor(random() * 11)) * DAY_MS) // on time: 3-13 days
-        : roll < 0.9
+        : roll < LATE_BELOW
           ? new Date(borrowedAt.getTime() + (15 + Math.floor(random() * 4)) * DAY_MS) // late: 15-18 days
           : null
     if (returnedAt && returnedAt >= midnight) returnedAt = null // not back yet
     if (returnedAt === null) {
       const copy = freeCopies.get(book.id)?.shift()
-      if (copy) return { userId, bookCopyId: copy, borrowedAt, dueAt, returnedAt: null, status: 'active' }
+      if (copy) return { id, userId, bookCopyId: copy, borrowedAt, dueAt, returnedAt: null, status: 'active' }
       // No borrowed copy is free to carry an open loan, so record it as returned.
       returnedAt = new Date(Math.min(borrowedAt.getTime() + 7 * DAY_MS, midnight.getTime() - 60 * 60 * 1000))
     }
     const index = nextCopy.get(book.id) ?? 0
     nextCopy.set(book.id, index + 1)
-    return { userId, bookCopyId: book.copyIds[index % book.copyIds.length], borrowedAt, dueAt, returnedAt, status: 'returned' }
+    return { id, userId, bookCopyId: book.copyIds[index % book.copyIds.length], borrowedAt, dueAt, returnedAt, status: 'returned' }
   }
 
   const bookings: HistoryBooking[] = []
@@ -136,7 +168,73 @@ export function generateHistory(
     }
     const weekend = day.getDay() === 0 || day.getDay() === 6
     const borrows = weekend ? (random() < 0.4 ? 1 : 0) : 2 + Math.floor(random() * 2)
-    for (let i = 0; i < borrows; i++) loans.push(makeLoan(day))
+    for (let i = 0; i < borrows; i++) loans.push(makeLoan(day, `hist-loan-${loans.length + 1}`))
   }
-  return { bookings, loans }
+  return { bookings, loans, fines: generateFines(loans, midnight, random) }
+}
+
+/**
+ * One overdue fine per loan returned after its due date, then a few settled so
+ * every filter on the Fines page has something: about half paid, a waived and
+ * a lowered example, and the newest left outstanding. Three loans in ten come
+ * back late, which gives five to eleven fines depending on the weekday: enough
+ * for every status each day. Should there ever be fewer than four, the
+ * outstanding fine comes first, then the waived one, then the lowered one.
+ *
+ * The statuses are decided after the bookings and loans, from the end of the
+ * same random stream, so they never move the rows generated before them.
+ */
+function generateFines(loans: HistoryLoan[], midnight: Date, random: () => number): HistoryFine[] {
+  const fines: HistoryFine[] = []
+  for (const loan of loans) {
+    if (!loan.returnedAt) continue
+    const amount = overdueFineAmount(loan.dueAt, loan.returnedAt)
+    if (amount <= 0) continue
+    fines.push({
+      userId: loan.userId,
+      relatedLoanId: loan.id,
+      amount,
+      reason: 'overdue',
+      createdAt: loan.returnedAt,
+      status: 'pending',
+      paidAt: null,
+      originalAmount: null,
+      adjustedAt: null,
+      adjustReason: null,
+    })
+  }
+
+  // Settle the oldest returns first, and only ones old enough that the payment
+  // or adjustment (1-3 days after the return) still falls before today.
+  const daysBeforeToday = (f: HistoryFine) => Math.ceil((midnight.getTime() - f.createdAt.getTime()) / DAY_MS) - 1
+  const oldestFirst = [...fines].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+  // The newest always stays outstanding: that is the one a librarian can act on.
+  const settleCount = Math.max(0, Math.min(fines.length - 1, Math.round(fines.length / 2) + 2))
+  const settled = oldestFirst.filter((f) => daysBeforeToday(f) >= 1).slice(0, settleCount)
+
+  // A waived and a lowered example, the rest paid, dealt out in random order.
+  const kinds: ('waived' | 'adjusted' | 'paid')[] = settled.map((_, i) => (i === 0 ? 'waived' : i === 1 ? 'adjusted' : 'paid'))
+  for (let i = kinds.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1))
+    ;[kinds[i], kinds[j]] = [kinds[j], kinds[i]]
+  }
+
+  settled.forEach((fine, i) => {
+    const owed = fine.amount
+    const days = 1 + Math.floor(random() * Math.min(3, daysBeforeToday(fine)))
+    const at = new Date(fine.createdAt.getTime() + days * DAY_MS)
+    if (kinds[i] === 'paid') {
+      fine.status = 'paid'
+      fine.paidAt = at
+    } else {
+      // The same columns the console sets when a librarian lowers or waives a fine (a waive is a lowering to nothing).
+      const waived = kinds[i] === 'waived'
+      fine.status = waived ? 'waived' : 'adjusted'
+      fine.amount = waived ? 0 : Math.max(1, Math.floor(owed / 2))
+      fine.originalAmount = owed
+      fine.adjustedAt = at
+      fine.adjustReason = waived ? WAIVE_REASON : ADJUST_REASON
+    }
+  })
+  return fines
 }

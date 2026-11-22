@@ -148,6 +148,8 @@ export interface LoanRow {
   borrowedAt: Date
   dueAt: Date
   returnedAt: Date | null
+  /** When its copy was marked lost while on loan: the loan closed then, but it was not returned. */
+  lostAt: Date | null
 }
 
 export interface CirculationDto {
@@ -176,6 +178,7 @@ export function computeCirculation(loans: LoanRow[], now: Date): CirculationDto 
       entry.borrows++
       byBook.set(l.bookId, entry)
     }
+    // Only a return: a loan closed as lost has no returnedAt.
     if (inWindow(l.returnedAt)) returns++
   }
   const topTitles = [...byBook.values()]
@@ -184,9 +187,12 @@ export function computeCirculation(loans: LoanRow[], now: Date): CirculationDto 
   return { borrows, returns, topTitles }
 }
 
-/** Loans that were out and past due at the moment `t`. */
+/** Loans that were out and past due at the moment `t`. A loan stops being out when it is returned or its copy is marked lost. */
 export function overdueAt(loans: LoanRow[], t: Date): number {
-  return loans.filter((l) => l.borrowedAt <= t && (l.returnedAt === null || l.returnedAt > t) && l.dueAt < t).length
+  return loans.filter((l) => {
+    const closedAt = l.returnedAt ?? l.lostAt
+    return l.borrowedAt <= t && (closedAt === null || closedAt > t) && l.dueAt < t
+  }).length
 }
 
 export function computeOverdue(loans: LoanRow[], now: Date): OverdueDto {

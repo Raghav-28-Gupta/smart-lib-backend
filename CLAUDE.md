@@ -105,15 +105,72 @@ Check every generated migration for a `DROP` of either before applying it.
 
 ## Live Events
 
-Every write that changes requests, bookings, resources or Dashboard numbers
-publishes an event once it has committed (`src/lib/events.ts`: `publish`;
-`publishActivity()` for a change that only moves Dashboard numbers;
-`publishBookingChange()` for a booking that is not a request, on the `bookings`
-and `metrics` topics; `publishResourceChange()` for a resource added, edited,
-taken offline or brought back, on the `resources` and `metrics` topics).
+Every write that changes what an admin page shows publishes an event once it
+has committed, and a refused write publishes nothing. Topics: `requests`,
+`metrics`, `bookings`, `resources`, `fines`, `catalogue`, `students`. The
+helpers in `src/lib/events.ts`:
+
+- `publish(event)`: the raw call; the request events (`request.created`,
+  `request.decided`, `request.cancelled`, `request.expired`) use it, on
+  `requests` (an approval also `metrics`, an approved room request also
+  `bookings`).
+- `publishActivity()`: a change that only moves Dashboard numbers (a waitlist
+  join or leave); `metrics`.
+- `publishBookingChange()`: a booking that is not a request (`booking.changed`);
+  `bookings` and `metrics`.
+- `publishResourceChange()`: a resource added, edited, taken offline or brought
+  back (`resource.changed`); `resources` and `metrics`.
+- `publishFineChange()`: a fine marked paid, adjusted or waived
+  (`fine.changed`); `fines`.
+- `publishCatalogueChange(extra)`: a book added or edited, copies added, a copy
+  to maintenance, lost from the shelf or restored (`catalogue.changed`);
+  `catalogue` plus whatever `extra` topics the change also moves. A copy lost
+  while on loan passes `['fines', 'metrics']`; a restore that waived the
+  replacement fine passes `['fines']`.
+- `publishStudentChange()`: a manual reliability adjustment
+  (`student.changed`); `students`.
+- `publishLoanChange(pastDue)`: a student's return or renewal (`loan.changed`);
+  `metrics` and `catalogue` (a renewal's new due date shows on the Catalogue and
+  student pages), and `fines` as well when the loan was past due (its accruing
+  row on the Fines page turns into a stored fine). It replaced `publishActivity()`
+  (and, for a past-due renewal, `publishFineChange()`) in `returnLoan` and
+  `renewLoan`.
+
 `GET /admin/events` streams them to the admin console. A new mutation the
 console should see must publish one, with a test using `recordEvents()` from
-`test/helpers/events.ts`.
+`test/helpers/events.ts`, including that a refusal publishes nothing.
+
+---
+
+## Fines, Copies and Lost Loans
+
+- **Fines.** Amounts are whole rupees. The database word for an owed, never
+  adjusted fine is `pending`; the API says `outstanding`. The overdue amount
+  comes only from `src/services/fineRules.ts` (`overdueFineAmount` in code,
+  `accruingAmountSql` in SQL, kept in step by a test); the Fines page's accruing
+  rows, the student's loan line and a late return all use it. Mark paid, adjust
+  and waive are conditional updates, never read-then-write, and mark paid also
+  checks the amount the librarian saw.
+- **Copies.** Every copy action is one transaction that locks the book's row
+  first (`FOR NO KEY UPDATE`), then updates the copy conditional on the status it
+  read; the loan is changed before the copy, the order a return uses. A copy
+  restored or added runs `onBookReturned` so a waiting student gets it first.
+  Barcodes come only from the database default (`next_copy_barcode()`): never
+  generate one in code. A book's `totalCopies` is counted from its copies that
+  are not lost (`totalCopiesByBook`); the `Book.totalCopies` column is not read.
+- **A lost loan is a closed loan.** It has `status: 'lost'` and `lostAt`, no
+  `returnedAt`, and is not overdue after `lostAt`. So an open loan is one with
+  `status: 'active'` (overdue is computed from `dueAt`, never stored): every
+  "open loan" check uses it, or excludes both `returned` and `lost`, and a
+  `returnedAt: null` test alone would count a lost loan as still out. The metrics
+  treat `lostAt` like `returnedAt`. A student's return or renew of one is a 409.
+- **Time zone in raw SQL.** Most date columns (`Loan`, `Fine`, the reliability
+  log, ...) are plain `timestamp(3)` holding UTC; only the booking and borrow
+  request ones are `timestamptz`. Prisma binds a JS `Date` as UTC wall-clock
+  text, so a raw query against a plain-`timestamp` column must cast it
+  `${now}::timestamp`, never `::timestamptz`, which the session's time zone would
+  shift by hours. `fineRules`, `adminFineService` and `adminCopyService` rely on
+  it.
 
 ---
 

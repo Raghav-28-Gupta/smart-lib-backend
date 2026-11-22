@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { generateHistory, HISTORY_SEED, mulberry32, type HistoryInputs } from '../../prisma/history'
+import { overdueFineAmount } from '../../src/services/fineRules'
 
 const TODAY = new Date(2026, 9, 15, 13, 0)
 const MIDNIGHT = new Date(2026, 9, 15)
@@ -89,5 +90,111 @@ describe('generateHistory', () => {
     expect(missed).toBeLessThan(0.3)
     expect(loans.length).toBeGreaterThanOrEqual(40)
     expect(loans.length).toBeLessThanOrEqual(60)
+  })
+
+  it('gives each loan a deterministic id, hist-loan-<n>', () => {
+    const { loans } = run()
+    expect(loans.map((l) => l.id)).toEqual(loans.map((_, i) => `hist-loan-${i + 1}`))
+  })
+
+  it('every late return has one overdue fine of the right amount', () => {
+    const { loans, fines } = run()
+    const late = loans.filter((l) => l.returnedAt && l.returnedAt.getTime() > l.dueAt.getTime())
+    expect(late.length).toBeGreaterThan(0)
+    // One fine per late return, and nothing owed for an on-time return or an open loan.
+    expect(fines).toHaveLength(late.length)
+    for (const loan of late) {
+      const forLoan = fines.filter((f) => f.relatedLoanId === loan.id)
+      expect(forLoan).toHaveLength(1)
+      const [fine] = forLoan
+      const owed = overdueFineAmount(loan.dueAt, loan.returnedAt!)
+      expect(owed).toBeGreaterThan(0)
+      expect(fine.userId).toBe(loan.userId)
+      expect(fine.reason).toBe('overdue')
+      expect(fine.createdAt).toEqual(loan.returnedAt)
+      // Whatever its status, the fine started as what the late return owed.
+      expect(fine.originalAmount ?? fine.amount).toBe(owed)
+      if (fine.status === 'pending' || fine.status === 'paid') expect(fine.amount).toBe(owed)
+    }
+  })
+
+  it('fines include paid, adjusted, waived and outstanding, with no librarian', () => {
+    const { fines } = run()
+    const byStatus = (status: string) => fines.filter((f) => f.status === status)
+    expect(byStatus('paid').length).toBeGreaterThanOrEqual(1)
+    expect(byStatus('adjusted').length).toBeGreaterThanOrEqual(1)
+    expect(byStatus('waived').length).toBeGreaterThanOrEqual(1)
+    expect(byStatus('pending').length).toBeGreaterThanOrEqual(1)
+    // About half are paid.
+    expect(byStatus('paid').length / fines.length).toBeGreaterThan(0.25)
+    expect(byStatus('paid').length / fines.length).toBeLessThan(0.75)
+
+    for (const f of fines) {
+      // Nobody is named: a fine has no recorder or adjuster field at all.
+      expect(Object.keys(f).filter((k) => k.endsWith('ById'))).toEqual([])
+      expect(f.createdAt.getTime()).toBeLessThan(MIDNIGHT.getTime())
+    }
+    for (const f of byStatus('paid')) {
+      const days = (f.paidAt!.getTime() - f.createdAt.getTime()) / DAY_MS
+      expect(days).toBeGreaterThanOrEqual(1)
+      expect(days).toBeLessThanOrEqual(3)
+      expect(f.paidAt!.getTime()).toBeLessThan(MIDNIGHT.getTime())
+      expect([f.originalAmount, f.adjustedAt, f.adjustReason]).toEqual([null, null, null])
+    }
+    for (const f of byStatus('adjusted')) {
+      // Looks like a fine the console lowered: the original kept, a lower whole-rupee amount, why and when.
+      expect(f.originalAmount).not.toBeNull()
+      expect(f.amount).toBeGreaterThan(0)
+      expect(f.amount).toBeLessThan(f.originalAmount!)
+      expect(Number.isInteger(f.amount)).toBe(true)
+      expect(f.adjustReason).toBe('Returned during exam week')
+      expect(f.adjustedAt!.getTime()).toBeGreaterThan(f.createdAt.getTime())
+      expect(f.adjustedAt!.getTime()).toBeLessThan(MIDNIGHT.getTime())
+      expect(f.paidAt).toBeNull()
+    }
+    for (const f of byStatus('waived')) {
+      expect(f.amount).toBe(0)
+      expect(f.originalAmount).toBeGreaterThan(0)
+      expect(f.adjustReason).toBe('First late return')
+      expect(f.adjustedAt!.getTime()).toBeGreaterThan(f.createdAt.getTime())
+      expect(f.adjustedAt!.getTime()).toBeLessThan(MIDNIGHT.getTime())
+      expect(f.paidAt).toBeNull()
+    }
+    for (const f of byStatus('pending')) {
+      expect([f.paidAt, f.originalAmount, f.adjustedAt, f.adjustReason]).toEqual([null, null, null, null])
+    }
+  })
+
+  it('still deterministic', () => {
+    const a = run()
+    const b = run()
+    expect(a.fines.length).toBeGreaterThan(0)
+    expect(b.fines).toEqual(a.fines)
+    expect(b).toEqual(a)
+  })
+
+  it('every day of a week gives outstanding, paid, adjusted and waived fines', () => {
+    // The history depends on the date only through the weekday, so seven
+    // consecutive days are every case there is.
+    for (let ahead = 0; ahead < 7; ahead++) {
+      const day = new Date()
+      day.setDate(day.getDate() + ahead)
+      const { loans, fines } = generateHistory(day, mulberry32(HISTORY_SEED), INPUTS)
+      const midnight = new Date(day.getFullYear(), day.getMonth(), day.getDate())
+      const count = (status: string) => fines.filter((f) => f.status === status).length
+
+      // A late return is never left without its fine.
+      expect(fines.length).toBe(loans.filter((l) => l.returnedAt && l.returnedAt > l.dueAt).length)
+      for (const status of ['pending', 'paid', 'adjusted', 'waived']) {
+        expect(count(status), `${day.toDateString()}: ${status}`).toBeGreaterThanOrEqual(1)
+      }
+      // About half are paid.
+      expect(count('paid') / fines.length).toBeGreaterThanOrEqual(0.25)
+      expect(count('paid') / fines.length).toBeLessThanOrEqual(0.75)
+      // Nothing is settled in the future.
+      for (const f of fines) {
+        for (const at of [f.paidAt, f.adjustedAt]) if (at) expect(at.getTime()).toBeLessThan(midnight.getTime())
+      }
+    }
   })
 })

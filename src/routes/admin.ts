@@ -3,6 +3,16 @@ import { openLiveStream } from '../lib/liveStream'
 import { requireAdmin, requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
 import { adminBookingParamsSchema, adminBookingsQuerySchema, cancelBookingSchema, reassignBookingSchema } from '../schemas/adminBookings'
+import {
+  addCopiesSchema,
+  adminBookParamsSchema,
+  adminBooksQuerySchema,
+  adminCopyParamsSchema,
+  createBookSchema,
+  markCopyLostSchema,
+  restoreCopySchema,
+  updateBookSchema,
+} from '../schemas/adminCatalogue'
 import { adjustFineSchema, adminFineParamsSchema, adminFinesQuerySchema, markFinePaidSchema } from '../schemas/adminFines'
 import { adminRequestParamsSchema, declineRequestSchema } from '../schemas/adminRequests'
 import {
@@ -12,6 +22,7 @@ import {
   takeOfflineSchema,
   updateResourceSchema,
 } from '../schemas/adminResources'
+import { adjustReliabilitySchema, adminStudentParamsSchema } from '../schemas/adminStudents'
 import {
   cancelBookingAsLibrary,
   listBookings,
@@ -19,6 +30,8 @@ import {
   reassignBooking,
   type AdminBookingListQuery,
 } from '../services/adminBookingService'
+import { addCopies, createBook, listBooks, updateBook, type AdminBookListQuery } from '../services/adminCatalogueService'
+import { markCopyLost, markCopyMaintenance, restoreCopy } from '../services/adminCopyService'
 import { adjustFine, listFines, markFinePaid, type AdminFineListQuery } from '../services/adminFineService'
 import { getCirculation, getDemand, getOverdue, getUtilization } from '../services/adminMetricsService'
 import { approveRequest, declineRequest, listPendingRequests, type RequestKind } from '../services/adminRequestService'
@@ -30,6 +43,7 @@ import {
   updateResource,
   type AdminResourceType,
 } from '../services/adminResourceService'
+import { adjustReliability, getStudent } from '../services/adminStudentService'
 
 export const adminRouter = Router()
 
@@ -147,6 +161,58 @@ adminRouter.post(
   async (req, res) => {
     const { amount, reason } = req.body as { amount: number; reason: string }
     res.json(await adjustFine(req.params.id as string, req.user!.sub, amount, reason))
+  },
+)
+
+adminRouter.get('/admin/books', validate({ query: adminBooksQuerySchema }), async (req, res) => {
+  res.json(await listBooks(req.validatedQuery as AdminBookListQuery))
+})
+
+adminRouter.post('/admin/books', validate({ body: createBookSchema }), async (req, res) => {
+  res.status(201).json(await createBook(req.body as Parameters<typeof createBook>[0]))
+})
+
+adminRouter.patch('/admin/books/:id', validate({ params: adminBookParamsSchema, body: updateBookSchema }), async (req, res) => {
+  res.json(await updateBook(req.params.id as string, req.body as Parameters<typeof updateBook>[1]))
+})
+
+adminRouter.post('/admin/books/:id/copies', validate({ params: adminBookParamsSchema, body: addCopiesSchema }), async (req, res) => {
+  const { count } = req.body as { count: number }
+  res.json(await addCopies(req.params.id as string, count))
+})
+
+adminRouter.post('/admin/copies/:id/maintenance', validate({ params: adminCopyParamsSchema }), async (req, res) => {
+  res.json(await markCopyMaintenance(req.params.id as string))
+})
+
+adminRouter.post(
+  '/admin/copies/:id/lost',
+  validate({ params: adminCopyParamsSchema, body: markCopyLostSchema }),
+  async (req, res) => {
+    const { replacementCharge, borrowerId } = req.body as { replacementCharge?: number; borrowerId?: string }
+    res.json(await markCopyLost(req.params.id as string, { replacementCharge, borrowerId }))
+  },
+)
+
+adminRouter.post(
+  '/admin/copies/:id/restore',
+  validate({ params: adminCopyParamsSchema, body: restoreCopySchema }),
+  async (req, res) => {
+    const { waiveReplacementCharge } = req.body as { waiveReplacementCharge?: boolean }
+    res.json(await restoreCopy(req.params.id as string, req.user!.sub, waiveReplacementCharge === true))
+  },
+)
+
+adminRouter.get('/admin/students/:id', validate({ params: adminStudentParamsSchema }), async (req, res) => {
+  res.json(await getStudent(req.params.id as string))
+})
+
+adminRouter.post(
+  '/admin/students/:id/reliability',
+  validate({ params: adminStudentParamsSchema, body: adjustReliabilitySchema }),
+  async (req, res) => {
+    const { delta, reason } = req.body as { delta: number; reason: string }
+    res.json(await adjustReliability(req.params.id as string, req.user!.sub, delta, reason))
   },
 )
 

@@ -46,7 +46,9 @@ express: the `EXCLUDE` constraint below (rewritten in
 and a partial unique index allowing one pending borrow request per student and
 title. Create new migrations with `npx prisma migrate dev --create-only` and
 read the SQL before applying it. Prisma doesn't model these two, so a
-generated migration may try to drop them.
+generated migration may try to drop them. (`20261121215218_console_catalogue`
+also hand-writes the barcode sequence and the `next_copy_barcode()` function
+that is `BookCopy.barcode`'s default; see *Catalogue and copies*.)
 
 The `EXCLUDE` constraint makes double-booking a resource a *database-level*
 impossibility rather than something application code has to get right on
@@ -87,7 +89,8 @@ matches the UI the team has already seen. It also gives the demo user a
 representative loan/reliability history (an overdue loan with a fine, a loan
 blocked from renewal by a waitlist, a degraded reliability score) so her own
 screens aren't empty on first login. Details and the specific scope decisions
-are documented in the comment block at the top of `prisma/seed.ts`.
+are documented in the comment block at the top of `prisma/seedData.ts` (the seed's work, as
+`runSeed()`; `prisma/seed.ts` is the command line around it).
 
 It also generates four weeks of past activity, ending yesterday, for the six
 "Seed Student" accounts: about 600-900 bookings (weekday afternoons busiest,
@@ -96,10 +99,44 @@ The same seed (`HISTORY_SEED` in `prisma/history.ts`) gives the same history
 every time, shifted to end yesterday. The demo student's account gets none of
 it, so the student app looks exactly as before.
 
+Each late return in that history also has its overdue fine: about half paid,
+one waived and one lowered (with their notes), the rest outstanding (the newest
+always is), so every status filter on the Fines page has something (the demo
+student's overdue loan, still out, is an accruing row). The seeded fines name no
+librarian, since nobody recorded them. Every seeded copy gets its barcode from the same sequence as a copy added
+in the console (see *Catalogue and copies*), so the numbers change on each
+re-seed.
+
 Re-running it resets the seeded books (b1-b12), resources (s1-r3) and seed
-accounts, then recreates them. The reset includes every loan, booking and
-waitlist entry on those books and resources, including ones students made
-through the live app. Other books, resources and accounts are left alone.
+accounts (the demo student and the six "Seed Student" accounts), then recreates
+them. It is safe to run after the console has been used: it never fails on rows
+the console added.
+
+**A re-seed resets:**
+
+- the demo books back to their demo state (a console edit to them is undone)
+  and all their copies, including copies a librarian added to them;
+- every loan, borrow request, waitlist entry, cached recommendation and fine
+  tied to a demo book or one of its copies, including other students' and ones
+  made through the live app, so no fine is left without its loan;
+- the demo resources, and every booking on them, with its no-show record and
+  fines;
+- the seed accounts, and everything they own wherever it points: loans, borrow
+  requests, waitlist entries, bookings, fines and scores, including on books and
+  resources a librarian added. A copy of a console-added book that a seed
+  account held (a pending borrow request or an open loan) goes back to
+  available first, so the book is not left with a copy held by nobody. A lost
+  or maintenance copy stays as it is.
+
+**A re-seed never touches:** books and resources a librarian added, their
+copies, other students' loans, requests, bookings and fines on them, other
+accounts (including admin accounts), and the shared barcode sequence.
+
+Only the reset is atomic: it runs in one transaction, so a failure part-way
+through it leaves the database as it was. The recreate that follows is not in
+that transaction, so a failure there leaves the demo data partly made; running
+the seed again repairs it.
+
 Against production, only re-run it if nothing there needs keeping.
 
 ## Admin accounts
@@ -226,9 +263,9 @@ next request takes about a minute while it wakes.
 | POST | `/borrow-requests` | ✓ | Ask to borrow a book (`{ bookId }`); holds one copy for 24 hours |
 | GET | `/borrow-requests/me` | ✓ | Your pending requests, and those declined or expired in the last 7 days |
 | POST | `/borrow-requests/:id/cancel` | ✓ | Withdraw a pending request |
-| GET | `/loans/me` | ✓ | Active loans, with computed fine/renewal/overdue fields |
-| POST | `/loans/:id/renew` | ✓ | Renew (blocked by renewal cap or an active waitlist) |
-| POST | `/loans/:id/return` | ✓ | Return (creates a `Fine` if overdue; cascades the waitlist) |
+| GET | `/loans/me` | ✓ | Open loans, with computed fine/renewal/overdue fields; a returned loan, or one closed because its copy was marked lost, is left out |
+| POST | `/loans/:id/renew` | ✓ | Renew (blocked by renewal cap or an active waitlist; writes the overdue `Fine` if late); 409 for a returned or lost loan |
+| POST | `/loans/:id/return` | ✓ | Return (creates a `Fine` if overdue; cascades the waitlist); 409 for a returned or lost loan |
 | POST | `/reservations` | ✓ | Join a book's waitlist |
 | GET | `/reservations/me` | ✓ | Your queue position or active claim |
 | DELETE | `/reservations/:id` | ✓ | Leave the waitlist / decline a claim |
@@ -238,6 +275,7 @@ next request takes about a minute while it wakes.
 | POST | `/bookings/:id/checkin` | ✓ | Check in within the grace window |
 | POST | `/bookings/:id/cancel` | ✓ | Cancel before check-in, or withdraw a room request |
 | GET | `/profile/reliability` | ✓ | Reliability score, tier, and recent history |
+| GET | `/fines/me` | ✓ | Your fines, newest first (up to 50), with `outstandingTotal` over all of them (see *Fines*) |
 | GET | `/recommendations/me` | ✓ | AI-backend recommendations, falling back to "popular right now" |
 | GET | `/admin/metrics/utilization` | admin | Booked share of open hours: today, the same weekday last week, and seats/rooms for the last 7 days |
 | GET | `/admin/metrics/circulation` | admin | Borrows, returns and top 5 titles over the last 7 days |
@@ -255,6 +293,18 @@ next request takes about a minute while it wakes.
 | POST | `/admin/bookings/:id/cancel` | admin | Cancel a booking for the library, with an optional `{ reason }` (up to 300 characters); 409 if it can no longer be cancelled |
 | GET | `/admin/bookings/:id/reassign-options` | admin | Resources the booking could move to: online, same type, free for its time |
 | POST | `/admin/bookings/:id/reassign` | admin | Move the booking to another resource of the same type (`{ resourceId }`), keeping its time |
+| GET | `/admin/fines?search=&status=&page=&pageSize=` | admin | Fines and, as `accruing` rows, loans still out and past due; newest first, 25 per page (up to 100), with the total behind the filters |
+| POST | `/admin/fines/:id/paid` | admin | Record a payment: `{ amount }`, the amount the librarian saw; 409 if the fine is already paid, was waived, or is no longer that amount |
+| POST | `/admin/fines/:id/adjust` | admin | Lower a fine, or waive it at 0: `{ amount, reason }` (whole rupees below the current amount; reason up to 300 characters, required) |
+| GET | `/admin/books?search=&page=&pageSize=` | admin | Books in title order, each with its copies, 25 per page (up to 100), with the total behind the search and the genres in use |
+| POST | `/admin/books` | admin | Add a book and its first copies: `{ isbn, title, author, genre, description?, publishedYear?, copies }`; answers 201; 409 for an ISBN already in the catalogue |
+| PATCH | `/admin/books/:id` | admin | Change those fields except `copies` (at least one); `null` clears `description` and `publishedYear` |
+| POST | `/admin/books/:id/copies` | admin | Add `{ count }` (1-20) available copies; a waiting student gets a claim on them first |
+| POST | `/admin/copies/:id/maintenance` | admin | Take a copy on the shelf out of service; no body |
+| POST | `/admin/copies/:id/lost` | admin | Mark a copy lost. For a copy on loan the body is `{ replacementCharge, borrowerId }` (whole rupees 0-10,000, and the student the librarian saw holding it); otherwise none |
+| POST | `/admin/copies/:id/restore` | admin | Bring a maintenance or lost copy back to available, optionally with `{ waiveReplacementCharge }` for a copy lost on loan; answers `{ book, replacementWaived }` |
+| GET | `/admin/students/:id` | admin | A student's profile, reliability score and log, and their loan, booking and fine history; 404 for an unknown id or an admin account |
+| POST | `/admin/students/:id/reliability` | admin | Adjust the score by hand: `{ delta, reason }` (a whole number from -10 to 10, not 0; reason up to 300 characters, required) |
 | GET | `/admin/events` | admin | Live updates for the console, as Server-Sent Events |
 | GET | `/health` | — | Is this service up |
 | GET | `/health/db` | — | Proves the Node → Postgres link |
@@ -356,6 +406,165 @@ shows the new resource's name and id, and `movedFrom`, the old resource's name,
 for 7 days after `movedAt` (null otherwise). The booking's `status` stays the
 raw database value (`cancelled` for a library cancel).
 
+## Fines
+
+A fine is `outstanding` (owed, never adjusted; stored as `pending`, and the API
+never says `pending`), `adjusted` (owed, lowered by a librarian), `paid` or
+`waived`. Its reason is `overdue`, `no_show` or `lost` (the replacement charge
+for a lost book; nothing creates no-show fines yet). It keeps its
+`originalAmount` (set by the first adjustment), the librarian's note after it is
+paid, and who recorded the change (`recordedBy`, null for the seed's fines or an
+account that is gone; the console and app then say "the library"). Amounts are
+whole rupees; the overdue rate is `FINE_PER_DAY_INR` (₹10 a day, whole days
+only), applied by `overdueFineAmount` in code and `accruingAmountSql` in SQL
+(`src/services/fineRules.ts`), which a test runs against each other.
+
+**The librarian's list.** `GET /admin/fines` returns
+`{ fines, total, page, pageSize }`, newest first (`date` is when the fine was
+created), 25 per page (up to 100). One SQL query merges two kinds of row
+(`kind`): stored fines, and `accruing` rows, which are not stored at all, one
+for each loan still out (`status: 'active'`) and past its due date. An accruing
+row's amount is the same whole days times ₹10 as the `fineAmount` on the
+student's loan, its date is the due date, and its id is the loan's, so the paid
+and adjust routes answer 404 for it. A loan overdue by under a day is listed at
+₹0; one exactly at its due time is not listed. When the loan is returned or
+renewed late the fine is written and the accruing row goes. `search` (up to 100
+characters) matches the student's name or email, ignoring case, with `%`, `_` and
+`\` taken literally; `status` is `accruing`, `outstanding`, `adjusted`, `paid` or
+`waived` (`pending` is a 400). `canSettle` is true exactly while a fine is
+outstanding or adjusted.
+
+**Mark paid, waive and adjust** are conditional writes, so of a payment and an
+adjustment (or two of either) racing on one fine the database applies one and
+the other is told why. Mark paid sends `{ amount }`, the amount the librarian
+saw, and applies only while the fine is still outstanding or adjusted and still
+exactly that amount: a payment collected against an amount a colleague has since
+lowered is refused ("This fine was just changed to ₹X. Check it before marking
+it paid.") instead of being recorded as paying the new one. Otherwise 409 "This
+fine is already paid." or "This fine was waived."; an unknown fine, or an
+accruing row's id, is a 404. Adjust takes `{ amount, reason }`: a whole number of
+rupees of 0 or more and lower than the current amount (else 400 "The new amount
+must be lower than ₹X."), and a required reason (trimmed, up to 300 characters).
+`0` makes the fine `waived`, anything else `adjusted`; an adjusted fine can be
+lowered again or paid, a paid or waived one cannot change.
+
+**What students see.** `GET /fines/me` returns `{ fines, outstandingTotal }`: the
+student's newest 50 fines, each with `id`, `reason`, `item` (book title, or the
+resource's name for a no-show), `amount`, `originalAmount`, `status`, `date` and
+`note` (the librarian's reason), and `outstandingTotal`, the outstanding and
+adjusted amounts over all of the student's fines, not only the 50. Accruing
+amounts are not in it: the student sees those on each overdue loan.
+
+## Catalogue and copies
+
+**The books list.** `GET /admin/books` returns
+`{ books, total, page, pageSize, genres }` in title order, 25 per page (up to
+100). `search` (up to 100 characters, case-insensitive, `%`, `_` and `\` literal)
+matches title, author, ISBN or the barcode of any copy; `genres` is every genre
+in use across the whole catalogue, not narrowed by the search or the page. A
+book carries `totalCopies` and `availableCopies` as students see them (see
+*Response shape*) and its copies in barcode order, each with `id`, `barcode`,
+`status` (`available`, `on_loan`, `held`, `maintenance`, `lost`), `borrower` and
+`dueAt` (from its open loan; empty for a copy marked borrowed with no open loan,
+which the seed has some of) and `owedReplacement` (for a lost copy, the
+replacement fine of its latest lost loan while it is still owed). `held` is a
+copy kept for a pending borrow request; it is not the student API's
+`heldCopies`, which counts shelf copies earmarked for a waitlist claim.
+
+**Books.** An ISBN is required, trimmed, up to 20 characters and unique (409
+"A book with this ISBN is already in the catalogue."); there is no checksum
+check, because the seed's ISBNs are placeholders. Title and author are required
+(up to 200 characters), genre is required on create and cannot be blanked on
+edit (up to 50), a description is up to 2000 characters (blank or `null`
+clears it), the published year runs from 1450 to the current year (`null`
+clears it), and `copies` and `count` are 1-20. A `PATCH` with nothing to change
+is a 400. Adding copies runs the same waitlist hand-off a return does, so a
+student waiting for the title gets a claim on a new copy straight away.
+
+**Barcodes.** Every copy has a unique barcode, `SL-00001` and up (widening past
+`SL-99999`), handed out by the database as the column's default
+(`next_copy_barcode()` over the sequence `BookCopy_barcode_seq`, in migration
+`console_catalogue`), so every way of adding a copy gets one. They are never
+typed or edited, and students never see them. The migration numbered the copies
+that already existed in book-title order, then copy id, and moved the sequence
+past them. The sequence belongs to the column, so the tests' `TRUNCATE ...
+RESTART IDENTITY` starts the numbering again; a re-seed does not.
+
+**Copy rules.** Each copy action is one transaction that locks the book's row,
+then changes the copy with an update conditional on the status it read, so a
+student borrowing or returning at the same moment cannot be overwritten; the
+409 says what the copy is now.
+
+- *Maintenance* only from the shelf (available); a copy on loan, in
+  maintenance, lost or held answers 409.
+- *Lost* from the shelf (available or maintenance), or while on loan (below). A
+  copy marked borrowed with no open loan is marked lost with no fines.
+- *Restore* from maintenance or lost to available, then the waitlist hand-off a
+  return runs (`onBookReturned`), so a waiting student gets it first. From
+  available, on loan or held it is a 409.
+- *The waitlist refusal.* Taking an available copy out of service (maintenance,
+  or lost from the shelf) is refused, 409 "This copy is set aside for a student
+  on the waitlist.", when it would leave fewer available copies than live
+  waitlist claims for the title (stale claims are expired first).
+- *Held copies.* A copy kept for a pending borrow request accepts no action:
+  409 "This copy is held for a borrow request."
+
+**Lost while on loan.** For a copy with an open loan, `POST
+/admin/copies/:id/lost` needs `{ replacementCharge, borrowerId }`: whole rupees
+from 0 to 10,000 (0 charges nothing), and the student the librarian saw holding
+the copy (400 "Enter a replacement charge for the copy on loan." or "Name the
+borrower of the copy on loan." when only one is missing; with neither, which is
+what a shelf dialog sends for a copy that has gone out on loan since the page
+loaded, it is a 409 "This copy is now on loan."). If someone else has it now it is a
+409 ("This copy's borrower has changed. Check it before marking it lost."), and
+a `borrowerId` sent for a copy nobody has any more is a 409 too ("This copy is no
+longer on loan."), so a charge never lands on the wrong student. In one
+transaction the loan ends as lost (`lostAt`), conditional on it still being
+active; the copy becomes lost; the days overdue so far become an `overdue` fine
+(same rule as a late return, when above 0); and the charge becomes a `lost` fine
+(when above 0). A student returning or renewing at the same moment is the other
+side of that condition: exactly one wins, and the loser gets a 409.
+
+**Restoring a copy lost on loan.** The loan stays closed as lost and its overdue
+fine stands. With `{ waiveReplacementCharge: true }` the replacement fine of the
+copy's latest lost loan is waived in the same transaction if it is still owed
+(outstanding or adjusted), recorded with the librarian and the reason "Book
+returned after it was marked lost"; a paid one is not refunded. If it was paid
+or waived a moment earlier the copy is restored anyway and `replacementWaived`
+is false.
+
+**A lost loan is a closed loan.** `status: 'lost'` with `lostAt`: not active, not
+returned, not overdue after `lostAt`. So every check for an open loan uses
+`status: 'active'`. `GET /loans/me` leaves the loan out; the student's return and
+renew answer 409 "This loan was closed because the copy was marked lost."; the
+Dashboard's overdue count stops counting it from `lostAt` (it was overdue
+before) and circulation never counts it as a return; and it does not stop the
+student asking for the title again.
+
+## Students
+
+`GET /admin/students/:id` returns the student's `name`, `email`, `roll`
+(`'Pending'` when none), `score`, `tier` (the function `/profile/reliability`
+uses: Good standing from 80, Building back up from 50, Needs improvement from
+25, At risk below) and, newest first and at most 50 of each, `history` (the score
+log: date, score, change, reason, and the librarian's name for a manual entry),
+`loans` (status `active`, `overdue`, `returned` or `lost`), `bookings` (the
+Bookings page's statuses, plus room requests that are pending, declined or
+expired) and `fines` (as on the Fines page, with the student's accruing rows). An
+unknown id, or an admin account, is a 404.
+
+`POST /admin/students/:id/reliability` takes `{ delta, reason }`: a whole number
+from -10 to 10 but not 0, and a required reason (up to 300 characters). It is
+stored as `Library adjustment: <reason>` with the librarian, through the same
+0-100 clamp as an automatic change, and the student's reliability card shows it:
+a drop is the card's note ("Your reliability score recently dropped: Library
+adjustment: <reason>."), also in Good standing (with no "return to Good standing"
+clause there) for as long as it is the newest entry in the score log. The
+student's row is locked while the score is read and written, so a check-in
+bonus landing at the same moment is not lost. If the clamp would change nothing
+the answer is 409 ("The score is already at 100." or "... at 0.") and nothing is
+logged.
+
 ## Live events
 
 `GET /admin/events` streams Server-Sent Events to the admin console: `ready` on
@@ -366,13 +575,30 @@ event: request.created
 data: {"topics":["requests"],"kind":"borrow","summary":"Aditi Sharma wants to borrow Clean Code"}
 ```
 
-Events name what changed (`requests`, `metrics`, `bookings`, `resources`),
-never the new state: the console refetches. A booking that is not a request
-changing (a seat booked, a check-in, a cancel or a move) sends
-`booking.changed`; a resource added, edited, taken offline or brought back
-sends `resource.changed`. A `: ping` comment goes out every 25 seconds, and each
-stream ends after 15 minutes, so the console reconnects and its token and role
-are checked again.
+Events name what changed (`requests`, `metrics`, `bookings`, `resources`,
+`fines`, `catalogue`, `students`), never the new state: the console refetches.
+A write publishes once, after it has committed; a refused write publishes
+nothing.
+
+| Change | Event | Topics |
+|---|---|---|
+| A request created, decided, withdrawn or lapsed | `request.created`, `request.decided`, `request.cancelled`, `request.expired` | `requests` (an approval also `metrics`, an approved room request also `bookings`) |
+| A booking that is not a request: a seat booked, a check-in, a cancel or a move | `booking.changed` | `bookings`, `metrics` |
+| A resource added, edited, taken offline or brought back | `resource.changed` | `resources`, `metrics` |
+| A waitlist join or leave | `activity` | `metrics` |
+| A student's return or renewal | `loan.changed` | `metrics`, `catalogue` (a renewal's new due date, or the copy a return frees); and `fines` too when the loan was past due (even by under a day), since its accruing row turns into a stored fine |
+| A fine marked paid, adjusted or waived | `fine.changed` | `fines` |
+| A book added or edited, copies added, a copy to maintenance, lost from the shelf, or restored | `catalogue.changed` | `catalogue` |
+| A copy lost while on loan | `catalogue.changed` | `catalogue`, `fines`, `metrics` |
+| A copy restored with its replacement fine waived | `catalogue.changed` | `catalogue`, `fines` |
+| A manual reliability adjustment | `student.changed` | `students` |
+
+The publish helpers are in `src/lib/events.ts`: `publishActivity`,
+`publishBookingChange`, `publishResourceChange`, `publishFineChange`,
+`publishCatalogueChange(extra)` (the topics a change also moves),
+`publishStudentChange` and `publishLoanChange(pastDue)`. A `: ping` comment goes
+out every 25 seconds, and each stream ends after 15 minutes, so the console
+reconnects and its token and role are checked again.
 
 The bus is in-process (`src/lib/events.ts`). That reaches every console while
 one instance serves the API, as on Render's free plan; several instances would
@@ -417,7 +643,9 @@ This project is on Prisma 7, which differs from most tutorials (written for v6):
 prisma/
 ├── schema.prisma
 ├── migrations/
-└── seed.ts              # demo data — see `npm run seed` above
+├── seed.ts              # the `npm run seed` command line
+├── seedData.ts          # demo data and the re-seed reset — see `npm run seed` above
+└── history.ts           # the generated four-week history, fines included
 src/
 ├── index.ts              # app bootstrap (listen())
 ├── app.ts                # Express app factory — supertest mounts this directly

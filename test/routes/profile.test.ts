@@ -64,6 +64,109 @@ describe('GET /profile/reliability', () => {
     const res = await request(app).get('/profile/reliability')
     expect(res.status).toBe(401)
   })
+
+  it("the student's reliability card shows the library adjustment as the latest drop", async () => {
+    const { user: student, token } = await seedUser(80)
+    const admin = await prisma.user.create({
+      data: { name: 'Librarian', email: `librarian${Math.random()}@test.com`, passwordHash: 'x', role: 'admin' },
+    })
+    const adminToken = jwt.sign({ sub: admin.id, role: admin.role }, JWT_SECRET, { expiresIn: '1h' })
+
+    const adjusted = await request(app)
+      .post(`/admin/students/${student.id}/reliability`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ delta: -6, reason: 'Left belongings at a seat all day' })
+    expect(adjusted.status).toBe(200)
+
+    const res = await request(app).get('/profile/reliability').set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ score: 74, tier: 'Building back up', history: ['miss'] })
+    expect(res.body.note).toContain(
+      'Your reliability score recently dropped: Library adjustment: Left belongings at a seat all day.',
+    )
+    // Below Good standing, the way back is still spelled out (6 points at 2 per on-time booking).
+    expect(res.body.note).toContain('Complete 3 more on-time bookings to return to Good standing.')
+  })
+
+  async function adjustAsLibrarian(studentId: string, delta: number, reason: string) {
+    const admin = await prisma.user.create({
+      data: { name: 'Librarian', email: `librarian${Math.random()}@test.com`, passwordHash: 'x', role: 'admin' },
+    })
+    const adminToken = jwt.sign({ sub: admin.id, role: admin.role }, JWT_SECRET, { expiresIn: '1h' })
+    const adjusted = await request(app)
+      .post(`/admin/students/${studentId}/reliability`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ delta, reason })
+    expect(adjusted.status).toBe(200)
+  }
+
+  it('a library adjustment from 100 to 90 shows its reason without the recovery clause', async () => {
+    const { user: student, token } = await seedUser(100)
+    await adjustAsLibrarian(student.id, -10, 'Damaged a study room')
+
+    const res = await request(app).get('/profile/reliability').set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ score: 90, tier: 'Good standing', history: ['miss'] })
+    expect(res.body.note).toBe('Your reliability score recently dropped: Library adjustment: Damaged a study room.')
+  })
+
+  it('a check-in after the adjustment returns to the normal Good-standing note', async () => {
+    const { user: student, token } = await seedUser(100)
+    await adjustAsLibrarian(student.id, -10, 'Damaged a study room')
+    const resource = await prisma.resource.create({ data: { type: 'seat', name: 'Desk 1' } })
+    const booking = await prisma.resourceBooking.create({
+      data: { userId: student.id, resourceId: resource.id, startTime: new Date(Date.now() - 1000), endTime: new Date(Date.now() + 60 * 60 * 1000) },
+    })
+    const checkedIn = await request(app).post(`/bookings/${booking.id}/checkin`).set('Authorization', `Bearer ${token}`)
+    expect(checkedIn.status).toBe(200)
+
+    const res = await request(app).get('/profile/reliability').set('Authorization', `Bearer ${token}`)
+
+    expect(res.body).toMatchObject({ score: 90 + RELIABILITY_ONTIME_BOOKING_BONUS, tier: 'Good standing', history: ['miss', 'ok'] })
+    expect(res.body.note).toMatch(/^No missed bookings yet\./)
+  })
+
+  it('a later positive library adjustment also clears the drop note', async () => {
+    const { user: student, token } = await seedUser(100)
+    await adjustAsLibrarian(student.id, -10, 'Damaged a study room')
+    await adjustAsLibrarian(student.id, 4, 'Helped at the library fair')
+
+    const res = await request(app).get('/profile/reliability').set('Authorization', `Bearer ${token}`)
+
+    expect(res.body).toMatchObject({ score: 94, history: ['miss', 'ok'] })
+    expect(res.body.note).toMatch(/^No missed bookings yet\./)
+  })
+
+  it('an automatic miss at 80 or more still shows the normal Good-standing note', async () => {
+    const { user, token } = await seedUser(85)
+    await prisma.reliabilityScoreLog.create({
+      data: { userId: user.id, score: 85, delta: -15, reason: 'Missed check-in window for Group Room 201' },
+    })
+
+    const res = await request(app).get('/profile/reliability').set('Authorization', `Bearer ${token}`)
+
+    expect(res.body).toMatchObject({ score: 85, tier: 'Good standing', history: ['miss'] })
+    expect(res.body.note).toMatch(/^No missed bookings yet\./)
+  })
+
+  it('a positive library adjustment shows as an on-time dot', async () => {
+    const { user: student, token } = await seedUser(70)
+    const admin = await prisma.user.create({
+      data: { name: 'Librarian', email: `librarian${Math.random()}@test.com`, passwordHash: 'x', role: 'admin' },
+    })
+    const adminToken = jwt.sign({ sub: admin.id, role: admin.role }, JWT_SECRET, { expiresIn: '1h' })
+
+    await request(app)
+      .post(`/admin/students/${student.id}/reliability`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ delta: 4, reason: 'Helped at the library fair' })
+
+    const res = await request(app).get('/profile/reliability').set('Authorization', `Bearer ${token}`)
+
+    expect(res.body).toMatchObject({ score: 74, history: ['ok'] })
+  })
 })
 
 describe('reliability adjustment on booking check-in', () => {

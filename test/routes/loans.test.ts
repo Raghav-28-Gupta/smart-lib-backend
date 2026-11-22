@@ -269,6 +269,85 @@ describe('POST /loans/:id/return', () => {
   })
 })
 
+describe('a loan closed because its copy was marked lost', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => recorder?.stop())
+
+  const LOST_LOAN = 'This loan was closed because the copy was marked lost.'
+  const DAY_MS = 24 * 60 * 60 * 1000
+
+  async function seedAdminToken() {
+    const admin = await prisma.user.create({
+      data: { name: 'Librarian', email: `admin${Math.random()}@test.com`, passwordHash: 'x', role: 'admin' },
+    })
+    return jwt.sign({ sub: admin.id, role: admin.role }, JWT_SECRET, { expiresIn: '1h' })
+  }
+
+  /** A student with this book out three whole days past due, which a librarian then marks lost with a ₹400 charge. */
+  async function seedLostLoan() {
+    const { user, token } = await seedUser()
+    const book = await seedBookWithCopies(1, 1)
+    const copy = await prisma.bookCopy.findFirstOrThrow({ where: { bookId: book.id } })
+    await prisma.bookCopy.update({ where: { id: copy.id }, data: { status: 'borrowed' } })
+    const loan = await prisma.loan.create({
+      data: { userId: user.id, bookCopyId: copy.id, dueAt: new Date(Date.now() - 3 * DAY_MS - 60 * 60 * 1000) },
+    })
+    const res = await request(app)
+      .post(`/admin/copies/${copy.id}/lost`)
+      .set('Authorization', `Bearer ${await seedAdminToken()}`)
+      .send({ replacementCharge: 400, borrowerId: user.id })
+    expect(res.status).toBe(200)
+    return { user, token, book, copy, loan }
+  }
+
+  it('the lost loan leaves /loans/me and its fines appear on /fines/me', async () => {
+    const { user, token, loan } = await seedLostLoan()
+    // Another book the student still has.
+    const other = await seedBookWithCopies(1, 1)
+    const otherCopy = await prisma.bookCopy.findFirstOrThrow({ where: { bookId: other.id } })
+    const kept = await prisma.loan.create({
+      data: { userId: user.id, bookCopyId: otherCopy.id, dueAt: new Date(Date.now() + 5 * DAY_MS) },
+    })
+
+    const loans = await request(app).get('/loans/me').set('Authorization', `Bearer ${token}`)
+    expect(loans.status).toBe(200)
+    expect(loans.body.map((l: { id: string }) => l.id)).toEqual([kept.id])
+    expect(loans.body.map((l: { id: string }) => l.id)).not.toContain(loan.id)
+
+    const fines = await request(app).get('/fines/me').set('Authorization', `Bearer ${token}`)
+    expect(fines.status).toBe(200)
+    const listed = (fines.body.fines as Array<{ reason: string; item: string; amount: number; status: string }>)
+      .map(({ reason, item, amount, status }) => ({ reason, item, amount, status }))
+      .sort((a, b) => a.reason.localeCompare(b.reason))
+    expect(listed).toEqual([
+      { reason: 'lost', item: 'Clean Code', amount: 400, status: 'outstanding' },
+      { reason: 'overdue', item: 'Clean Code', amount: 30, status: 'outstanding' },
+    ])
+    expect(fines.body.outstandingTotal).toBe(430)
+  })
+
+  it('returning or renewing a lost loan is 409 with the message', async () => {
+    const { token, copy, loan } = await seedLostLoan()
+    const finesBefore = await prisma.fine.count()
+    recorder = recordEvents()
+
+    const returned = await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${token}`)
+    const renewed = await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
+
+    expect(returned.status).toBe(409)
+    expect(returned.body).toEqual({ error: LOST_LOAN })
+    expect(renewed.status).toBe(409)
+    expect(renewed.body).toEqual({ error: LOST_LOAN })
+    // Nothing moved: the loan stays closed as lost, the copy lost, no fine added, nothing announced.
+    const after = await prisma.loan.findUniqueOrThrow({ where: { id: loan.id } })
+    expect(after).toMatchObject({ status: 'lost', returnedAt: null, renewedCount: 0, dueAt: loan.dueAt })
+    expect((await prisma.bookCopy.findUniqueOrThrow({ where: { id: copy.id } })).status).toBe('lost')
+    expect(await prisma.fine.count()).toBe(finesBefore)
+    expect(recorder.events).toEqual([])
+  })
+})
+
 describe('loan activity reaches the console', () => {
   beforeEach(resetDb)
   let recorder: ReturnType<typeof recordEvents> | undefined
@@ -282,14 +361,14 @@ describe('loan activity reaches the console', () => {
     return { user, token, loan }
   }
 
-  it('reports an on-time renewal as activity', async () => {
+  it('an on-time renewal publishes loan.changed on metrics and catalogue', async () => {
     const { token, loan } = await seedLoanDue(new Date(Date.now() + 2 * 24 * 60 * 60 * 1000))
     recorder = recordEvents()
 
     const res = await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
 
     expect(res.status).toBe(200)
-    expect(recorder.events).toEqual([{ type: 'activity', topics: ['metrics'] }])
+    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue'] }])
   })
 
   it('returning an on-time loan publishes loan.changed on metrics and catalogue', async () => {
@@ -326,17 +405,14 @@ describe('loan activity reaches the console', () => {
     expect(await prisma.fine.count({ where: { userId: user.id } })).toBe(0)
   })
 
-  it('renewing a past-due loan publishes fine.changed', async () => {
+  it('renewing a past-due loan publishes one loan.changed with fines too', async () => {
     const { token, loan } = await seedLoanDue(new Date(Date.now() - 2 * 24 * 60 * 60 * 1000))
     recorder = recordEvents()
 
     const res = await request(app).post(`/loans/${loan.id}/renew`).set('Authorization', `Bearer ${token}`)
 
     expect(res.status).toBe(200)
-    expect(recorder.events).toEqual([
-      { type: 'activity', topics: ['metrics'] },
-      { type: 'fine.changed', topics: ['fines'] },
-    ])
+    expect(recorder.events).toEqual([{ type: 'loan.changed', topics: ['metrics', 'catalogue', 'fines'] }])
   })
 
   it('a refused renewal publishes nothing and writes no fine', async () => {

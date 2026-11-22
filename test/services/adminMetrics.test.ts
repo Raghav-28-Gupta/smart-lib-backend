@@ -155,6 +155,7 @@ const loan = (over: Partial<LoanRow>): LoanRow => ({
   borrowedAt: at(TODAY, 10),
   dueAt: at(addDays(TODAY, 14), 10),
   returnedAt: null,
+  lostAt: null,
   ...over,
 })
 
@@ -167,6 +168,16 @@ describe('computeCirculation', () => {
       loan({ borrowedAt: at(addDays(TODAY, -3), 10), returnedAt: at(addDays(TODAY, -1), 12) }), // both
     ]
     expect(computeCirculation(loans, NOW)).toMatchObject({ borrows: 2, returns: 2 })
+  })
+
+  it('a lost loan is not a return', () => {
+    const loans = [
+      // Borrowed before the window, its copy marked lost inside it.
+      loan({ borrowedAt: at(addDays(TODAY, -10), 10), dueAt: at(addDays(TODAY, -3), 10), lostAt: at(addDays(TODAY, -1), 12) }),
+      // Borrowed and lost inside the window: still a borrow.
+      loan({ borrowedAt: at(addDays(TODAY, -3), 10), lostAt: at(TODAY, 9) }),
+    ]
+    expect(computeCirculation(loans, NOW)).toMatchObject({ borrows: 1, returns: 0 })
   })
 
   it('ranks up to 5 titles by borrows, ties by title', () => {
@@ -200,6 +211,16 @@ describe('computeOverdue', () => {
       loan({ borrowedAt: at(addDays(TODAY, -2), 10), dueAt: at(addDays(TODAY, 12), 10) }), // not due
     ]
     expect(computeOverdue(loans, NOW)).toEqual({ count: 3, countYesterday: 2 })
+  })
+
+  it('a lost loan is not overdue after lostAt but was overdue before it', () => {
+    // Overdue for six days, its copy marked lost at 9 this morning: out and past due 24 hours ago, closed now.
+    const lostThisMorning = loan({ borrowedAt: at(addDays(TODAY, -20), 10), dueAt: at(addDays(TODAY, -6), 10), lostAt: at(TODAY, 9) })
+    expect(computeOverdue([lostThisMorning], NOW)).toEqual({ count: 0, countYesterday: 1 })
+
+    // Lost before the earlier moment too: counted at neither.
+    const lostLastWeek = loan({ borrowedAt: at(addDays(TODAY, -20), 10), dueAt: at(addDays(TODAY, -10), 10), lostAt: at(addDays(TODAY, -7), 9) })
+    expect(computeOverdue([lostLastWeek], NOW)).toEqual({ count: 0, countYesterday: 0 })
   })
 
   it('ignores a loan borrowed after the moment being measured', () => {

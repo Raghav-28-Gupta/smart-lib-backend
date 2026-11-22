@@ -1,5 +1,5 @@
 import { WAITLIST_CLAIM_HOURS } from '../config/constants'
-import type { Reservation } from '../generated/prisma/client'
+import type { Prisma, PrismaClient, Reservation } from '../generated/prisma/client'
 import { publishActivity } from '../lib/events'
 import { ConflictError, ForbiddenError, NotFoundError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
@@ -14,22 +14,33 @@ export interface ReservationDto {
   queuePosition: number | null
 }
 
+// Marks every claim on this book whose time has run out as expired. Takes the
+// client so a caller inside a transaction (a copy leaving service) expires them
+// as part of it.
+export async function expireStaleClaims(
+  bookId: string,
+  now: Date,
+  db: Prisma.TransactionClient | PrismaClient = prisma,
+): Promise<void> {
+  const staleClaims = await db.reservation.findMany({
+    where: { bookId, status: 'fulfilled', claimExpiresAt: { lt: now } },
+    select: { id: true },
+  })
+  if (staleClaims.length > 0) {
+    await db.reservation.updateMany({
+      where: { id: { in: staleClaims.map((c) => c.id) } },
+      data: { status: 'expired' },
+    })
+  }
+}
+
 // At most `availableCopies` reservations should be 'fulfilled' for a book at
 // once -- each fulfilled claim earmarks one of the currently-available
 // copies for its holder, without physically flipping that copy's status
 // (CopyStatus has no "held" state). Expires stale claims, then promotes the
 // oldest waiting reservation(s) into whatever headroom opens up.
 async function rebalanceClaims(bookId: string, now: Date): Promise<void> {
-  const staleClaims = await prisma.reservation.findMany({
-    where: { bookId, status: 'fulfilled', claimExpiresAt: { lt: now } },
-    select: { id: true },
-  })
-  if (staleClaims.length > 0) {
-    await prisma.reservation.updateMany({
-      where: { id: { in: staleClaims.map((c) => c.id) } },
-      data: { status: 'expired' },
-    })
-  }
+  await expireStaleClaims(bookId, now)
 
   const [availableCopies, activeFulfilled] = await Promise.all([
     prisma.bookCopy.count({ where: { bookId, status: 'available' } }),

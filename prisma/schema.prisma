@@ -118,12 +118,13 @@ model User {
   reliabilityLogs ReliabilityScoreLog[]
   recommendations RecommendationCache[]
 
-  borrowRequests        BorrowRequest[]   @relation("BorrowRequester")
-  decidedBorrowRequests BorrowRequest[]   @relation("BorrowRequestDecider")
-  decidedBookings       ResourceBooking[] @relation("BookingDecider")
-  cancelledBookings     ResourceBooking[] @relation("BookingCanceller")
-  adjustedFines         Fine[]            @relation("FineAdjuster")
-  recordedFinePayments  Fine[]            @relation("FinePaymentRecorder")
+  borrowRequests        BorrowRequest[]       @relation("BorrowRequester")
+  decidedBorrowRequests BorrowRequest[]       @relation("BorrowRequestDecider")
+  decidedBookings       ResourceBooking[]     @relation("BookingDecider")
+  cancelledBookings     ResourceBooking[]     @relation("BookingCanceller")
+  adjustedFines         Fine[]                @relation("FineAdjuster")
+  recordedFinePayments  Fine[]                @relation("FinePaymentRecorder")
+  adjustedReliability   ReliabilityScoreLog[] @relation("ReliabilityAdjuster")
 }
 
 model Book {
@@ -310,13 +311,17 @@ model Fine {
 }
 
 model ReliabilityScoreLog {
-  id         String   @id @default(uuid())
-  userId     String
-  user       User     @relation(fields: [userId], references: [id])
-  score      Float
-  delta      Float
-  reason     String
-  computedAt DateTime @default(now())
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  score        Float
+  delta        Float
+  reason       String
+  computedAt   DateTime @default(now())
+  // The librarian behind a manual adjustment (null for the automatic entries,
+  // and when that account is gone).
+  adjustedById String?
+  adjustedBy   User?    @relation("ReliabilityAdjuster", fields: [adjustedById], references: [id], onDelete: SetNull)
 }
 
 model RecommendationCache {

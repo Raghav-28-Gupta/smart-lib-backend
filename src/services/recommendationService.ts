@@ -63,7 +63,8 @@ export async function getRecommendations(userId: string): Promise<Recommendation
   const books = await getBooksByIds(await popularBookIds(POPULARITY_LIMIT))
   if (books.length === 0) return { note: 'No recommendations available yet.', sections: [] }
 
-  const hasActiveLoan = (await prisma.loan.count({ where: { userId, status: { not: 'returned' } } })) > 0
+  // A book the student has out now; a loan closed because its copy was marked lost is not out.
+  const hasActiveLoan = (await prisma.loan.count({ where: { userId, status: { notIn: ['returned', 'lost'] } } })) > 0
   const note = hasActiveLoan
     ? 'Personalized picks are on the way — for now, here\'s what\'s popular in the library.'
     : "You haven't borrowed anything yet — here's what's popular right now."

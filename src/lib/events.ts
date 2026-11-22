@@ -84,10 +84,11 @@ export function publishStudentChange(): void {
 }
 
 /**
- * A loan ended by a return: Dashboard numbers move and its copy is free again.
- * `pastDue` is whether the loan was past its due date at that moment (even by
- * less than a day), when its accruing row on the Fines page turns into a stored
- * fine or disappears.
+ * A student's loan changed by a return or a renewal: Dashboard numbers move, and
+ * the Catalogue and student pages show the loan differently (a return frees its
+ * copy; a renewal moves its due date). `pastDue` is whether the loan was past its
+ * due date at that moment (even by less than a day), when its accruing row on the
+ * Fines page turns into a stored fine or disappears.
  */
 export function publishLoanChange(pastDue: boolean): void {
   publish({ type: 'loan.changed', topics: pastDue ? ['metrics', 'catalogue', 'fines'] : ['metrics', 'catalogue'] })

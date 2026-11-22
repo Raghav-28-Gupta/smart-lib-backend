@@ -3,6 +3,7 @@ import request from 'supertest'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { app } from '../../src/app'
 import { JWT_SECRET } from '../../src/config/constants'
+import * as aiClientModule from '../../src/lib/aiClient'
 import { prisma } from '../../src/lib/prisma'
 import { resetDb } from '../helpers/db'
 
@@ -84,6 +85,24 @@ describe('GET /recommendations/me', () => {
     const titles = res.body.sections[0].books.map((b: { title: string }) => b.title)
     expect(titles).toContain('Recently Borrowed Book')
     expect(titles).not.toContain('Old Popular Book')
+  })
+
+  it('a loan closed because its copy was marked lost is not one the student still has out', async () => {
+    vi.spyOn(aiClientModule, 'fetchRecommendations').mockResolvedValue([])
+    const { user: holder, token: holderToken } = await seedUser()
+    const { user: loser, token: loserToken } = await seedUser()
+    const book = await seedBook('Popular Book')
+    await seedLoan(holder.id, book.id, new Date())
+    const copy = await prisma.bookCopy.create({ data: { bookId: book.id, status: 'lost' } })
+    await prisma.loan.create({
+      data: { userId: loser.id, bookCopyId: copy.id, dueAt: new Date(Date.now() - 24 * 60 * 60 * 1000), status: 'lost', lostAt: new Date() },
+    })
+
+    const holding = await request(app).get('/recommendations/me').set('Authorization', `Bearer ${holderToken}`)
+    expect(holding.body.note).toBe("Personalized picks are on the way — for now, here's what's popular in the library.")
+
+    const lost = await request(app).get('/recommendations/me').set('Authorization', `Bearer ${loserToken}`)
+    expect(lost.body.note).toBe("You haven't borrowed anything yet — here's what's popular right now.")
   })
 
   it('builds a personalized section when the AI backend returns real results', async () => {
