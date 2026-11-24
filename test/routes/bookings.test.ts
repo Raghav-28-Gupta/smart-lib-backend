@@ -820,3 +820,233 @@ describe('GET /bookings/me with library cancels and moves', () => {
     expect(res.body[0]).toMatchObject({ frontendStatus: 'upcomingFar', cancelReason: null, movedFrom: null })
   })
 })
+
+describe('GET /bookings/me with problem-report flags', () => {
+  beforeEach(resetDb)
+  afterEach(() => vi.restoreAllMocks())
+
+  const MINUTE_MS = 60 * 1000
+  const HOUR_MS = 60 * MINUTE_MS
+  const DAY_MS = 24 * HOUR_MS
+  const auth = (token: string) => ({ Authorization: `Bearer ${token}` })
+
+  type Status = Prisma.ResourceBookingUncheckedCreateInput['status']
+  type Row = { id: string; resourceId: string; canReport: boolean; reportOpen: boolean }
+
+  /** A booking that starts `offsetMs` from now (negative: that long ago) and lasts an hour. */
+  function seedBooking(userId: string, resourceId: string, offsetMs: number, status: Status = 'booked') {
+    const startTime = new Date(Date.now() + offsetMs)
+    return prisma.resourceBooking.create({
+      data: { userId, resourceId, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status },
+    })
+  }
+
+  function seedReport(userId: string, resourceId: string, status: 'open' | 'confirmed' | 'dismissed' = 'open') {
+    return prisma.issueReport.create({ data: { userId, resourceId, category: 'dirty', status } })
+  }
+
+  function myBookings(token: string) {
+    return request(app).get('/bookings/me').set(auth(token))
+  }
+
+  const flagsOf = (row: Row) => ({ canReport: row.canReport, reportOpen: row.reportOpen })
+
+  it('shows canReport and reportOpen correctly and a student with no booking sees false', async () => {
+    const { user, token } = await seedUser()
+    const { user: other, token: otherToken } = await seedUser()
+    const { token: loner } = await seedUser()
+    const fresh = await seedResource('seat', 'Fresh')
+    const reported = await seedResource('seat', 'Reported')
+    const closed = await seedResource('seat', 'Closed')
+    const agedOut = await seedResource('seat', 'Aged out')
+    const reportedAgedOut = await seedResource('seat', 'Reported and aged out')
+    const tooFar = await seedResource('seat', 'Too far ahead')
+    await seedBooking(user.id, fresh.id, -HOUR_MS, 'checked_in')
+    await seedBooking(user.id, reported.id, -2 * HOUR_MS, 'checked_in')
+    await seedReport(user.id, reported.id)
+    await seedBooking(user.id, closed.id, -2 * DAY_MS)
+    await seedReport(user.id, closed.id, 'dismissed')
+    await seedReport(user.id, closed.id, 'confirmed')
+    await seedBooking(user.id, agedOut.id, -8 * DAY_MS, 'completed')
+    await seedBooking(user.id, reportedAgedOut.id, -8 * DAY_MS, 'completed')
+    await seedReport(user.id, reportedAgedOut.id)
+    await seedBooking(user.id, tooFar.id, 25 * HOUR_MS)
+    // Another student's open reports, on desks this student sits at, say nothing about this student's own.
+    await seedBooking(other.id, fresh.id, -4 * HOUR_MS, 'checked_in')
+    await seedBooking(other.id, agedOut.id, -3 * DAY_MS, 'completed')
+    await seedReport(other.id, fresh.id)
+    await seedReport(other.id, agedOut.id)
+
+    const res = await myBookings(token)
+    const byResource = new Map((res.body as Row[]).map((row) => [row.resourceId, flagsOf(row)]))
+
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveLength(6)
+    expect(byResource.get(fresh.id)).toEqual({ canReport: true, reportOpen: false })
+    expect(byResource.get(reported.id)).toEqual({ canReport: false, reportOpen: true })
+    // A closed report, however many, neither blocks the next one nor shows as open.
+    expect(byResource.get(closed.id)).toEqual({ canReport: true, reportOpen: false })
+    // Out of the window: nothing to report. An open report still shows, so the app can say it was sent.
+    expect(byResource.get(agedOut.id)).toEqual({ canReport: false, reportOpen: false })
+    expect(byResource.get(reportedAgedOut.id)).toEqual({ canReport: false, reportOpen: true })
+    expect(byResource.get(tooFar.id)).toEqual({ canReport: false, reportOpen: false })
+    // The other student sees their own flags.
+    const theirs = new Map(((await myBookings(otherToken)).body as Row[]).map((row) => [row.resourceId, flagsOf(row)]))
+    expect(theirs.size).toBe(2)
+    expect(theirs.get(fresh.id)).toEqual({ canReport: false, reportOpen: true })
+    expect(theirs.get(agedOut.id)).toEqual({ canReport: false, reportOpen: true })
+    // A student with no booking has no rows, so no flag at all.
+    expect((await myBookings(loner)).body).toEqual([])
+  })
+
+  it('a student whose own booking does not qualify sees false, whatever others booked or reported', async () => {
+    const { user, token } = await seedUser()
+    const { user: other } = await seedUser()
+    const desk = await seedResource('seat', 'Desk 1')
+    await seedBooking(user.id, desk.id, -9 * DAY_MS, 'completed')
+    await seedBooking(other.id, desk.id, -HOUR_MS, 'checked_in')
+    await seedReport(other.id, desk.id)
+
+    const res = await myBookings(token)
+
+    expect(res.body).toHaveLength(1)
+    expect(flagsOf(res.body[0])).toEqual({ canReport: false, reportOpen: false })
+  })
+
+  it("canReport is a booking's own: a request or a booking outside the window shows false next to one that qualifies; reportOpen is the resource's", async () => {
+    const { user, token } = await seedUser()
+    const room = await seedResource('room', 'Group Room 201')
+    const pending = await seedBooking(user.id, room.id, 3 * HOUR_MS, 'requested')
+    const past = await seedBooking(user.id, room.id, -2 * DAY_MS, 'completed')
+    const later = await seedBooking(user.id, room.id, 3 * DAY_MS)
+    const flagsById = async () => new Map(((await myBookings(token)).body as Row[]).map((row) => [row.id, flagsOf(row)]))
+
+    const before = await flagsById()
+    expect(before.get(pending.id)).toEqual({ canReport: false, reportOpen: false })
+    expect(before.get(past.id)).toEqual({ canReport: true, reportOpen: false })
+    expect(before.get(later.id)).toEqual({ canReport: false, reportOpen: false })
+
+    await seedReport(user.id, room.id)
+
+    // Every booking of the room now says a report is open, and none can send another.
+    const after = await flagsById()
+    for (const id of [pending.id, past.id, later.id]) expect(after.get(id)).toEqual({ canReport: false, reportOpen: true })
+  })
+
+  it('canReport is true exactly when POST /reports would accept, a minute either side of both limits', async () => {
+    const { user, token } = await seedUser()
+    // [what, start relative to now, status, whether it qualifies]
+    const cases: Array<[string, number, Status, boolean]> = [
+      ['started 6 days ago', -6 * DAY_MS, 'booked', true],
+      ['a minute inside 7 days ago', -(7 * DAY_MS - MINUTE_MS), 'booked', true],
+      ['a minute outside 7 days ago', -(7 * DAY_MS + MINUTE_MS), 'booked', false],
+      ['starts in 23 hours', 23 * HOUR_MS, 'booked', true],
+      ['a minute inside 24 hours ahead', 24 * HOUR_MS - MINUTE_MS, 'booked', true],
+      ['a minute outside 24 hours ahead', 24 * HOUR_MS + MINUTE_MS, 'booked', false],
+      ['completed yesterday', -DAY_MS, 'completed', true],
+      ['checked in', -HOUR_MS, 'checked_in', true],
+      ['a request', 2 * HOUR_MS, 'requested', false],
+      ['a no-show', -HOUR_MS, 'no_show', false],
+    ]
+    const expectedOf = new Map<string, [string, boolean]>()
+    for (const [what, offset, status, qualifies] of cases) {
+      const resource = await seedResource('seat', what)
+      await seedBooking(user.id, resource.id, offset, status)
+      expectedOf.set(resource.id, [what, qualifies])
+    }
+
+    const rows = (await myBookings(token)).body as Row[]
+    expect(rows).toHaveLength(cases.length)
+    for (const row of rows) {
+      const [what, qualifies] = expectedOf.get(row.resourceId)!
+      expect(flagsOf(row), what).toEqual({ canReport: qualifies, reportOpen: false })
+      const posted = await request(app).post('/reports').set(auth(token)).send({ resourceId: row.resourceId, category: 'dirty' })
+      expect(posted.status, what).toBe(qualifies ? 201 : 403)
+    }
+
+    // What was accepted is now open and cannot be reported twice; the rest is as it was.
+    for (const row of (await myBookings(token)).body as Row[]) {
+      const [what, qualifies] = expectedOf.get(row.resourceId)!
+      expect(flagsOf(row), what).toEqual({ canReport: false, reportOpen: qualifies })
+    }
+  })
+
+  it('reads the flags with one lookup of open reports however many bookings are listed', async () => {
+    const { user, token } = await seedUser()
+    const spies = [
+      vi.spyOn(prisma.issueReport, 'findMany'),
+      vi.spyOn(prisma.issueReport, 'findFirst'),
+      vi.spyOn(prisma.issueReport, 'findUnique'),
+      vi.spyOn(prisma.issueReport, 'count'),
+      vi.spyOn(prisma.resourceBooking, 'findMany'),
+      vi.spyOn(prisma.resourceBooking, 'findFirst'),
+      vi.spyOn(prisma.resourceBooking, 'count'),
+    ]
+    // How often each of those reads ran during the one request made by `read`.
+    async function callsDuring(read: () => Promise<request.Response>) {
+      spies.forEach((spy) => spy.mockClear())
+      const res = await read()
+      return { res, calls: spies.map((spy) => spy.mock.calls.length) }
+    }
+    let desks = 0
+    async function addDesk() {
+      const resource = await seedResource('seat', `Desk ${++desks}`)
+      await seedBooking(user.id, resource.id, -HOUR_MS, 'checked_in')
+      if (desks % 2 === 0) await seedReport(user.id, resource.id)
+    }
+
+    await addDesk()
+    const one = await callsDuring(() => myBookings(token))
+    for (let i = 0; i < 6; i++) await addDesk()
+    const seven = await callsDuring(() => myBookings(token))
+
+    expect(one.res.body).toHaveLength(1)
+    expect(seven.res.body).toHaveLength(7)
+    expect(seven.res.body.filter((row: Row) => row.reportOpen)).toHaveLength(3)
+    // One read of the student's bookings and one of their open reports, whatever the list holds.
+    expect(one.calls).toEqual([1, 0, 0, 0, 1, 0, 0])
+    expect(seven.calls).toEqual(one.calls)
+  })
+
+  it('the answers to booking, checking in and cancelling carry the flags too', async () => {
+    const { user, token } = await seedUser()
+    const desk = await seedResource('seat', 'Desk 1')
+    const otherDesk = await seedResource('seat', 'Desk 2')
+    const soon = new Date(Date.now() + 2 * HOUR_MS)
+
+    const created = await request(app)
+      .post('/bookings')
+      .set(auth(token))
+      .send({ resourceId: desk.id, startTime: soon.toISOString(), endTime: new Date(soon.getTime() + HOUR_MS).toISOString() })
+    const started = await seedBooking(user.id, otherDesk.id, -MINUTE_MS)
+    const checkedIn = await request(app).post(`/bookings/${started.id}/checkin`).set(auth(token))
+    const later = await seedBooking(user.id, desk.id, 5 * HOUR_MS)
+    await seedReport(user.id, desk.id)
+    const cancelled = await request(app).post(`/bookings/${later.id}/cancel`).set(auth(token))
+
+    // A seat booked for later today starts within the next 24 hours, so it can be reported.
+    expect(created.status).toBe(201)
+    expect(flagsOf(created.body)).toEqual({ canReport: true, reportOpen: false })
+    expect(checkedIn.status).toBe(200)
+    expect(checkedIn.body).toMatchObject({ frontendStatus: 'checkedIn', canReport: true, reportOpen: false })
+    // A cancelled booking never qualifies; the open report on its desk still shows.
+    expect(cancelled.status).toBe(200)
+    expect(cancelled.body).toMatchObject({ status: 'cancelled', canReport: false, reportOpen: true })
+  })
+
+  it('the only change to a booking row is the two new keys', async () => {
+    const { user, token } = await seedUser()
+    const desk = await seedResource('seat', 'Desk 1')
+    await seedBooking(user.id, desk.id, -HOUR_MS, 'checked_in')
+
+    const [row] = (await myBookings(token)).body as Row[]
+
+    expect(Object.keys(row).sort()).toEqual(
+      [
+        'id', 'userId', 'resourceId', 'resourceName', 'resourceType', 'startTime', 'endTime', 'status', 'frontendStatus',
+        'graceRemainingSeconds', 'checkedInAt', 'expiresAt', 'declineReason', 'cancelReason', 'movedFrom',
+        'canReport', 'reportOpen',
+      ].sort(),
+    )
+  })
+})

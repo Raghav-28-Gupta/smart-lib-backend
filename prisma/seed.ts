@@ -23,6 +23,8 @@ async function main() {
   console.log(
     `Generated ${summary.fines} fines on the late returns (${by.pending} outstanding, ${by.paid} paid, ${by.adjusted} adjusted, ${by.waived} waived).`,
   )
+  // eslint-disable-next-line no-console
+  console.log(`Opened ${summary.disputes} fine disputes and ${summary.reports} problem reports for Needs attention.`)
 }
 
 main()

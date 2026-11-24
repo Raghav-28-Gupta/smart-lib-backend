@@ -21,16 +21,20 @@
 // lands first is the one that charges the overdue days, and a return that lands
 // first makes the loss a 409. The loan is changed before the copy, the order a
 // return changes them in, so the two never wait on each other in a circle.
-// Restoring that copy can waive its replacement fine in the same transaction.
+// Restoring that copy can waive its replacement fine in the same transaction, and
+// closes a student's open dispute of that fine as waived, with a notice.
 //
-// Every success publishes catalogue.changed once, after it has committed. A
-// refusal publishes nothing.
-import type { CopyStatus, Prisma } from '../generated/prisma/client'
+// Every success publishes catalogue.changed once, after it has committed (and, when
+// a dispute was closed, after the student's email outcome is stored). A refusal
+// publishes nothing.
+import type { CopyStatus, Notice, Prisma } from '../generated/prisma/client'
 import { publishCatalogueChange } from '../lib/events'
 import { ConflictError, NotFoundError, ValidationError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
 import { getAdminBook, LATEST_LOST_LOAN_FIRST, type AdminBookDto } from './adminCatalogueService'
+import { closeDisputeOnFine } from './disputeService'
 import { overdueFineAmount } from './fineRules'
+import { deliverNotice } from './noticeService'
 import { expireStaleClaims, onBookReturned } from './reservationService'
 
 type CopyAction = 'maintenance' | 'lost' | 'restore'
@@ -202,30 +206,61 @@ async function loseCopy(tx: Prisma.TransactionClient, copyId: string, bookId: st
  * Waives the replacement fine of the copy's latest lost loan if it is still owed
  * (outstanding or adjusted), the way a librarian's waive does
  * (adminFineService.adjustFine): the original amount kept from the first
- * adjustment, who, when and why. ONE conditional UPDATE, so a payment that lands
- * first is seen and the fine is left alone. Answers whether a fine was waived.
- * `adjustedAt` is a plain `timestamp`, so `now` is cast `::timestamp`.
+ * adjustment, who, when and why, and the dispute marker cleared. The fine is
+ * locked first (NO KEY UPDATE), so a payment or a student's dispute that is
+ * committing at the same moment is seen whole: a payment that lands first leaves
+ * the fine alone, and a dispute that lands first is closed below, so a fine is
+ * never waived with its dispute left open. Then ONE conditional UPDATE waives it.
+ * An open dispute on it is closed as `waived`, the restore's reason as the note,
+ * with the notice to the student, the way an adjustment to ₹0 does
+ * (disputeService.closeDisputeOnFine). `adjustedAt` is a plain `timestamp`, so
+ * `now` is cast `::timestamp`.
+ *
+ * Answers whether a fine was waived, and the notices to email after the commit.
  */
-async function waiveReplacementFine(tx: Prisma.TransactionClient, copyId: string, adminId: string, now: Date): Promise<boolean> {
+async function waiveReplacementFine(
+  tx: Prisma.TransactionClient,
+  copyId: string,
+  adminId: string,
+  now: Date,
+): Promise<{ waived: boolean; notices: Notice[] }> {
+  const none = { waived: false, notices: [] }
   const loan = await tx.loan.findFirst({
     where: { bookCopyId: copyId, status: 'lost' },
     orderBy: LATEST_LOST_LOAN_FIRST,
     select: { id: true },
   })
-  if (!loan) return false
+  if (!loan) return none
 
-  const waived = await tx.$executeRaw`
+  // $queryRaw, not $executeRaw: it has to read the rows to lock them. What each stood
+  // at is what the student's notice says was waived.
+  const owed = await tx.$queryRaw<Array<{ id: string; amount: number }>>`
+    SELECT id, amount FROM "Fine"
+    WHERE "relatedLoanId" = ${loan.id}
+      AND reason = 'lost'
+      AND status IN ('pending', 'adjusted')
+    FOR NO KEY UPDATE`
+  if (owed.length === 0) return none
+
+  await tx.$executeRaw`
     UPDATE "Fine"
     SET "originalAmount" = COALESCE("originalAmount", amount),
         amount = 0,
         status = 'waived',
         "adjustedAt" = ${now}::timestamp,
         "adjustedById" = ${adminId},
-        "adjustReason" = ${RETURNED_AFTER_LOST}
+        "adjustReason" = ${RETURNED_AFTER_LOST},
+        "disputedAt" = NULL
     WHERE "relatedLoanId" = ${loan.id}
       AND reason = 'lost'
       AND status IN ('pending', 'adjusted')`
-  return waived > 0
+
+  const notices: Notice[] = []
+  for (const fine of owed) {
+    const notice = await closeDisputeOnFine(tx, fine.id, 'waived', RETURNED_AFTER_LOST, adminId, now, fine.amount)
+    if (notice) notices.push(notice)
+  }
+  return { waived: true, notices }
 }
 
 /** Takes an available copy out of service. */
@@ -269,17 +304,21 @@ export async function restoreCopy(
   now = new Date(),
 ): Promise<{ book: AdminBookDto; replacementWaived: boolean }> {
   const bookId = await bookOf(copyId)
-  const replacementWaived = await prisma.$transaction(async (tx) => {
+  const { waived: replacementWaived, notices } = await prisma.$transaction(async (tx) => {
     const from = await lockAndRead(tx, copyId, bookId)
     await moveCopy(tx, copyId, bookId, 'restore', from, now)
-    return waiveReplacementCharge && from === 'lost' ? waiveReplacementFine(tx, copyId, adminId, now) : false
+    return waiveReplacementCharge && from === 'lost' ? waiveReplacementFine(tx, copyId, adminId, now) : { waived: false, notices: [] }
   })
 
+  // A waived fine's dispute was closed with a notice: email it once, now the restore has
+  // committed (deliverNotice never throws), so the event below finds the outcome stored.
+  for (const notice of notices) await deliverNotice(notice)
   try {
     await onBookReturned(bookId, now)
   } finally {
-    // The copy is back even if the hand-off failed, so the console must hear of it.
-    publishCatalogueChange(replacementWaived ? ['fines'] : [])
+    // The copy is back even if the hand-off failed, so the console must hear of it. A closed
+    // dispute also leaves the Needs attention queue.
+    publishCatalogueChange(notices.length > 0 ? ['fines', 'attention'] : replacementWaived ? ['fines'] : [])
   }
   return { book: await getAdminBook(bookId), replacementWaived }
 }

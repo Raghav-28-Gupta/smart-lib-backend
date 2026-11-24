@@ -2,8 +2,8 @@ import { Router } from 'express'
 import { ConflictError } from '../lib/httpError'
 import { requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
-import { createLoanSchema, loanIdParamsSchema } from '../schemas/loans'
-import { listMyLoans, renewLoan, returnLoan } from '../services/loanService'
+import { createLoanSchema, loanIdParamsSchema, returnLoanSchema } from '../schemas/loans'
+import { listMyLoans, renewLoan, returnLoan, type ReturnReportInput } from '../services/loanService'
 
 export const loansRouter = Router()
 
@@ -22,7 +22,10 @@ loansRouter.post('/loans/:id/renew', requireAuth, validate({ params: loanIdParam
   res.json(await renewLoan(req.user!.sub, id))
 })
 
-loansRouter.post('/loans/:id/return', requireAuth, validate({ params: loanIdParamsSchema }), async (req, res) => {
+// The body is optional: `{ report: { category, note? } }` reports a problem with the copy
+// as it is returned (saved with the return, or not at all).
+loansRouter.post('/loans/:id/return', requireAuth, validate({ params: loanIdParamsSchema, body: returnLoanSchema }), async (req, res) => {
   const { id } = req.params as { id: string }
-  res.json(await returnLoan(req.user!.sub, id))
+  const { report } = req.body as { report?: ReturnReportInput }
+  res.json(await returnLoan(req.user!.sub, id, report))
 })

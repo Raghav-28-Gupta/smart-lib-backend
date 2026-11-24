@@ -2,6 +2,14 @@ import { Router } from 'express'
 import { openLiveStream } from '../lib/liveStream'
 import { requireAdmin, requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
+import {
+  adminAttentionQuerySchema,
+  adminLoanParamsSchema,
+  adminReportParamsSchema,
+  confirmReportSchema,
+  dismissReportSchema,
+  escalateLoanSchema,
+} from '../schemas/adminAttention'
 import { adminBookingParamsSchema, adminBookingsQuerySchema, cancelBookingSchema, reassignBookingSchema } from '../schemas/adminBookings'
 import {
   addCopiesSchema,
@@ -14,6 +22,7 @@ import {
   updateBookSchema,
 } from '../schemas/adminCatalogue'
 import { adjustFineSchema, adminFineParamsSchema, adminFinesQuerySchema, markFinePaidSchema } from '../schemas/adminFines'
+import { adminDisputeParamsSchema, upholdDisputeSchema } from '../schemas/disputes'
 import { adminRequestParamsSchema, declineRequestSchema } from '../schemas/adminRequests'
 import {
   adminResourceParamsSchema,
@@ -23,6 +32,7 @@ import {
   updateResourceSchema,
 } from '../schemas/adminResources'
 import { adjustReliabilitySchema, adminStudentParamsSchema } from '../schemas/adminStudents'
+import { escalateOverdueLoan, listAttention, remindOverdueLoan, type AttentionKind } from '../services/adminAttentionService'
 import {
   cancelBookingAsLibrary,
   listBookings,
@@ -44,6 +54,8 @@ import {
   type AdminResourceType,
 } from '../services/adminResourceService'
 import { adjustReliability, getStudent } from '../services/adminStudentService'
+import { upholdDispute } from '../services/disputeService'
+import { confirmReport, dismissReport, type CopyOutcome } from '../services/reportService'
 
 export const adminRouter = Router()
 
@@ -159,8 +171,18 @@ adminRouter.post(
   '/admin/fines/:id/adjust',
   validate({ params: adminFineParamsSchema, body: adjustFineSchema }),
   async (req, res) => {
-    const { amount, reason } = req.body as { amount: number; reason: string }
-    res.json(await adjustFine(req.params.id as string, req.user!.sub, amount, reason))
+    const { amount, reason, disputeId } = req.body as { amount: number; reason: string; disputeId?: string | null }
+    res.json(await adjustFine(req.params.id as string, req.user!.sub, amount, reason, disputeId ?? null))
+  },
+)
+
+// The librarian keeps the fine: closes the dispute, the fine stands. A bare POST (no body) is no note.
+adminRouter.post(
+  '/admin/disputes/:id/uphold',
+  validate({ params: adminDisputeParamsSchema, body: upholdDisputeSchema }),
+  async (req, res) => {
+    const { note } = req.body as { note?: string }
+    res.json(await upholdDispute(req.params.id as string, req.user!.sub, note ? note : null))
   },
 )
 
@@ -213,6 +235,47 @@ adminRouter.post(
   async (req, res) => {
     const { delta, reason } = req.body as { delta: number; reason: string }
     res.json(await adjustReliability(req.params.id as string, req.user!.sub, delta, reason))
+  },
+)
+
+adminRouter.get('/admin/attention', validate({ query: adminAttentionQuerySchema }), async (req, res) => {
+  const { kind } = req.validatedQuery as { kind?: AttentionKind }
+  res.json(await listAttention({ kind }))
+})
+
+// A reminder takes no body (Express 5 leaves req.body undefined for the console's bare POST).
+adminRouter.post('/admin/loans/:id/remind', validate({ params: adminLoanParamsSchema }), async (req, res) => {
+  res.json(await remindOverdueLoan(req.params.id as string, req.user!.sub))
+})
+
+adminRouter.post(
+  '/admin/loans/:id/escalate',
+  validate({ params: adminLoanParamsSchema, body: escalateLoanSchema }),
+  async (req, res) => {
+    const { note } = req.body as { note?: string }
+    res.json(await escalateOverdueLoan(req.params.id as string, req.user!.sub, note ? note : null))
+  },
+)
+
+// A librarian agrees with a student's problem report: a copy goes to maintenance or is marked lost
+// (`outcome`, required for a copy), a resource goes offline. A bare POST (no body) is a complete
+// request for a resource report.
+adminRouter.post(
+  '/admin/reports/:id/confirm',
+  validate({ params: adminReportParamsSchema, body: confirmReportSchema }),
+  async (req, res) => {
+    const { outcome, note } = req.body as { outcome?: CopyOutcome; note?: string }
+    res.json(await confirmReport(req.params.id as string, req.user!.sub, { outcome, note }))
+  },
+)
+
+// The librarian finds nothing to do. A bare POST (no body) is no note.
+adminRouter.post(
+  '/admin/reports/:id/dismiss',
+  validate({ params: adminReportParamsSchema, body: dismissReportSchema }),
+  async (req, res) => {
+    const { note } = req.body as { note?: string }
+    res.json(await dismissReport(req.params.id as string, req.user!.sub, note ? note : null))
   },
 )
 

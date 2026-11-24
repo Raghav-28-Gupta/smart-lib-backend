@@ -139,6 +139,7 @@ describe('GET /fines/me', () => {
           status: 'adjusted',
           date: noShow.createdAt.toISOString(),
           note: 'First offence',
+          dispute: null,
         },
         {
           id: overdue.id,
@@ -149,6 +150,7 @@ describe('GET /fines/me', () => {
           status: 'outstanding',
           date: overdue.createdAt.toISOString(),
           note: null,
+          dispute: null,
         },
         {
           id: lost.id,
@@ -159,6 +161,7 @@ describe('GET /fines/me', () => {
           status: 'waived',
           date: lost.createdAt.toISOString(),
           note: 'Library error',
+          dispute: null,
         },
         {
           id: paid.id,
@@ -169,6 +172,7 @@ describe('GET /fines/me', () => {
           status: 'paid',
           date: paid.createdAt.toISOString(),
           note: 'Hardship',
+          dispute: null,
         },
         {
           id: bare.id,
@@ -179,6 +183,7 @@ describe('GET /fines/me', () => {
           status: 'outstanding',
           date: bare.createdAt.toISOString(),
           note: null,
+          dispute: null,
         },
       ],
       // Outstanding 30 + 10 and adjusted 20; the paid, waived and still-out loan add nothing.
@@ -256,5 +261,64 @@ describe('GET /fines/me', () => {
     expect((res.body.fines as Array<{ id: string }>).map((f) => f.id)).toEqual(newest50)
     // The total is over all 55, not the 50 shown.
     expect(res.body.outstandingTotal).toBe(550)
+  })
+})
+
+describe('GET /fines/me: the dispute on a fine', () => {
+  beforeEach(resetDb)
+
+  it('shows an open dispute with no note, and a resolved one with the library\'s note', async () => {
+    const { user: student, token } = await seedUser('student', 'Asha Rao')
+    const { user: librarian } = await seedUser('admin', 'Priya Menon')
+    const { user: other } = await seedUser('student', 'Ben Carter')
+    const t = Date.now()
+    const open = await seedFine({ userId: student.id, amount: 90, createdAt: new Date(t - 1 * DAY_MS) })
+    const upheld = await seedFine({ userId: student.id, amount: 60, createdAt: new Date(t - 2 * DAY_MS) })
+    const lowered = await seedFine({
+      userId: student.id,
+      amount: 20,
+      status: 'adjusted',
+      originalAmount: 50,
+      adjustReason: 'Returned a day earlier than the system says',
+      createdAt: new Date(t - 3 * DAY_MS),
+    })
+    const waived = await seedFine({
+      userId: student.id,
+      amount: 0,
+      status: 'waived',
+      originalAmount: 40,
+      adjustReason: 'Library error',
+      createdAt: new Date(t - 4 * DAY_MS),
+    })
+    const undisputed = await seedFine({ userId: student.id, amount: 10, createdAt: new Date(t - 5 * DAY_MS) })
+    // Another student's open dispute never shows here.
+    const theirs = await seedFine({ userId: other.id, amount: 70 })
+    await prisma.fine.update({ where: { id: open.id }, data: { disputedAt: new Date(t - HOUR_MS) } })
+    await prisma.fine.update({ where: { id: theirs.id }, data: { disputedAt: new Date(t - HOUR_MS) } })
+    const resolved = { resolvedById: librarian.id, resolvedAt: new Date(t - HOUR_MS) }
+    await prisma.fineDispute.createMany({
+      data: [
+        { fineId: open.id, userId: student.id, reason: 'I returned it on time' },
+        { fineId: upheld.id, userId: student.id, reason: 'Wrong', status: 'upheld', resolutionNote: 'The loan record is clear.', ...resolved },
+        { fineId: lowered.id, userId: student.id, reason: 'Late by a day only', status: 'adjusted', resolutionNote: 'Returned a day earlier than the system says', ...resolved },
+        { fineId: waived.id, userId: student.id, reason: 'Not my book', status: 'waived', resolutionNote: 'Library error', ...resolved },
+        { fineId: theirs.id, userId: other.id, reason: 'Mine alone' },
+      ],
+    })
+
+    const res = await mine(token)
+
+    expect(res.status).toBe(200)
+    const byId = new Map((res.body.fines as Array<{ id: string; status: string; dispute: unknown }>).map((f) => [f.id, f]))
+    // Still owed while the dispute is open: the status does not change, and it counts in the total.
+    expect(byId.get(open.id)).toMatchObject({ status: 'outstanding', dispute: { status: 'open', note: null } })
+    expect(byId.get(upheld.id)).toMatchObject({ status: 'outstanding', dispute: { status: 'upheld', note: 'The loan record is clear.' } })
+    expect(byId.get(lowered.id)).toMatchObject({ status: 'adjusted', dispute: { status: 'adjusted', note: 'Returned a day earlier than the system says' } })
+    expect(byId.get(waived.id)).toMatchObject({ status: 'waived', dispute: { status: 'waived', note: 'Library error' } })
+    expect(byId.get(undisputed.id)).toMatchObject({ dispute: null })
+    expect(byId.has(theirs.id)).toBe(false)
+    // Only the two keys, so nothing about who resolved it or when leaves the server.
+    expect(Object.keys(byId.get(open.id)!.dispute as object).sort()).toEqual(['note', 'status'])
+    expect(res.body.outstandingTotal).toBe(90 + 60 + 20 + 10)
   })
 })

@@ -174,17 +174,25 @@ export function generateHistory(
 }
 
 /**
+ * How many of the newest fines are never settled: the seed opens a dispute on each
+ * (seedData.ts imports this, and refuses a plan with more disputes than it).
+ */
+export const OUTSTANDING_NEWEST = 2
+
+/**
  * One overdue fine per loan returned after its due date, then a few settled so
- * every filter on the Fines page has something: about half paid, a waived and
- * a lowered example, and the newest left outstanding. Three loans in ten come
- * back late, which gives five to eleven fines depending on the weekday: enough
- * for every status each day. Should there ever be fewer than four, the
- * outstanding fine comes first, then the waived one, then the lowered one.
+ * every filter on the Fines page has something: a waived and a lowered example,
+ * the older ones paid, and the two newest left outstanding. Three loans in ten
+ * come back late, which gives five to eleven fines depending on the weekday:
+ * enough for every status each day (one paid of five fines, six of eleven).
+ * With fewer fines the older ones settle in the same order: three fines give the
+ * two outstanding and the waived one, four add the lowered one, and the first
+ * paid one appears at five.
  *
  * The statuses are decided after the bookings and loans, from the end of the
  * same random stream, so they never move the rows generated before them.
  */
-function generateFines(loans: HistoryLoan[], midnight: Date, random: () => number): HistoryFine[] {
+export function generateFines(loans: HistoryLoan[], midnight: Date, random: () => number): HistoryFine[] {
   const fines: HistoryFine[] = []
   for (const loan of loans) {
     if (!loan.returnedAt) continue
@@ -208,8 +216,9 @@ function generateFines(loans: HistoryLoan[], midnight: Date, random: () => numbe
   // or adjustment (1-3 days after the return) still falls before today.
   const daysBeforeToday = (f: HistoryFine) => Math.ceil((midnight.getTime() - f.createdAt.getTime()) / DAY_MS) - 1
   const oldestFirst = [...fines].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
-  // The newest always stays outstanding: that is the one a librarian can act on.
-  const settleCount = Math.max(0, Math.min(fines.length - 1, Math.round(fines.length / 2) + 2))
+  // The newest two always stay outstanding: the ones a librarian can act on, and the
+  // ones the seed disputes. Settling takes the oldest first, so it never reaches them.
+  const settleCount = Math.max(0, Math.min(fines.length - OUTSTANDING_NEWEST, Math.round(fines.length / 2) + 2))
   const settled = oldestFirst.filter((f) => daysBeforeToday(f) >= 1).slice(0, settleCount)
 
   // A waived and a lowered example, the rest paid, dealt out in random order.

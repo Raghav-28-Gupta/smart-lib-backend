@@ -77,13 +77,21 @@ interface MailerConfig {
   from: { email: string; name: string }
 }
 
-// null when email is off. Under NODE_ENV=test only an injected transport
-// counts, so a key in a developer's environment can never send from a test run.
+// True under a test run. NODE_ENV alone is not enough: Vitest sets it only when
+// the shell left it unset, so a shell with NODE_ENV=development would otherwise
+// leave the real transport on. Vitest always sets VITEST.
+function inTestRun(): boolean {
+  return process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST)
+}
+
+// null when email is off. In a test run (NODE_ENV=test or VITEST set) only an
+// injected transport counts, so a key in a developer's environment or .env can
+// never send from a test run.
 function resolveConfig(): MailerConfig | null {
   const email = setting('MAIL_FROM')
   const name = setting('MAIL_FROM_NAME') ?? DEFAULT_FROM_NAME
   if (injected) return { transport: injected, from: { email: email ?? TEST_FROM_EMAIL, name } }
-  if (process.env.NODE_ENV === 'test') return null
+  if (inTestRun()) return null
   const apiKey = setting('BREVO_API_KEY')
   if (!apiKey || !email) return null
   return { transport: brevoTransport(apiKey), from: { email, name } }

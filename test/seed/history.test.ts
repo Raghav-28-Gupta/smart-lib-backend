@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { generateHistory, HISTORY_SEED, mulberry32, type HistoryInputs } from '../../prisma/history'
+import { generateFines, generateHistory, HISTORY_SEED, mulberry32, type HistoryInputs, type HistoryLoan } from '../../prisma/history'
 import { overdueFineAmount } from '../../src/services/fineRules'
 
 const TODAY = new Date(2026, 9, 15, 13, 0)
-const MIDNIGHT = new Date(2026, 9, 15)
-const DAY_MS = 24 * 60 * 60 * 1000
+// The midnight that starts TODAY, derived from it rather than written out a second time.
+const MIDNIGHT = new Date(TODAY.getFullYear(), TODAY.getMonth(), TODAY.getDate())
+const HOUR_MS = 60 * 60 * 1000
+const DAY_MS = 24 * HOUR_MS
 
 const INPUTS: HistoryInputs = {
   studentIds: ['st1', 'st2', 'st3', 'st4', 'st5', 'st6'],
@@ -124,7 +126,8 @@ describe('generateHistory', () => {
     expect(byStatus('paid').length).toBeGreaterThanOrEqual(1)
     expect(byStatus('adjusted').length).toBeGreaterThanOrEqual(1)
     expect(byStatus('waived').length).toBeGreaterThanOrEqual(1)
-    expect(byStatus('pending').length).toBeGreaterThanOrEqual(1)
+    // The seed opens a dispute on each of the two newest, so at least two stay outstanding.
+    expect(byStatus('pending').length).toBeGreaterThanOrEqual(2)
     // About half are paid.
     expect(byStatus('paid').length / fines.length).toBeGreaterThan(0.25)
     expect(byStatus('paid').length / fines.length).toBeLessThan(0.75)
@@ -173,7 +176,7 @@ describe('generateHistory', () => {
     expect(b).toEqual(a)
   })
 
-  it('every day of a week gives outstanding, paid, adjusted and waived fines', () => {
+  it('every day of a week gives outstanding, paid, adjusted and waived fines, the two newest outstanding', () => {
     // The history depends on the date only through the weekday, so seven
     // consecutive days are every case there is.
     for (let ahead = 0; ahead < 7; ahead++) {
@@ -185,16 +188,61 @@ describe('generateHistory', () => {
 
       // A late return is never left without its fine.
       expect(fines.length).toBe(loans.filter((l) => l.returnedAt && l.returnedAt > l.dueAt).length)
+      // Five to eleven fines a day: enough to show every status with two left outstanding.
+      expect(fines.length, day.toDateString()).toBeGreaterThanOrEqual(5)
       for (const status of ['pending', 'paid', 'adjusted', 'waived']) {
         expect(count(status), `${day.toDateString()}: ${status}`).toBeGreaterThanOrEqual(1)
       }
-      // About half are paid.
-      expect(count('paid') / fines.length).toBeGreaterThanOrEqual(0.25)
+      expect(count('pending'), day.toDateString()).toBeGreaterThanOrEqual(2)
+      // The two newest are outstanding: the seed disputes them.
+      const newest = [...fines].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, 2)
+      expect(newest.map((f) => f.status), day.toDateString()).toEqual(['pending', 'pending'])
+      // The rest are mostly paid: a fifth on the days with the fewest fines (one paid of five), up to three quarters.
+      expect(count('paid') / fines.length).toBeGreaterThanOrEqual(0.2)
       expect(count('paid') / fines.length).toBeLessThanOrEqual(0.75)
       // Nothing is settled in the future.
       for (const f of fines) {
         for (const at of [f.paidAt, f.adjustedAt]) if (at) expect(at.getTime()).toBeLessThan(midnight.getTime())
       }
+    }
+  })
+})
+
+describe('generateFines', () => {
+  // generateFines reads no clock: it is given the midnight that starts today, so any day will do, and this one is the real one.
+  const now = new Date()
+  const TODAY_MIDNIGHT = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  /** `n` loans returned late, the oldest first, each far enough back that its fine may be settled. */
+  const lateLoans = (n: number): HistoryLoan[] =>
+    Array.from({ length: n }, (_, i) => {
+      const returnedAt = new Date(TODAY_MIDNIGHT.getTime() - (30 - i * 2) * DAY_MS + 12 * HOUR_MS)
+      const dueAt = new Date(returnedAt.getTime() - 3 * DAY_MS)
+      return { id: `hist-loan-${i + 1}`, userId: 'st1', bookCopyId: 'c1', borrowedAt: new Date(dueAt.getTime() - 14 * DAY_MS), dueAt, returnedAt, status: 'returned' as const }
+    })
+  /** The fines' statuses, oldest first. */
+  const statuses = (n: number) => generateFines(lateLoans(n), TODAY_MIDNIGHT, mulberry32(HISTORY_SEED)).map((f) => f.status)
+
+  it('leaves the two newest outstanding, then settles the waived, the lowered and the paid, oldest first', () => {
+    expect(statuses(0)).toEqual([])
+    // One fine on its own is outstanding; with two or more, the two newest are.
+    expect(statuses(1)).toEqual(['pending'])
+    expect(statuses(2)).toEqual(['pending', 'pending'])
+    expect(statuses(3)).toEqual(['waived', 'pending', 'pending'])
+    expect(statuses(4).slice(0, 2).sort()).toEqual(['adjusted', 'waived'])
+    expect(statuses(4).slice(2)).toEqual(['pending', 'pending'])
+    // From five on, every status appears.
+    expect(statuses(5).slice(0, 3).sort()).toEqual(['adjusted', 'paid', 'waived'])
+    expect(statuses(5).slice(3)).toEqual(['pending', 'pending'])
+    for (const n of [6, 7, 8, 9, 10, 11]) {
+      const all = statuses(n)
+      expect(all.slice(-2), `${n} fines`).toEqual(['pending', 'pending'])
+      for (const status of ['paid', 'adjusted', 'waived']) expect(all, `${n} fines: ${status}`).toContain(status)
+    }
+  })
+
+  it('leaves the two newest outstanding whatever the random numbers are', () => {
+    for (let seed = 1; seed <= 50; seed++) {
+      expect(generateFines(lateLoans(7), TODAY_MIDNIGHT, mulberry32(seed)).slice(-2).map((f) => f.status), `seed ${seed}`).toEqual(['pending', 'pending'])
     }
   })
 })

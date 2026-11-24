@@ -1,8 +1,9 @@
 import jwt from 'jsonwebtoken'
 import request from 'supertest'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { app } from '../../src/app'
 import { JWT_SECRET } from '../../src/config/constants'
+import type { Prisma } from '../../src/generated/prisma/client'
 import { prisma } from '../../src/lib/prisma'
 import { resetDb } from '../helpers/db'
 import { recordEvents } from '../helpers/events'
@@ -266,6 +267,201 @@ describe('POST /loans/:id/return', () => {
 
     const res = await request(app).post(`/loans/${loan.id}/return`).set('Authorization', `Bearer ${otherToken}`)
     expect(res.status).toBe(403)
+  })
+})
+
+describe('POST /loans/:id/return with a report', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+    vi.restoreAllMocks()
+  })
+
+  const DAY_MS = 24 * 60 * 60 * 1000
+  const LOST_LOAN = 'This loan was closed because the copy was marked lost.'
+  const LOAN_KEYS = ['blockedReason', 'bookId', 'borrowedAt', 'canRenew', 'dueAt', 'fineAmount', 'frontendStatus', 'id', 'renewedCount', 'returnedAt', 'status', 'userId']
+  const damaged = { report: { category: 'damaged', note: 'The cover is torn' } }
+
+  /** A student with a copy of a new book out on loan (the copy marked borrowed, as lending leaves it). */
+  async function seedLoanOut(dueAt = new Date(Date.now() + 5 * DAY_MS)) {
+    const { user, token } = await seedUser()
+    const book = await seedBookWithCopies(1, 1)
+    const copy = await prisma.bookCopy.findFirstOrThrow({ where: { bookId: book.id } })
+    await prisma.bookCopy.update({ where: { id: copy.id }, data: { status: 'borrowed' } })
+    const loan = await prisma.loan.create({ data: { userId: user.id, bookCopyId: copy.id, dueAt } })
+    return { user, token, copy, loan }
+  }
+
+  const returnLoan = (token: string, loanId: string, body?: object) => {
+    const req = request(app).post(`/loans/${loanId}/return`).set('Authorization', `Bearer ${token}`)
+    return body === undefined ? req : req.send(body)
+  }
+
+  it('returning with a report creates one open report on that copy by that student, in the same transaction', async () => {
+    const { user, token, copy, loan } = await seedLoanOut()
+
+    const res = await returnLoan(token, loan.id, { report: { category: 'damaged', note: '  The cover is torn \n' } })
+
+    expect(res.status).toBe(200)
+    // The answer is the loan, as it always was: the report adds nothing to it.
+    expect(Object.keys(res.body).sort()).toEqual(LOAN_KEYS)
+    expect(res.body).toMatchObject({ id: loan.id, status: 'returned' })
+    const reports = await prisma.issueReport.findMany()
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({
+      userId: user.id,
+      bookCopyId: copy.id,
+      resourceId: null,
+      category: 'damaged',
+      note: 'The cover is torn',
+      status: 'open',
+      resolutionNote: null,
+      resolvedById: null,
+      resolvedAt: null,
+    })
+    const returned = await prisma.loan.findUniqueOrThrow({ where: { id: loan.id } })
+    expect(returned.status).toBe('returned')
+    expect((await prisma.bookCopy.findUniqueOrThrow({ where: { id: copy.id } })).status).toBe('available')
+    // Written by the return itself, with its clock: the report and the return are one moment.
+    expect(reports[0].createdAt).toEqual(returned.returnedAt)
+  })
+
+  it('returning with no body behaves as before', async () => {
+    const noBody = await seedLoanOut()
+    const emptyBody = await seedLoanOut()
+    recorder = recordEvents()
+
+    const first = await returnLoan(noBody.token, noBody.loan.id)
+    const second = await returnLoan(emptyBody.token, emptyBody.loan.id, {})
+
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    expect(Object.keys(first.body).sort()).toEqual(LOAN_KEYS)
+    expect(first.body).toMatchObject({ status: 'returned' })
+    expect(second.body).toMatchObject({ status: 'returned' })
+    expect(await prisma.issueReport.count()).toBe(0)
+    // Each return announces the return and nothing about a report.
+    expect(recorder.events).toEqual([
+      { type: 'loan.changed', topics: ['metrics', 'catalogue'] },
+      { type: 'loan.changed', topics: ['metrics', 'catalogue'] },
+    ])
+  })
+
+  it('a return refused because the loan is already returned or lost creates no report', async () => {
+    const returned = await seedLoanOut()
+    expect((await returnLoan(returned.token, returned.loan.id)).status).toBe(200)
+    const lost = await seedLoanOut()
+    await prisma.loan.update({ where: { id: lost.loan.id }, data: { status: 'lost', lostAt: new Date() } })
+    await prisma.bookCopy.update({ where: { id: lost.copy.id }, data: { status: 'lost' } })
+    const theirs = await seedLoanOut()
+    const { token: strangerToken } = await seedUser()
+    recorder = recordEvents()
+
+    const again = await returnLoan(returned.token, returned.loan.id, damaged)
+    const lostRes = await returnLoan(lost.token, lost.loan.id, damaged)
+    const notTheirs = await returnLoan(strangerToken, theirs.loan.id, damaged)
+    const unknown = await returnLoan(returned.token, 'no-such-loan', damaged)
+    const anonymous = await request(app).post(`/loans/${theirs.loan.id}/return`).send(damaged)
+
+    expect(again.status).toBe(409)
+    expect(again.body).toEqual({ error: 'This loan has already been returned.' })
+    expect(lostRes.status).toBe(409)
+    expect(lostRes.body).toEqual({ error: LOST_LOAN })
+    expect(notTheirs.status).toBe(403)
+    expect(unknown.status).toBe(404)
+    expect(anonymous.status).toBe(401)
+    // Nothing was written, nothing announced, and the loan someone else tried to return is still out.
+    expect(await prisma.issueReport.count()).toBe(0)
+    expect(recorder.events).toEqual([])
+    expect((await prisma.loan.findUniqueOrThrow({ where: { id: theirs.loan.id } })).status).toBe('active')
+    expect((await prisma.bookCopy.findUniqueOrThrow({ where: { id: theirs.copy.id } })).status).toBe('borrowed')
+  })
+
+  type TransactionClient = Prisma.TransactionClient
+  /** A client for the test's transaction that behaves as `tx` does, except that `replacements` stand in for some of its models. */
+  const withModels = (tx: TransactionClient, replacements: Record<string, object>) =>
+    new Proxy(tx, { get: (target, prop) => (typeof prop === 'string' && prop in replacements ? replacements[prop] : Reflect.get(target, prop)) })
+  /** A model of `tx` that behaves as it does, except that `replacements` stand in for some of its methods. */
+  const withMethods = (model: object, replacements: Record<string, (...args: never[]) => unknown>) =>
+    new Proxy(model, { get: (target, prop) => (typeof prop === 'string' && prop in replacements ? replacements[prop] : Reflect.get(target, prop)) })
+  /** Runs the next transactions for real, each on the client `wrap` makes of the real one. */
+  function wrapTransactions(wrap: (tx: TransactionClient) => TransactionClient) {
+    const real = prisma.$transaction.bind(prisma) as unknown as (fn: (tx: TransactionClient) => Promise<unknown>, options?: unknown) => Promise<unknown>
+    vi.spyOn(prisma, '$transaction').mockImplementation(((fn: (tx: TransactionClient) => Promise<unknown>, options?: unknown) =>
+      real((tx) => fn(wrap(tx)), options)) as never)
+  }
+
+  it('a failure after the loan update rolls the report back', async () => {
+    const { token, copy, loan } = await seedLoanOut(new Date(Date.now() - 3 * DAY_MS - 60 * 60 * 1000))
+    recorder = recordEvents()
+
+    // A real failure inside the return's transaction: its copy update throws, after the
+    // loan has been returned, the overdue fine written and the report inserted. What the
+    // transaction held at that moment is read from inside it, so the test cannot pass
+    // merely because the report was never written.
+    let heldWhenItFailed: { loan: string; reports: number; fines: number } | undefined
+    wrapTransactions((tx) =>
+      withModels(tx, {
+        bookCopy: withMethods(tx.bookCopy, {
+          update: async () => {
+            heldWhenItFailed = {
+              loan: (await tx.loan.findUniqueOrThrow({ where: { id: loan.id } })).status,
+              reports: await tx.issueReport.count({ where: { bookCopyId: copy.id } }),
+              fines: await tx.fine.count({ where: { relatedLoanId: loan.id } }),
+            }
+            throw new Error('The copy update failed')
+          },
+        }),
+      }),
+    )
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const res = await returnLoan(token, loan.id, damaged)
+    vi.restoreAllMocks()
+
+    expect(res.status).toBe(500)
+    expect(logged).toHaveBeenCalledWith(expect.objectContaining({ message: 'The copy update failed' }))
+    expect(heldWhenItFailed).toEqual({ loan: 'returned', reports: 1, fines: 1 })
+    // All of it rolled back together: the loan is still out, the copy still borrowed, no report, no fine.
+    expect(await prisma.issueReport.count()).toBe(0)
+    expect(await prisma.fine.count()).toBe(0)
+    expect(await prisma.loan.findUniqueOrThrow({ where: { id: loan.id } })).toMatchObject({ status: 'active', returnedAt: null })
+    expect((await prisma.bookCopy.findUniqueOrThrow({ where: { id: copy.id } })).status).toBe('borrowed')
+    expect(recorder.events).toEqual([])
+
+    // And nothing is left stuck: the same return, tried again, goes through with its report.
+    const retry = await returnLoan(token, loan.id, damaged)
+    expect(retry.status).toBe(200)
+    expect(await prisma.issueReport.count({ where: { bookCopyId: copy.id, status: 'open' } })).toBe(1)
+  })
+
+  it('writes the report only after the loan update has won, and before the copy goes back on the shelf', async () => {
+    const { token, loan } = await seedLoanOut()
+    // Within the transaction a refusal rolls everything back, so the order is not visible
+    // in the outcome; it is pinned here by watching the writes as the transaction makes them.
+    const writes: string[] = []
+    const watch = <M extends object>(name: string, model: M, method: string) =>
+      withMethods(model, {
+        [method]: (...args: never[]) => {
+          writes.push(`${name}.${method}`)
+          return (Reflect.get(model, method) as (...a: never[]) => unknown).apply(model, args)
+        },
+      })
+    wrapTransactions((tx) =>
+      withModels(tx, {
+        loan: watch('loan', tx.loan, 'updateMany'),
+        issueReport: watch('issueReport', tx.issueReport, 'createMany'),
+        bookCopy: watch('bookCopy', tx.bookCopy, 'update'),
+      }),
+    )
+
+    const res = await returnLoan(token, loan.id, damaged)
+    vi.restoreAllMocks()
+
+    expect(res.status).toBe(200)
+    expect(writes).toEqual(['loan.updateMany', 'issueReport.createMany', 'bookCopy.update'])
   })
 })
 

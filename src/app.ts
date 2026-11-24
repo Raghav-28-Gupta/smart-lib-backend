@@ -13,6 +13,7 @@ import { reservationsRouter } from './routes/reservations'
 import { bookingsRouter } from './routes/bookings'
 import { profileRouter } from './routes/profile'
 import { recommendationsRouter } from './routes/recommendations'
+import { reportsRouter } from './routes/reports'
 import { resourcesRouter } from './routes/resources'
 
 // The Express app, separate from the listen() call in index.ts, so tests can
@@ -41,6 +42,7 @@ app.use(profileRouter)
 app.use(recommendationsRouter)
 app.use(finesRouter)
 app.use(noticesRouter)
+app.use(reportsRouter)
 app.use(adminRouter)
 
 // More route modules land here as later tasks add them — each router

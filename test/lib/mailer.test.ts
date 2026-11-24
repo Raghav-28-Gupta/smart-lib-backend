@@ -14,6 +14,7 @@ const ENV_KEYS = [
   'MAIL_FROM_NAME',
   'MAIL_ALLOWED_DOMAINS',
   'NODE_ENV',
+  'VITEST',
 ] as const
 
 const BREVO_URL = 'https://api.brevo.com/v3/smtp/email'
@@ -26,10 +27,16 @@ const message: MailMessage = {
 
 const saved: Record<string, string | undefined> = {}
 
-// The real path only runs outside NODE_ENV=test, so a test that exercises it
-// switches to 'production' (beforeEach/afterEach put the original back).
-function useRealPath(env: Record<string, string> = {}) {
+// The real path only runs outside a test run (NODE_ENV=test or VITEST set), so a
+// test that exercises it switches to 'production' and clears VITEST (afterEach
+// puts both back).
+function leaveTestRun() {
   process.env.NODE_ENV = 'production'
+  delete process.env.VITEST
+}
+
+function useRealPath(env: Record<string, string> = {}) {
+  leaveTestRun()
   process.env.BREVO_API_KEY = 'xkeysib-test-key'
   process.env.MAIL_FROM = 'library@example.org'
   Object.assign(process.env, env)
@@ -56,7 +63,7 @@ function silenceConsole() {
 beforeEach(() => {
   for (const key of ENV_KEYS) {
     saved[key] = process.env[key]
-    if (key !== 'NODE_ENV') delete process.env[key]
+    if (key !== 'NODE_ENV' && key !== 'VITEST') delete process.env[key]
   }
   setMailTransport(null)
 })
@@ -74,7 +81,7 @@ afterEach(() => {
 describe('sendEmail', () => {
   it('is skipped, with no request, when BREVO_API_KEY or MAIL_FROM is unset', async () => {
     const fetchMock = stubFetch(() => new Response('{}', { status: 201 }))
-    process.env.NODE_ENV = 'production'
+    leaveTestRun()
 
     expect(await sendEmail(message)).toBe('skipped')
 
@@ -93,13 +100,44 @@ describe('sendEmail', () => {
 
   it('is skipped under NODE_ENV=test with no injected transport', async () => {
     const fetchMock = stubFetch(() => new Response('{}', { status: 201 }))
-    // Vitest sets this; a key in a developer's .env must still not send.
-    expect(process.env.NODE_ENV).toBe('test')
+    // NODE_ENV alone (VITEST cleared): a key in a developer's .env must still not send.
+    process.env.NODE_ENV = 'test'
+    delete process.env.VITEST
     process.env.BREVO_API_KEY = 'xkeysib-test-key'
     process.env.MAIL_FROM = 'library@example.org'
 
     expect(await sendEmail(message)).toBe('skipped')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('is skipped when Vitest is running even if NODE_ENV is not "test", with a key configured', async () => {
+    const fetchMock = stubFetch(() => new Response('{}', { status: 201 }))
+    const before = { NODE_ENV: process.env.NODE_ENV, VITEST: process.env.VITEST }
+    try {
+      // Vitest only sets NODE_ENV when the shell left it unset, and the .env loaded by
+      // test/setup.ts may hold a live key: VITEST alone must keep the real transport off.
+      process.env.NODE_ENV = 'development'
+      process.env.VITEST = 'true'
+      process.env.BREVO_API_KEY = 'xkeysib-test-key'
+      process.env.MAIL_FROM = 'library@example.org'
+
+      expect(isEmailConfigured()).toBe(false)
+      expect(await sendEmail(message)).toBe('skipped')
+      expect(fetchMock).not.toHaveBeenCalled()
+
+      // An injected transport is still the way a test sends.
+      const { transport, send } = fakeTransport()
+      setMailTransport(transport)
+      expect(isEmailConfigured()).toBe(true)
+      expect(await sendEmail(message)).toBe('sent')
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      for (const [key, value] of Object.entries(before)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
   })
 
   it('skips the placeholder demo addresses', async () => {
@@ -312,8 +350,8 @@ describe('sendEmail with an injected transport', () => {
 })
 
 describe('isEmailConfigured', () => {
-  it('needs both BREVO_API_KEY and MAIL_FROM outside the test environment', () => {
-    process.env.NODE_ENV = 'production'
+  it('needs both BREVO_API_KEY and MAIL_FROM outside a test run', () => {
+    leaveTestRun()
     expect(isEmailConfigured()).toBe(false)
 
     process.env.BREVO_API_KEY = 'xkeysib-test-key'
@@ -329,7 +367,7 @@ describe('isEmailConfigured', () => {
   it('is true with an injected transport and false under NODE_ENV=test without one', () => {
     process.env.BREVO_API_KEY = 'xkeysib-test-key'
     process.env.MAIL_FROM = 'library@example.org'
-    expect(process.env.NODE_ENV).toBe('test')
+    process.env.NODE_ENV = 'test'
     expect(isEmailConfigured()).toBe(false)
 
     setMailTransport(fakeTransport().transport)

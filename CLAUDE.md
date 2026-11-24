@@ -59,6 +59,8 @@ PORT=3000
 
 > **Neon Connection Notice**: Use the **direct / unpooled** connection string for database migrations. `sslmode=require` is mandatory.
 
+Optional email settings (all commented out in `.env.example`; email is off unless the first two are set, and nothing else depends on them): `BREVO_API_KEY` (a secret), `MAIL_FROM`, `MAIL_FROM_NAME` (default "SmartLib") and `MAIL_ALLOWED_DOMAINS` (comma-separated). Never put a real key in a committed file. The rules are under *Notices, Disputes and Reports*.
+
 ---
 
 ## Prisma 7 Architecture & Nuances
@@ -99,7 +101,18 @@ To guarantee zero double-bookings at the database level, the `ResourceBooking` t
 
 A pending room request (`requested`) holds its slot. `BorrowRequest` also
 carries a hand-written partial unique index, `BorrowRequest_one_pending_per_title`.
-Check every generated migration for a `DROP` of either before applying it.
+`IssueReport` (migration `20261122164800_attention_reports`) carries a
+hand-written CHECK, `IssueReport_exactly_one_target`
+(`num_nonnulls("bookCopyId", "resourceId") = 1`: a report names a copy or a
+resource, never both or neither), and two partial unique indexes,
+`IssueReport_one_open_per_copy` (`"userId", "bookCopyId"`) and
+`IssueReport_one_open_per_resource` (`"userId", "resourceId"`), both
+`WHERE status = 'open'`: one open report per student and target. Prisma models
+none of these, and no later migration or generator may drop them. Check every
+generated migration for a `DROP` of `no_overlapping_bookings`,
+`BorrowRequest_one_pending_per_title`, `IssueReport_exactly_one_target`,
+`IssueReport_one_open_per_copy` or `IssueReport_one_open_per_resource` before
+applying it.
 
 ---
 
@@ -107,8 +120,8 @@ Check every generated migration for a `DROP` of either before applying it.
 
 Every write that changes what an admin page shows publishes an event once it
 has committed, and a refused write publishes nothing. Topics: `requests`,
-`metrics`, `bookings`, `resources`, `fines`, `catalogue`, `students`. The
-helpers in `src/lib/events.ts`:
+`metrics`, `bookings`, `resources`, `fines`, `catalogue`, `students`,
+`attention`. The helpers in `src/lib/events.ts`:
 
 - `publish(event)`: the raw call; the request events (`request.created`,
   `request.decided`, `request.cancelled`, `request.expired`) use it, on
@@ -120,21 +133,34 @@ helpers in `src/lib/events.ts`:
   `bookings` and `metrics`.
 - `publishResourceChange()`: a resource added, edited, taken offline or brought
   back (`resource.changed`); `resources` and `metrics`.
-- `publishFineChange()`: a fine marked paid, adjusted or waived
-  (`fine.changed`); `fines`.
+- `publishFineChange()`: a fine marked paid, adjusted or waived, a dispute opened
+  on it, or a dispute upheld (`fine.changed`); `fines`. Opening or settling a
+  dispute also publishes `publishAttentionChange()` right after it.
 - `publishCatalogueChange(extra)`: a book added or edited, copies added, a copy
   to maintenance, lost from the shelf or restored (`catalogue.changed`);
   `catalogue` plus whatever `extra` topics the change also moves. A copy lost
-  while on loan passes `['fines', 'metrics']`; a restore that waived the
-  replacement fine passes `['fines']`.
+  while on loan passes `['fines', 'metrics', 'attention']` (closing the loan
+  removes its overdue item from the queue); a restore that waived the
+  replacement fine passes `['fines']`, and `['fines', 'attention']` when it also
+  closed a student's dispute of that fine.
 - `publishStudentChange()`: a manual reliability adjustment
   (`student.changed`); `students`.
 - `publishLoanChange(pastDue)`: a student's return or renewal (`loan.changed`);
   `metrics` and `catalogue` (a renewal's new due date shows on the Catalogue and
-  student pages), and `fines` as well when the loan was past due (its accruing
-  row on the Fines page turns into a stored fine). It replaced `publishActivity()`
-  (and, for a past-due renewal, `publishFineChange()`) in `returnLoan` and
+  student pages), and `fines` and `attention` as well when the loan was past due
+  (its accruing row on the Fines page turns into a stored fine, and its overdue
+  item leaves the Needs attention queue). It replaced `publishActivity()` (and,
+  for a past-due renewal, `publishFineChange()`) in `returnLoan` and
   `renewLoan`.
+- `publishAttentionChange()`: the Needs attention queue changed
+  (`attention.changed`, topic `attention`): a reminder or escalation sent, a fine
+  dispute opened or settled, a problem report filed, confirmed or dismissed, a
+  return that carried a report. A service publishes it once, after the commit
+  and after the notice's email outcome has been written (see *Notices, Disputes
+  and Reports* below), so the console's refetch sees the true "emailed" or "not
+  emailed"; a refused write publishes nothing. `loan.changed` carries `attention`
+  when the loan was past due; a payment publishes `fine.changed` only, since a
+  disputed fine cannot be paid and so a payment never moves the queue.
 
 `GET /admin/events` streams them to the admin console. A new mutation the
 console should see must publish one, with a test using `recordEvents()` from
@@ -169,8 +195,95 @@ console should see must publish one, with a test using `recordEvents()` from
   request ones are `timestamptz`. Prisma binds a JS `Date` as UTC wall-clock
   text, so a raw query against a plain-`timestamp` column must cast it
   `${now}::timestamp`, never `::timestamptz`, which the session's time zone would
-  shift by hours. `fineRules`, `adminFineService` and `adminCopyService` rely on
-  it.
+  shift by hours. `fineRules`, `adminFineService`, `adminCopyService` and
+  `adminAttentionService` rely on it.
+
+---
+
+## Notices, Disputes and Reports
+
+A **notice** is the library's message to one student (`Notice`; kinds
+`overdue_reminder`, `overdue_escalation`, `dispute_outcome`, `report_outcome`),
+shown for 7 days (`REQUEST_OUTCOME_VISIBLE_DAYS`), at most 20, by
+`GET /notices/me`. Everything that writes one (`adminAttentionService` for a
+reminder or escalation, `disputeService`, `reportService`, and
+`adminFineService.adjustFine` and `adminCopyService.restoreCopy` when they close
+a dispute) follows the same order:
+
+1. **The notice is created in the action's transaction** (`createNotice(tx, ...)`),
+   so it commits or rolls back with the action. Its email status starts
+   `skipped`.
+2. **`deliverNotice(notice)` runs once, after the commit.** It emails the student
+   (awaited, bounded by the mailer's 5 seconds, never throws) and writes the
+   outcome (`sent`, `failed` or `skipped`, and `emailedAt`) to the notice.
+3. **Then publish**, once: `publishAttentionChange()` plus whatever fine,
+   catalogue or loan event the action moves (a restore that closes a dispute has
+   no separate attention event: its `catalogue.changed` carries the `attention`
+   topic). A refused action writes, sends and publishes nothing, and a repeated
+   click sends nothing extra because its conditional update or rule refuses it
+   first. Once the notice has committed nothing refuses the action (a reminder
+   still answers 200 if the student returned the book during the email), so read
+   whatever the answer needs inside the transaction, not after it.
+4. **An email problem never fails, blocks or half-applies an action.** Never
+   await the mailer inside a transaction, and never let its failure change the
+   answer.
+
+Conventions the new services follow:
+
+- **Conditional updates with specific 409s.** A status change is one UPDATE with
+  its precondition in the WHERE (a dispute: the fine is `pending` or `adjusted`
+  with `disputedAt` null; a payment adds `disputedAt IS NULL`; a dispute or a
+  report closes `WHERE status = 'open'`), never read-then-write. When nothing
+  matched, read the row again and say why, in a message that names the reason.
+- **Lock order: the fine row, then the dispute row.** `adjustFine`, `upholdDispute`
+  and `waiveReplacementFine` lock the fine `FOR NO KEY UPDATE` first; opening a
+  dispute updates the fine before inserting the dispute. Keep that order, or two
+  of these can wait on each other in a circle. `closeReport` must take no loan,
+  copy or book lock: a student's return takes the loan's lock and then writes a
+  report row, so a closing step that locked them would wait in a circle (`40P01`,
+  a 500).
+- **A unique violation aborts a Postgres transaction.** Where the transaction has
+  to go on (`returnLoan` with a report, when the student already has an open report
+  on that copy), write with `createMany({ data, skipDuplicates: true })` and
+  read the count, never insert and catch. Where the violation is the answer
+  (`createDispute`, `createResourceReport`), let the insert fail and map it (Prisma
+  P2002, or P2039 with SQLSTATE 23505 in its message) to the 409.
+- **Confirming a report runs the action first, then closes it.** `confirmReport`
+  calls the Catalogue or Resources service (their own transactions and events),
+  then one small transaction closes the report and writes the notice. If another
+  librarian resolves the report in between, the second confirm answers a bare 409
+  "This report was already resolved." while its action stays done (a known limit;
+  the README's *Problem reports* says how to undo it). A report never charges
+  anyone: confirm-as-lost calls `markCopyLost` with no charge fields.
+- **A new `/admin` route** answers 401 without a token and 403 for a student; the
+  student routes (`/notices/me`, `/fines/:id/dispute`, `/reports`) touch only the
+  caller's own rows, and another student's id is a 404 (a resource the student
+  never booked is a 403).
+
+**Email is optional and never fails an action.** The mailer (`src/lib/mailer.ts`):
+
+- **Off unless configured.** `BREVO_API_KEY` and `MAIL_FROM` must both be set
+  (`MAIL_FROM_NAME` defaults to "SmartLib"); otherwise `sendEmail` answers
+  `skipped` with no network call. Settings are read from `process.env` on every
+  call. `isEmailConfigured()` feeds `emailEnabled` in `GET /admin/attention`.
+- **Brevo's HTTPS API**, through Node's built-in `fetch` (Render's free plan blocks
+  SMTP, and there is no new dependency). The wait is 5 seconds (`MAIL_TIMEOUT_MS`)
+  and there is no retry; a non-2xx answer, a network error or a timeout is
+  `failed`.
+- **It never throws and never logs a body, a recipient or the key** (only an HTTP
+  status or an error name). Do not add a log line that does. `BREVO_API_KEY` is a
+  secret: an environment variable only, never committed, printed or logged.
+- **Skips by address.** The seed's demo accounts (`DEMO_EMAIL_PATTERN`:
+  `aditi.sharma@thapar.edu`, `seed.student<n>@thapar.edu`) are always `skipped`,
+  and when `MAIL_ALLOWED_DOMAINS` (comma-separated) is set so is every address
+  outside those domains (an exact match on the part after the `@`: a subdomain
+  does not match).
+- **Tests never send.** Inject a fake with `setMailTransport(...)` and restore it
+  with `setMailTransport(null)`; with none injected and `NODE_ENV=test` or `VITEST`
+  set (Vitest sets it whatever `NODE_ENV` the shell has) the mailer is `skipped`.
+- **Only this slice's events send email:** a reminder, an escalation, a dispute
+  resolved and a report resolved. Do not email from anything else without being
+  asked.
 
 ---
 
@@ -188,7 +301,8 @@ backend/
 │   ├── middleware/       # JWT auth, role validation (student/admin), error handlers
 │   └── lib/
 │       ├── prisma.ts     # PrismaClient singleton with @prisma/adapter-pg
-│       └── aiClient.ts   # Isolated Axios/fetch client calling FastAPI AI backend
+│       ├── aiClient.ts   # Isolated Axios/fetch client calling FastAPI AI backend
+│       └── mailer.ts     # Optional Brevo email sender; never throws, never logs a body or the key
 ├── prisma/
 │   ├── schema.prisma     # Prisma data model
 │   ├── migrations/       # Migration SQL history

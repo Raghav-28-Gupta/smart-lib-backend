@@ -13,6 +13,12 @@ export const REQUEST_OUTCOME_VISIBLE_DAYS = 7
 // A borrow request holds its copy this long while it waits for a librarian.
 export const BORROW_REQUEST_HOURS = 24
 
+// A student may report a seat or room they have booked while one of their bookings
+// of it started within the last REPORT_BOOKING_LOOKBACK_DAYS days or starts within
+// the next REPORT_BOOKING_LOOKAHEAD_HOURS hours (reportService.ts).
+export const REPORT_BOOKING_LOOKBACK_DAYS = 7
+export const REPORT_BOOKING_LOOKAHEAD_HOURS = 24
+
 // The demo accounts the seed creates. They are placeholders, never real
 // inboxes, so the mailer (lib/mailer.ts) never sends to them.
 export const DEMO_EMAIL_PATTERN = /^(aditi\.sharma|seed\.student\d+)@thapar\.edu$/i

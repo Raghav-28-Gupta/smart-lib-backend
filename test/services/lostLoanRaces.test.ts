@@ -313,4 +313,138 @@ describe('a loan changed while a write on it was waiting', () => {
     expect(await finesOf(loan.id)).toEqual([{ reason: 'overdue', amount: OVERDUE }])
     expect(recorder.events).toEqual([])
   }, 60_000)
+
+  const damaged = { report: { category: 'damaged', note: 'Pages torn out' } }
+  const reportsOn = (copyId: string) => prisma.issueReport.findMany({ where: { bookCopyId: copyId } })
+
+  it('a return with a report that waited for a loss is refused and creates no report', async () => {
+    const { token, user: student } = await seedUser()
+    const { copy, loan } = await seedOverdueLoan(student.id)
+    recorder = recordEvents()
+
+    const res = await writeBlockedThenCompete(
+      loan.id,
+      () => request(app).post(`/loans/${loan.id}/return`).set(auth(token)).send(damaged),
+      (tx) => loseInTx(tx, loan),
+    )
+
+    expect(res.status).toBe(409)
+    expect(res.body).toEqual({ error: LOST_LOAN })
+    expect(await loanOf(loan.id)).toMatchObject({ status: 'lost', returnedAt: null })
+    expect(await copyStatus(copy.id)).toBe('lost')
+    // No report: the librarian's loss won the loan, and the student's report went with the refused return.
+    expect(await prisma.issueReport.count()).toBe(0)
+    expect(await finesOf(loan.id)).toEqual([
+      { reason: 'lost', amount: REPLACEMENT },
+      { reason: 'overdue', amount: OVERDUE },
+    ])
+    expect(recorder.events).toEqual([])
+  }, 60_000)
+
+  it('a return with a report that waited for the same student\'s other return is refused and leaves the one report', async () => {
+    const { token, user: student } = await seedUser()
+    const { copy, loan } = await seedOverdueLoan(student.id)
+    recorder = recordEvents()
+
+    // What the winning return writes, done by the test: the loan, its fine, the report, the copy.
+    const res = await writeBlockedThenCompete(
+      loan.id,
+      () => request(app).post(`/loans/${loan.id}/return`).set(auth(token)).send(damaged),
+      async (tx) => {
+        await tx.loan.update({ where: { id: loan.id }, data: { status: 'returned', returnedAt: new Date() } })
+        await tx.fine.create({ data: { userId: student.id, relatedLoanId: loan.id, amount: OVERDUE, reason: 'overdue' } })
+        await tx.issueReport.create({ data: { userId: student.id, bookCopyId: copy.id, category: 'other', note: 'The winner' } })
+        await tx.bookCopy.update({ where: { id: copy.id }, data: { status: 'available' } })
+      },
+    )
+
+    expect(res.status).toBe(409)
+    expect(res.body).toEqual({ error: 'This loan has already been returned.' })
+    expect(await reportsOn(copy.id)).toEqual([expect.objectContaining({ note: 'The winner', category: 'other' })])
+    expect(await finesOf(loan.id)).toEqual([{ reason: 'overdue', amount: OVERDUE }])
+    expect(recorder.events).toEqual([])
+  }, 60_000)
+
+  it('a return whose report meets the same student\'s report committing at that moment still succeeds and keeps it', async () => {
+    const { token, user: student } = await seedUser()
+    const { copy, loan } = await seedOverdueLoan(student.id)
+    recorder = recordEvents()
+
+    // The competing report is written but not committed, so the return cannot see it and
+    // goes on to write its own: that write waits on the unique key, and when the other
+    // transaction commits it must be skipped, not refused. A violation would abort the
+    // return's whole transaction.
+    let pending: Promise<request.Response> | undefined
+    try {
+      await prisma.$transaction(
+        async (tx) => {
+          await tx.issueReport.create({ data: { userId: student.id, bookCopyId: copy.id, category: 'missing_pages', note: 'Landed first' } })
+          pending = Promise.resolve(request(app).post(`/loans/${loan.id}/return`).set(auth(token)).send({ report: { category: 'damaged', note: 'Landed second' } }))
+          await waitUntilAWriterIsBlocked()
+        },
+        { timeout: 30_000, maxWait: 30_000 },
+      )
+    } finally {
+      await pending
+    }
+    const res = await pending!
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ id: loan.id, status: 'returned' })
+    expect(await loanOf(loan.id)).toMatchObject({ status: 'returned' })
+    expect(await copyStatus(copy.id)).toBe('available')
+    expect(await finesOf(loan.id)).toEqual([{ reason: 'overdue', amount: OVERDUE }])
+    expect(await reportsOn(copy.id)).toEqual([expect.objectContaining({ note: 'Landed first', category: 'missing_pages' })])
+    // The return is announced; the report that was written by someone else is not this return's to announce.
+    expect(recorder.events.map((e) => e.type)).toEqual(['loan.changed'])
+  }, 60_000)
+})
+
+// --- A copy returned with a report -------------------------------------------------
+// The report is written inside the return's transaction, after the loan was won, so
+// whatever beats the return to the loan (a librarian's loss, the student's own other
+// request) leaves no report behind, and a report the student already has open on the
+// copy never turns the return into an error.
+
+describe('a copy returned with a report while another change lands', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+  })
+
+  const ALREADY_RETURNED = 'This loan has already been returned.'
+  const typesPublished = (events: Array<{ type: string }>) => events.map((e) => e.type).sort()
+  const returnWithReport = (token: string, loanId: string, note: string) =>
+    request(app).post(`/loans/${loanId}/return`).set(auth(token)).send({ report: { category: 'damaged', note } })
+  const reportsOn = (copyId: string) => prisma.issueReport.findMany({ where: { bookCopyId: copyId } })
+
+  it('two simultaneous returns with a report create exactly one report and one 409', async () => {
+    const { user: student, token } = await seedUser()
+    await warmPool()
+
+    for (let round = 0; round < ROUNDS; round++) {
+      const { copy, loan } = await seedOverdueLoan(student.id)
+      recorder?.stop()
+      recorder = recordEvents()
+
+      const [first, second] = await together(
+        round,
+        () => returnWithReport(token, loan.id, 'First'),
+        () => returnWithReport(token, loan.id, 'Second'),
+      )
+
+      expect([first.status, second.status].sort(), `round ${round}`).toEqual([200, 409])
+      const [winner, loser] = first.status === 200 ? [first, second] : [second, first]
+      expect(winner.body, `round ${round}`).toMatchObject({ id: loan.id, status: 'returned' })
+      expect(loser.body, `round ${round}`).toEqual({ error: ALREADY_RETURNED })
+      // One return, so one report (the winner's), one overdue charge, one announcement of each.
+      const note = first.status === 200 ? 'First' : 'Second'
+      expect(await reportsOn(copy.id), `round ${round}`).toEqual([expect.objectContaining({ userId: student.id, status: 'open', note })])
+      expect(await finesOf(loan.id)).toEqual([{ reason: 'overdue', amount: OVERDUE }])
+      expect(await copyStatus(copy.id)).toBe('available')
+      expect(typesPublished(recorder.events), `round ${round}`).toEqual(['attention.changed', 'loan.changed'])
+    }
+  }, 120_000)
 })

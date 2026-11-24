@@ -89,6 +89,7 @@ interface ListedFine {
   date: string
   note: string | null
   recordedBy: string | null
+  dispute: { id: string; reason: string; createdAt: string } | null
   canSettle: boolean
 }
 
@@ -131,6 +132,7 @@ describe('admin fines list', () => {
           date: createdAt.toISOString(),
           note: null,
           recordedBy: null,
+          dispute: null,
           canSettle: true,
         },
       ],
@@ -174,6 +176,7 @@ describe('admin fines list', () => {
         date: dueAt.toISOString(),
         note: null,
         recordedBy: null,
+        dispute: null,
         canSettle: false,
       },
     ])
@@ -672,6 +675,7 @@ describe('mark a fine paid', () => {
       date: fine.createdAt.toISOString(),
       note: null,
       recordedBy: 'Priya Menon',
+      dispute: null,
       canSettle: false,
     })
     const row = await stored(fine.id)
@@ -930,6 +934,7 @@ describe('waive or adjust a fine', () => {
       date: fine.createdAt.toISOString(),
       note: 'Hardship',
       recordedBy: 'Priya Menon',
+      dispute: null,
       canSettle: true,
     })
     const row = await stored(fine.id)
@@ -1108,5 +1113,315 @@ describe('waive or adjust a fine', () => {
     expect(recorder.events).toEqual([FINE_CHANGED, FINE_CHANGED])
     expect((await adjust(token, fine.id, { amount: 0, reason: 'Again' })).status).toBe(409) // waived
     expect(recorder.events).toEqual([FINE_CHANGED, FINE_CHANGED])
+  })
+})
+
+// --- Disputed fines -------------------------------------------------------------------
+
+const BEING_DISPUTED = 'This fine is being disputed. Resolve the dispute first.'
+
+/** Opens a dispute the way POST /fines/:id/dispute leaves the rows: the marker on the fine, and the dispute. */
+async function openDispute(fineId: string, userId: string, reason = 'I returned it on time', createdAt = new Date()) {
+  await prisma.fine.update({ where: { id: fineId }, data: { disputedAt: createdAt } })
+  return prisma.fineDispute.create({ data: { fineId, userId, reason, createdAt } })
+}
+
+describe("disputed fines on the librarian's list", () => {
+  beforeEach(resetDb)
+  afterEach(() => vi.restoreAllMocks())
+
+  it('a disputed fine lists as disputed with its dispute, and can still be waived or adjusted', async () => {
+    const { token: admin, user: librarian } = await seedUser('admin', { name: 'Priya Menon' })
+    const { user: student } = await seedUser('student', { name: 'Asha Rao', email: 'asha@test.com' })
+    const opened = new Date(Date.now() - 3 * HOUR_MS)
+    const outstanding = await seedFineOnLoan(student.id, { amount: 150, createdAt: new Date(Date.now() - 2 * DAY_MS) }, 'Refactoring')
+    const adjusted = await seedFineOnLoan(
+      student.id,
+      { status: 'adjusted', amount: 50, originalAmount: 150, adjustedById: librarian.id, adjustReason: 'Hardship', createdAt: new Date(Date.now() - 3 * DAY_MS) },
+      'Clean Code',
+    )
+    const dispute = await openDispute(outstanding.id, student.id, 'I returned it on time', opened)
+    const adjustedDispute = await openDispute(adjusted.id, student.id, 'Still too high', opened)
+
+    const res = await list(admin)
+
+    expect(res.status).toBe(200)
+    expect(res.body.fines).toEqual([
+      {
+        id: outstanding.id,
+        kind: 'fine',
+        student: { id: student.id, name: 'Asha Rao', email: 'asha@test.com' },
+        reason: 'overdue',
+        item: 'Refactoring',
+        amount: 150,
+        originalAmount: 150,
+        status: 'disputed',
+        date: outstanding.createdAt.toISOString(),
+        note: null,
+        recordedBy: null,
+        dispute: { id: dispute.id, reason: 'I returned it on time', createdAt: opened.toISOString() },
+        canSettle: true,
+      },
+      {
+        id: adjusted.id,
+        kind: 'fine',
+        student: { id: student.id, name: 'Asha Rao', email: 'asha@test.com' },
+        reason: 'overdue',
+        item: 'Clean Code',
+        amount: 50,
+        originalAmount: 150,
+        status: 'disputed',
+        date: adjusted.createdAt.toISOString(),
+        note: 'Hardship',
+        recordedBy: 'Priya Menon',
+        dispute: { id: adjustedDispute.id, reason: 'Still too high', createdAt: opened.toISOString() },
+        canSettle: true,
+      },
+    ])
+    // Only these three keys of a dispute leave the server.
+    expect(Object.keys(res.body.fines[0].dispute).sort()).toEqual(['createdAt', 'id', 'reason'])
+  })
+
+  it('a disputed fine has canSettle true and its dispute shows on the row', async () => {
+    const { token: admin, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const outstanding = await seedFineOnLoan(student.id, { amount: 90 })
+    const adjusted = await seedFineOnLoan(student.id, { status: 'adjusted', amount: 30, originalAmount: 60, adjustedById: librarian.id, adjustReason: 'Hardship' })
+    const calm = await seedFineOnLoan(student.id, { amount: 10 })
+    const paid = await seedFineOnLoan(student.id, { status: 'paid', amount: 5, paidRecordedById: librarian.id })
+    const first = await openDispute(outstanding.id, student.id, 'Not mine')
+    const second = await openDispute(adjusted.id, student.id, 'Still too high')
+
+    const res = await list(admin)
+
+    const row = (id: string) => (res.body.fines as ListedFine[]).find((f) => f.id === id)!
+    // The console offers Waive / adjust when canSettle is true and hides Mark paid itself
+    // when a dispute is set, so canSettle follows the stored status (pending or adjusted),
+    // not the derived "disputed".
+    expect(row(outstanding.id)).toMatchObject({ status: 'disputed', canSettle: true, dispute: { id: first.id, reason: 'Not mine' } })
+    expect(row(adjusted.id)).toMatchObject({ status: 'disputed', canSettle: true, dispute: { id: second.id, reason: 'Still too high' } })
+    expect(row(calm.id)).toMatchObject({ status: 'outstanding', canSettle: true, dispute: null })
+    expect(row(paid.id)).toMatchObject({ status: 'paid', canSettle: false, dispute: null })
+  })
+
+  it('a fine with no dispute, and an accruing row, have dispute null', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const { copy } = await seedBook()
+    await seedLoan(student.id, copy.id, new Date(Date.now() - 2 * DAY_MS - HOUR_MS))
+    await seedFineOnLoan(student.id, { status: 'pending' })
+
+    const res = await list(admin)
+
+    expect((res.body.fines as ListedFine[]).map((f) => [f.kind, f.dispute]).sort()).toEqual([
+      ['accruing', null],
+      ['fine', null],
+    ])
+  })
+
+  it('the Disputed filter returns only disputed fines and Outstanding excludes them', async () => {
+    const { token: admin, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser('student', { name: 'Asha Rao' })
+    const { user: other } = await seedUser('student', { name: 'Ben Carter' })
+    const { copy } = await seedBook()
+    const accruing = await seedLoan(student.id, copy.id, new Date(Date.now() - 2 * DAY_MS - HOUR_MS))
+    const outstanding = await seedFineOnLoan(student.id, { status: 'pending' })
+    const adjusted = await seedFineOnLoan(student.id, { status: 'adjusted', amount: 10, originalAmount: 40, adjustedById: librarian.id, adjustReason: 'Hardship' })
+    const paid = await seedFineOnLoan(student.id, { status: 'paid', paidRecordedById: librarian.id })
+    const waived = await seedFineOnLoan(student.id, { status: 'waived', amount: 0, originalAmount: 50, adjustedById: librarian.id, adjustReason: 'Library error' })
+    const disputedOutstanding = await seedFineOnLoan(student.id, { status: 'pending' })
+    const disputedAdjusted = await seedFineOnLoan(student.id, { status: 'adjusted', amount: 20, originalAmount: 60, adjustedById: librarian.id, adjustReason: 'Hardship' })
+    const othersDisputed = await seedFineOnLoan(other.id, { status: 'pending' })
+    await openDispute(disputedOutstanding.id, student.id)
+    await openDispute(disputedAdjusted.id, student.id)
+    await openDispute(othersDisputed.id, other.id)
+
+    const byStatus = async (status: string, extra = '') => {
+      const res = await list(admin, `?status=${status}${extra}`)
+      expect(res.status).toBe(200)
+      return { ids: ids(res).sort(), total: res.body.total }
+    }
+
+    expect(await byStatus('disputed')).toEqual({ ids: [disputedOutstanding.id, disputedAdjusted.id, othersDisputed.id].sort(), total: 3 })
+    // A disputed fine is not also listed as outstanding or adjusted.
+    expect(await byStatus('outstanding')).toEqual({ ids: [outstanding.id], total: 1 })
+    expect(await byStatus('adjusted')).toEqual({ ids: [adjusted.id], total: 1 })
+    expect(await byStatus('paid')).toEqual({ ids: [paid.id], total: 1 })
+    expect(await byStatus('waived')).toEqual({ ids: [waived.id], total: 1 })
+    expect(await byStatus('accruing')).toEqual({ ids: [accruing.id], total: 1 })
+    // The filter combines with the search and with paging.
+    expect(await byStatus('disputed', '&search=ben')).toEqual({ ids: [othersDisputed.id], total: 1 })
+    const firstPage = await list(admin, '?status=disputed&pageSize=2')
+    const secondPage = await list(admin, '?status=disputed&pageSize=2&page=2')
+    expect(firstPage.body.fines).toHaveLength(2)
+    expect(secondPage.body.fines).toHaveLength(1)
+    expect(secondPage.body.total).toBe(3)
+    // The unfiltered list still has every row once, each disputed one showing as disputed.
+    const all = await list(admin)
+    // The accruing loan, five stored fines of the student's and one of the other's, and the two disputed ones.
+    expect(all.body.total).toBe(8)
+    expect((all.body.fines as ListedFine[]).filter((f) => f.status === 'disputed')).toHaveLength(3)
+    expect((all.body.fines as ListedFine[]).filter((f) => f.status === 'outstanding' || f.status === 'adjusted')).toHaveLength(2)
+  })
+
+  it("the student's own list in the console carries the dispute too", async () => {
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 80 })
+    const dispute = await openDispute(fine.id, student.id, 'Not my book')
+
+    const rows = await listFinesForStudent(student.id, 50)
+
+    expect(rows).toEqual([
+      expect.objectContaining({ id: fine.id, status: 'disputed', canSettle: true, dispute: { id: dispute.id, reason: 'Not my book', createdAt: dispute.createdAt } }),
+    ])
+  })
+
+  it('a resolved dispute no longer shows: the fine lists by its own status again', async () => {
+    const { token: admin, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 80 })
+    // How a resolution leaves the rows: the marker cleared, the dispute closed.
+    await prisma.fineDispute.create({
+      data: { fineId: fine.id, userId: student.id, reason: 'Wrong', status: 'upheld', resolutionNote: 'Checked', resolvedById: librarian.id, resolvedAt: new Date() },
+    })
+
+    const res = await list(admin)
+
+    expect(res.body.fines).toEqual([expect.objectContaining({ id: fine.id, status: 'outstanding', dispute: null, canSettle: true })])
+  })
+
+  it('the disputed list agrees when the database session is not on UTC', async () => {
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 80, createdAt: new Date(Date.now() - 2 * DAY_MS) })
+    const opened = new Date(Date.now() - 5 * HOUR_MS)
+    await openDispute(fine.id, student.id, 'Wrong', opened)
+
+    // Every query the service makes runs on Kolkata time (+5:30), as in the accruing test above.
+    const realQueryRaw = prisma.$queryRaw
+    vi.spyOn(prisma, '$queryRaw').mockImplementation(((sql: Prisma.Sql) =>
+      prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe(`SET LOCAL TIME ZONE 'Asia/Kolkata'`)
+        return realQueryRaw.call(tx, sql)
+      })) as never)
+
+    const result = await listFines({ page: 1, pageSize: 25, status: 'disputed' })
+
+    expect(result.fines.map((f) => [f.id, f.status, f.dispute?.createdAt.getTime(), f.date.getTime()])).toEqual([
+      [fine.id, 'disputed', opened.getTime(), fine.createdAt.getTime()],
+    ])
+    expect(result.total).toBe(1)
+  })
+})
+
+describe('mark a disputed fine paid', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+  })
+
+  it('Mark paid on a disputed fine is 409 with the disputed message and the fine is unchanged', async () => {
+    const { token } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+    const dispute = await openDispute(fine.id, student.id)
+    const before = await stored(fine.id)
+    recorder = recordEvents()
+
+    const res = await pay(token, fine.id, { amount: 150 })
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe(BEING_DISPUTED)
+    // Not a single column moved, and the dispute is still open.
+    expect(await stored(fine.id)).toEqual(before)
+    expect(await prisma.fineDispute.findUniqueOrThrow({ where: { id: dispute.id } })).toMatchObject({ status: 'open' })
+    expect(recorder.events).toEqual([])
+  })
+
+  it('an adjusted fine that is disputed is refused the same way, and the disputed message beats the changed-amount one', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { status: 'adjusted', amount: 50, originalAmount: 150, adjustedById: librarian.id, adjustReason: 'Hardship' })
+    await openDispute(fine.id, student.id)
+
+    const sameAmount = await pay(token, fine.id, { amount: 50 })
+    // The amount the librarian saw is stale as well; the dispute is said first.
+    const staleAmount = await pay(token, fine.id, { amount: 150 })
+
+    expect(sameAmount.status).toBe(409)
+    expect(sameAmount.body.error).toBe(BEING_DISPUTED)
+    expect(staleAmount.status).toBe(409)
+    expect(staleAmount.body.error).toBe(BEING_DISPUTED)
+    expect(await stored(fine.id)).toMatchObject({ status: 'adjusted', amount: 50, paidAt: null, paidRecordedById: null })
+  })
+
+  it('paid and waived are still said first', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const paid = await seedFineOnLoan(student.id, { status: 'paid', amount: 20, paidRecordedById: librarian.id })
+    const waived = await seedFineOnLoan(student.id, { status: 'waived', amount: 0, originalAmount: 40, adjustedById: librarian.id, adjustReason: 'x' })
+    // Rows that should not exist together (a marker on a settled fine), to pin the order of the refusals.
+    await prisma.fine.updateMany({ where: { id: { in: [paid.id, waived.id] } }, data: { disputedAt: new Date() } })
+
+    const paidRes = await pay(token, paid.id, { amount: 20 })
+    const waivedRes = await pay(token, waived.id, { amount: 0 })
+
+    expect(paidRes.body.error).toBe('This fine is already paid.')
+    expect(waivedRes.body.error).toBe('This fine was waived.')
+  })
+
+  it('a fine whose dispute was resolved (marker cleared) can be paid', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const fine = await seedFineOnLoan(student.id, { amount: 150 })
+    await prisma.fineDispute.create({
+      data: { fineId: fine.id, userId: student.id, reason: 'Wrong', status: 'upheld', resolutionNote: 'Checked', resolvedById: librarian.id, resolvedAt: new Date() },
+    })
+
+    const res = await pay(token, fine.id, { amount: 150 })
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ status: 'paid', dispute: null, canSettle: false })
+  })
+
+  // A disputed fine is still settled by the adjust route, but a request must name the
+  // dispute the librarian saw, and the adjustment closes it (waived at 0, adjusted
+  // otherwise). The refusals, the notices and the races are covered in
+  // test/routes/adminDisputes.test.ts and test/services/disputeRaces.test.ts.
+  it('a disputed fine can be adjusted or waived only by a request that names its dispute, which the adjustment closes', async () => {
+    const { token, user: librarian } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const lowered = await seedFineOnLoan(student.id, { amount: 150 })
+    const waived = await seedFineOnLoan(student.id, { amount: 80 })
+    const loweredDispute = await openDispute(lowered.id, student.id)
+    const waivedDispute = await openDispute(waived.id, student.id)
+
+    // Not naming the dispute is refused, and nothing changes.
+    const unnamed = await adjust(token, lowered.id, { amount: 50, reason: 'Hardship' })
+    expect(unnamed.status).toBe(409)
+    expect(unnamed.body.error).toBe('This fine was just disputed. Read the dispute before changing the fine.')
+    expect(await stored(lowered.id)).toMatchObject({ status: 'pending', amount: 150, originalAmount: null })
+    expect((await stored(lowered.id)).disputedAt).not.toBeNull()
+
+    const lowerRes = await adjust(token, lowered.id, { amount: 50, reason: 'Hardship', disputeId: loweredDispute.id })
+    const waiveRes = await adjust(token, waived.id, { amount: 0, reason: 'Library error', disputeId: waivedDispute.id })
+
+    expect(lowerRes.status).toBe(200)
+    expect(lowerRes.body).toMatchObject({ amount: 50, originalAmount: 150, note: 'Hardship', status: 'adjusted', dispute: null, canSettle: true })
+    expect(waiveRes.status).toBe(200)
+    expect(waiveRes.body).toMatchObject({ amount: 0, originalAmount: 80, note: 'Library error', status: 'waived', dispute: null, canSettle: false })
+    expect(await stored(lowered.id)).toMatchObject({ status: 'adjusted', amount: 50, originalAmount: 150, disputedAt: null })
+    expect(await stored(waived.id)).toMatchObject({ status: 'waived', amount: 0, originalAmount: 80, disputedAt: null })
+    expect(await prisma.fineDispute.findUniqueOrThrow({ where: { id: loweredDispute.id } })).toMatchObject({
+      status: 'adjusted',
+      resolutionNote: 'Hardship',
+      resolvedById: librarian.id,
+    })
+    expect(await prisma.fineDispute.findUniqueOrThrow({ where: { id: waivedDispute.id } })).toMatchObject({
+      status: 'waived',
+      resolutionNote: 'Library error',
+      resolvedById: librarian.id,
+    })
   })
 })

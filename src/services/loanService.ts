@@ -9,7 +9,7 @@
 // them got there first.
 import { LOAN_PERIOD_DAYS, MAX_RENEWALS } from '../config/constants'
 import type { Loan, LoanStatus, Prisma } from '../generated/prisma/client'
-import { publishLoanChange } from '../lib/events'
+import { publishAttentionChange, publishLoanChange } from '../lib/events'
 import { ConflictError, ForbiddenError, NotFoundError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
 import { overdueFineAmount } from './fineRules'
@@ -149,12 +149,35 @@ export async function renewLoan(userId: string, loanId: string): Promise<LoanDto
   return toLoanDto(updated, now)
 }
 
-export async function returnLoan(userId: string, loanId: string): Promise<LoanDto> {
+/** What a student can say is wrong with the copy they are returning (already validated: the note is trimmed, at most 300 characters, and required for `other`). */
+export interface ReturnReportInput {
+  category: 'damaged' | 'missing_pages' | 'other'
+  note?: string
+}
+
+/**
+ * Returns the loan, and files the student's `report` of a problem with the copy when
+ * they made one. The report is written in the return's own transaction, after the
+ * loan was won and before the copy goes back on the shelf, so the return and the
+ * report succeed or fail together: a refused return (closed loan) leaves no report,
+ * and a failure further on rolls it back.
+ *
+ * A student who still has an open report on this copy keeps it: the new one is
+ * dropped by the insert itself (ON CONFLICT DO NOTHING on the one-open-report-per-copy
+ * index) and the return goes on. It is not inserted and caught: a unique violation
+ * would abort the whole transaction and the return with it.
+ *
+ * `attention.changed` is published once, after the commit, only when a report was
+ * actually created; the return's own `loan.changed` is published either way. Both
+ * are published even if the waitlist hand-off after the commit throws (the error
+ * still propagates).
+ */
+export async function returnLoan(userId: string, loanId: string, report?: ReturnReportInput): Promise<LoanDto> {
   const loan = await getOwnedActiveLoan(userId, loanId)
   const now = new Date()
 
   // The loan before the copy, the order a librarian's loss changes them in, so the two never wait on each other.
-  const { updated, wasPastDue } = await prisma.$transaction(async (tx) => {
+  const { updated, wasPastDue, reported } = await prisma.$transaction(async (tx) => {
     const current = await lockLoan(tx, loan.id)
     const { count } = await tx.loan.updateMany({
       where: { id: loan.id, status: 'active' },
@@ -166,12 +189,28 @@ export async function returnLoan(userId: string, loanId: string): Promise<LoanDt
     if (fineAmount > 0) {
       await tx.fine.create({ data: { userId, relatedLoanId: loan.id, amount: fineAmount, reason: 'overdue' } })
     }
+    let reported = false
+    if (report) {
+      // Stamped with the return's own clock, like the loan. No row written: the student's earlier report on this copy is still open and stands.
+      const { count: written } = await tx.issueReport.createMany({
+        data: { userId, bookCopyId: current.bookCopyId, category: report.category, note: report.note ?? null, createdAt: now },
+        skipDuplicates: true,
+      })
+      reported = written > 0
+    }
     await tx.bookCopy.update({ where: { id: current.bookCopyId }, data: { status: 'available' } })
     const updated = await tx.loan.findUniqueOrThrow({ where: { id: loan.id }, include: { bookCopy: { select: { bookId: true } } } })
-    return { updated, wasPastDue: current.dueAt < now }
+    return { updated, wasPastDue: current.dueAt < now, reported }
   })
 
-  await onBookReturned(loan.bookCopy.bookId, now)
-  publishLoanChange(wasPastDue)
+  try {
+    await onBookReturned(loan.bookCopy.bookId, now)
+  } finally {
+    // The return (and its report) committed even if the waitlist hand-off failed, so the
+    // console must hear of both, as it does after a copy restore. Whether the student is
+    // answered 200 or 500 when the hand-off fails is not decided here.
+    publishLoanChange(wasPastDue)
+    if (reported) publishAttentionChange()
+  }
   return toLoanDto(updated, now)
 }

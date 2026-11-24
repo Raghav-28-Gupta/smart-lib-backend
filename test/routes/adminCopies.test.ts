@@ -3,8 +3,11 @@ import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { app } from '../../src/app'
 import { JWT_SECRET } from '../../src/config/constants'
-import type { CopyStatus } from '../../src/generated/prisma/client'
+import type { CopyStatus, Prisma } from '../../src/generated/prisma/client'
+import { subscribe } from '../../src/lib/events'
+import { setMailTransport, type MailTransport } from '../../src/lib/mailer'
 import { prisma } from '../../src/lib/prisma'
+import { restoreCopy } from '../../src/services/adminCopyService'
 import { resetDb } from '../helpers/db'
 import { recordEvents } from '../helpers/events'
 
@@ -646,6 +649,228 @@ describe('admin copy actions', () => {
       expect((await restore(admin, copy.id, { waiveReplacementCharge: true })).status).toBe(200)
 
       expect(recorder.events).toEqual([{ type: 'catalogue.changed', topics: ['catalogue', 'fines'] }])
+    })
+
+    // A student may dispute the replacement fine. Waiving it on restore waives it for good, so the
+    // open dispute is closed too (as waived, with the restore's reason as the note) and the student
+    // is told, exactly as when a librarian waives the fine on the Fines page.
+    describe('with a dispute on the replacement fine', () => {
+      let savedAllowedDomains: string | undefined
+      beforeEach(() => {
+        savedAllowedDomains = process.env.MAIL_ALLOWED_DOMAINS
+        delete process.env.MAIL_ALLOWED_DOMAINS
+        setMailTransport(null)
+      })
+      afterEach(() => {
+        setMailTransport(null)
+        if (savedAllowedDomains === undefined) delete process.env.MAIL_ALLOWED_DOMAINS
+        else process.env.MAIL_ALLOWED_DOMAINS = savedAllowedDomains
+      })
+
+      /** Injects a fake mail transport; email is then configured and nothing leaves the process. */
+      function fakeTransport(ok = true) {
+        const sendMail = vi.fn<MailTransport['send']>(async () => ({ ok }))
+        setMailTransport({ send: sendMail })
+        return sendMail
+      }
+
+      /** The student disputes through the real route, so the rows are exactly what a dispute leaves. */
+      async function disputeFine(studentToken: string, fineId: string, reason = 'I never lost it') {
+        const res = await request(app).post(`/fines/${fineId}/dispute`).set(auth(studentToken)).send({ reason })
+        expect(res.status).toBe(201)
+        return res.body.id as string
+      }
+      const disputeOf = (id: string) => prisma.fineDispute.findUniqueOrThrow({ where: { id } })
+
+      it('restoring a copy with the replacement waived closes a dispute on that fine as waived and sends the notice', async () => {
+        const { token: admin, user: librarian } = await seedUser('admin', 'Priya Menon')
+        const { token: studentToken, user: student } = await seedUser('student', 'Asha Rao')
+        const { copy, loan } = await lostOnLoan(admin, student.id)
+        const replacement = await lostFineOf(loan.id)
+        const disputeId = await disputeFine(studentToken, replacement.id)
+        // The overdue fine of the same loan is disputed too; the restore does not touch that one.
+        const overdue = await prisma.fine.findFirstOrThrow({ where: { relatedLoanId: loan.id, reason: 'overdue' } })
+        const overdueDispute = await disputeFine(studentToken, overdue.id, 'It was returned late by the desk')
+        const sendMail = fakeTransport()
+        const before = Date.now()
+
+        const res = await restore(admin, copy.id, { waiveReplacementCharge: true })
+
+        expect(res.status).toBe(200)
+        expect(res.body.replacementWaived).toBe(true)
+        expect(res.body).toEqual({ book: expect.any(Object), replacementWaived: true })
+        // The fine is waived with the marker cleared, and its dispute is closed with the restore's reason.
+        expect(await lostFineOf(loan.id)).toMatchObject({ status: 'waived', amount: 0, originalAmount: 400, disputedAt: null, adjustReason: RETURNED_AFTER_LOST })
+        const closed = await disputeOf(disputeId)
+        expect(closed).toMatchObject({ status: 'waived', resolutionNote: RETURNED_AFTER_LOST, resolvedById: librarian.id })
+        expect(closed.resolvedAt!.getTime()).toBeGreaterThanOrEqual(before)
+        expect(closed.resolvedAt!.getTime()).toBeLessThanOrEqual(Date.now())
+        // The dispute on the overdue fine, which was not waived, is still open.
+        expect(await disputeOf(overdueDispute)).toMatchObject({ status: 'open', resolutionNote: null })
+        expect((await prisma.fine.findUniqueOrThrow({ where: { id: overdue.id } })).disputedAt).not.toBeNull()
+
+        // The student is told, and sent the same text by email, once.
+        const notices = await prisma.notice.findMany({ where: { kind: 'dispute_outcome' } })
+        expect(notices).toHaveLength(1)
+        expect(notices[0]).toMatchObject({
+          userId: student.id,
+          fineId: replacement.id,
+          createdById: librarian.id,
+          title: 'Your fine was waived',
+          body: `The library waived the ₹400 fine for Dune.\n\nNote from the library: ${RETURNED_AFTER_LOST}`,
+          emailStatus: 'sent',
+        })
+        expect(sendMail).toHaveBeenCalledTimes(1)
+        expect(sendMail.mock.calls[0][0].subject).toBe('SmartLib: Your fine was waived')
+        expect(sendMail.mock.calls[0][0].text.startsWith(notices[0].body)).toBe(true)
+        const mine = await request(app).get('/fines/me').set(auth(studentToken))
+        expect(mine.body.fines.find((f: { id: string }) => f.id === replacement.id)).toMatchObject({
+          status: 'waived',
+          dispute: { status: 'waived', note: RETURNED_AFTER_LOST },
+        })
+      })
+
+      it('a lowered replacement fine that was disputed is waived at what the student saw', async () => {
+        const { token: admin } = await seedUser('admin')
+        const { token: studentToken, user: student } = await seedUser('student', 'Asha Rao')
+        const { copy, loan } = await lostOnLoan(admin, student.id)
+        const replacement = await lostFineOf(loan.id)
+        expect((await adjustFine(admin, replacement.id, 300, 'Partly found')).status).toBe(200)
+        const disputeId = await disputeFine(studentToken, replacement.id)
+
+        expect((await restore(admin, copy.id, { waiveReplacementCharge: true })).body.replacementWaived).toBe(true)
+
+        expect(await disputeOf(disputeId)).toMatchObject({ status: 'waived', resolutionNote: RETURNED_AFTER_LOST })
+        expect((await prisma.notice.findFirstOrThrow({ where: { fineId: replacement.id } })).body).toBe(
+          `The library waived the ₹300 fine for Dune.\n\nNote from the library: ${RETURNED_AFTER_LOST}`,
+        )
+      })
+
+      it('a restore that does not waive leaves the dispute open, sends nothing and moves only the catalogue', async () => {
+        const { token: admin } = await seedUser('admin')
+        const { token: studentToken, user: student } = await seedUser('student', 'Asha Rao')
+        const { copy, loan } = await lostOnLoan(admin, student.id)
+        const replacement = await lostFineOf(loan.id)
+        const disputeId = await disputeFine(studentToken, replacement.id)
+        const sendMail = fakeTransport()
+        recorder = recordEvents()
+
+        const res = await restore(admin, copy.id, { waiveReplacementCharge: false })
+
+        expect(res.status).toBe(200)
+        expect(res.body.replacementWaived).toBe(false)
+        expect(await disputeOf(disputeId)).toMatchObject({ status: 'open', resolutionNote: null, resolvedAt: null })
+        expect(await lostFineOf(loan.id)).toMatchObject({ status: 'pending', amount: 400 })
+        expect((await lostFineOf(loan.id)).disputedAt).not.toBeNull()
+        expect(await prisma.notice.count()).toBe(0)
+        expect(sendMail).not.toHaveBeenCalled()
+        expect(recorder.events).toEqual([{ type: 'catalogue.changed', topics: ['catalogue'] }])
+      })
+
+      it('a restore that waives a fine nobody disputed sends no notice and keeps slice 5\'s topics', async () => {
+        const { token: admin } = await seedUser('admin')
+        const { user: student } = await seedUser('student', 'Asha Rao')
+        const { copy, loan } = await lostOnLoan(admin, student.id)
+        const sendMail = fakeTransport()
+        recorder = recordEvents()
+
+        const res = await restore(admin, copy.id, { waiveReplacementCharge: true })
+
+        expect(res.body.replacementWaived).toBe(true)
+        expect(await lostFineOf(loan.id)).toMatchObject({ status: 'waived', disputedAt: null })
+        expect(await prisma.notice.count()).toBe(0)
+        expect(sendMail).not.toHaveBeenCalled()
+        expect(recorder.events).toEqual([{ type: 'catalogue.changed', topics: ['catalogue', 'fines'] }])
+      })
+
+      it('a restore that closes a dispute publishes catalogue.changed once, on catalogue, fines and attention, after the email outcome', async () => {
+        const { token: admin } = await seedUser('admin')
+        const { token: studentToken, user: student } = await seedUser('student', 'Asha Rao')
+        const { copy, loan } = await lostOnLoan(admin, student.id)
+        await disputeFine(studentToken, (await lostFineOf(loan.id)).id)
+        fakeTransport()
+        recorder = recordEvents()
+        // What the notice looks like in the database at the moment the event is published.
+        const atPublish: Array<Promise<string[]>> = []
+        const stop = subscribe(() => {
+          atPublish.push(prisma.notice.findMany().then((rows) => rows.map((n) => n.emailStatus)))
+        })
+
+        try {
+          expect((await restore(admin, copy.id, { waiveReplacementCharge: true })).status).toBe(200)
+        } finally {
+          stop()
+        }
+
+        expect(recorder.events).toEqual([{ type: 'catalogue.changed', topics: ['catalogue', 'fines', 'attention'] }])
+        expect(await Promise.all(atPublish)).toEqual([['sent']])
+      })
+
+      it('a failing email transport records failed and the restore stands', async () => {
+        const { token: admin } = await seedUser('admin')
+        const { token: studentToken, user: student } = await seedUser('student', 'Asha Rao')
+        const { copy, loan } = await lostOnLoan(admin, student.id)
+        const disputeId = await disputeFine(studentToken, (await lostFineOf(loan.id)).id)
+        setMailTransport({ send: async () => ({ ok: false }) })
+
+        const res = await restore(admin, copy.id, { waiveReplacementCharge: true })
+
+        expect(res.status).toBe(200)
+        expect(res.body.replacementWaived).toBe(true)
+        expect(await statusOf(copy.id)).toBe('available')
+        expect(await disputeOf(disputeId)).toMatchObject({ status: 'waived' })
+        const notice = await prisma.notice.findFirstOrThrow({ where: { kind: 'dispute_outcome' } })
+        expect(notice.emailStatus).toBe('failed')
+        expect(notice.emailedAt).not.toBeNull()
+      })
+
+      it('a restore refused by the copy\'s status closes no dispute and sends nothing', async () => {
+        const { token: admin } = await seedUser('admin')
+        const { token: studentToken, user: student } = await seedUser('student', 'Asha Rao')
+        const { copy, loan } = await lostOnLoan(admin, student.id)
+        const disputeId = await disputeFine(studentToken, (await lostFineOf(loan.id)).id)
+        expect((await restore(admin, copy.id)).status).toBe(200) // the copy is back, the fine still owed
+        const sendMail = fakeTransport()
+        recorder = recordEvents()
+
+        // The copy is available now, so a second restore is refused and nothing is waived.
+        const res = await restore(admin, copy.id, { waiveReplacementCharge: true })
+
+        expect(res.status).toBe(409)
+        expect(res.body.error).toBe(ALREADY_AVAILABLE)
+        expect(await disputeOf(disputeId)).toMatchObject({ status: 'open' })
+        expect(await prisma.notice.count()).toBe(0)
+        expect(sendMail).not.toHaveBeenCalled()
+        expect(recorder.events).toEqual([])
+      })
+
+      it('records the date it is given when the database session is not on UTC', async () => {
+        const { user: librarian } = await seedUser('admin')
+        const { token: admin } = await seedUser('admin')
+        const { token: studentToken, user: student } = await seedUser('student', 'Asha Rao')
+        const { copy, loan } = await lostOnLoan(admin, student.id)
+        const replacement = await lostFineOf(loan.id)
+        const disputeId = await disputeFine(studentToken, replacement.id)
+        const at = new Date(Date.now() - 3 * HOUR_MS)
+
+        // Every write the restore makes runs in a transaction whose session is on Kolkata time (+5:30).
+        type Work = (tx: Prisma.TransactionClient) => Promise<unknown>
+        const realTransaction = prisma.$transaction.bind(prisma) as (fn: Work, options?: unknown) => Promise<unknown>
+        vi.spyOn(prisma, '$transaction').mockImplementation(((fn: Work, options?: unknown) =>
+          realTransaction(async (tx) => {
+            await tx.$executeRawUnsafe(`SET LOCAL TIME ZONE 'Asia/Kolkata'`)
+            return fn(tx)
+          }, options)) as never)
+        try {
+          const result = await restoreCopy(copy.id, librarian.id, true, at)
+          expect(result.replacementWaived).toBe(true)
+        } finally {
+          vi.restoreAllMocks()
+        }
+
+        expect((await lostFineOf(loan.id)).adjustedAt).toEqual(at)
+        expect((await disputeOf(disputeId)).resolvedAt).toEqual(at)
+      })
     })
   })
 

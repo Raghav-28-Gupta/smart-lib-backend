@@ -1,7 +1,7 @@
 // A student's own fines, for the Fines section under My Loans. Not the
 // librarian's list (adminFineService): no student, no librarian name, no accruing
 // rows (the student already sees what an overdue loan has accrued on the loan).
-import type { FineStatus } from '../generated/prisma/client'
+import type { DisputeStatus, FineStatus } from '../generated/prisma/client'
 import { prisma } from '../lib/prisma'
 
 /** How many fines the list shows, newest first. The total is over all of them. */
@@ -21,6 +21,12 @@ export interface StudentFineDto {
   date: Date
   /** The librarian's reason for lowering or waiving the fine, kept after it is paid; null when it was never adjusted. */
   note: string | null
+  /**
+   * The student's dispute of this fine, open or resolved, or null when they never
+   * disputed it. `note` is the library's resolution note, null while it is open.
+   * Additive: an older app ignores the key.
+   */
+  dispute: { status: DisputeStatus; note: string | null } | null
 }
 
 const STATUS_TO_STUDENT: Record<FineStatus, StudentFineDto['status']> = {
@@ -49,6 +55,7 @@ export async function listMyFines(userId: string): Promise<{ fines: StudentFineD
         status: true,
         createdAt: true,
         adjustReason: true,
+        dispute: { select: { status: true, resolutionNote: true } },
         relatedLoan: { select: { bookCopy: { select: { book: { select: { title: true } } } } } },
         relatedBooking: { select: { resource: { select: { name: true } } } },
       },
@@ -69,6 +76,7 @@ export async function listMyFines(userId: string): Promise<{ fines: StudentFineD
       status: STATUS_TO_STUDENT[fine.status],
       date: fine.createdAt,
       note: fine.adjustReason,
+      dispute: fine.dispute ? { status: fine.dispute.status, note: fine.dispute.resolutionNote } : null,
     })),
     outstandingTotal: owed._sum.amount ?? 0,
   }

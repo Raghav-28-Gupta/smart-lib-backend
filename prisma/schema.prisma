@@ -106,6 +106,34 @@ enum NoticeKind {
   report_outcome
 }
 
+// Where a fine dispute stands. `open` while the librarians have not answered;
+// the other three say how it was settled: the fine waived, lowered, or kept.
+enum DisputeStatus {
+  open
+  waived
+  adjusted
+  upheld
+}
+
+// What a student says is wrong. `damaged` and `missing_pages` are for a book copy
+// (reported when it is returned), `not_working` and `dirty` for a seat or room;
+// `other` is for either and needs a note.
+enum IssueCategory {
+  damaged
+  missing_pages
+  not_working
+  dirty
+  other
+}
+
+// Where a problem report stands. `open` until a librarian answers it; the other
+// two say the library acted on it (`confirmed`) or found nothing to do (`dismissed`).
+enum ReportStatus {
+  open
+  confirmed
+  dismissed
+}
+
 // What happened when the library tried to email a notice. `skipped` is also
 // the default a notice is written with, and the final answer when email is not
 // set up or the address is a placeholder: nothing was attempted.
@@ -143,6 +171,10 @@ model User {
   adjustedReliability   ReliabilityScoreLog[] @relation("ReliabilityAdjuster")
   notices               Notice[]              @relation("NoticeRecipient")
   authoredNotices       Notice[]              @relation("NoticeAuthor")
+  fineDisputes          FineDispute[]         @relation("DisputeStudent")
+  resolvedFineDisputes  FineDispute[]         @relation("DisputeResolver")
+  issueReports          IssueReport[]         @relation("ReportAuthor")
+  resolvedIssueReports  IssueReport[]         @relation("ReportResolver")
 }
 
 model Book {
@@ -174,6 +206,7 @@ model BookCopy {
   barcode String     @unique @default(dbgenerated("next_copy_barcode()"))
 
   borrowRequests BorrowRequest[]
+  issueReports   IssueReport[]
 }
 
 model Loan {
@@ -216,7 +249,8 @@ model Resource {
   // The optional note given when a librarian takes the resource offline.
   statusNote String?
 
-  bookings ResourceBooking[]
+  bookings     ResourceBooking[]
+  issueReports IssueReport[]
 }
 
 model ResourceBooking {
@@ -325,10 +359,66 @@ model Fine {
   paidAt           DateTime?
   paidRecordedById String?
   paidRecordedBy   User?            @relation("FinePaymentRecorder", fields: [paidRecordedById], references: [id], onDelete: SetNull)
+  // The marker for an open dispute: set when the student disputes the fine,
+  // cleared when a librarian resolves it. Paying, adjusting and disputing are all
+  // conditional updates on this row, so whichever commits first wins and the
+  // others find the marker (or the status) changed.
+  disputedAt       DateTime?
 
   notices Notice[]
+  dispute FineDispute?
 
   @@index([createdAt])
+}
+
+// A student's dispute of one fine: why they think it is wrong, and how the
+// library answered. At most one per fine, ever (the unique fineId), open or
+// resolved. While it is open the fine carries disputedAt and cannot be paid.
+model FineDispute {
+  id             String        @id @default(uuid())
+  fineId         String        @unique
+  fine           Fine          @relation(fields: [fineId], references: [id])
+  userId         String
+  user           User          @relation("DisputeStudent", fields: [userId], references: [id])
+  reason         String
+  status         DisputeStatus @default(open)
+  resolutionNote String?
+  // The librarian who resolved it (null while open, and if that account is gone).
+  resolvedById   String?
+  resolvedBy     User?         @relation("DisputeResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+  createdAt      DateTime      @default(now())
+  resolvedAt     DateTime?
+
+  @@index([status, createdAt])
+}
+
+// A student's report of a problem with one thing: a book copy (made as the copy is
+// returned) or a seat or room (made from the app). Exactly one of bookCopyId and
+// resourceId is set, and a student has at most one open report per target; both
+// rules are in the migration SQL (a CHECK, and two partial unique indexes
+// WHERE status = 'open'), which Prisma's schema language cannot express.
+model IssueReport {
+  id             String        @id @default(uuid())
+  userId         String
+  user           User          @relation("ReportAuthor", fields: [userId], references: [id])
+  bookCopyId     String?
+  // A copy or resource with a report on it cannot be deleted: setting the link to
+  // null would leave a report with no target (the CHECK refuses it), so the delete
+  // is restricted outright. Nothing in the app deletes either; only the re-seed does.
+  bookCopy       BookCopy?     @relation(fields: [bookCopyId], references: [id], onDelete: Restrict)
+  resourceId     String?
+  resource       Resource?     @relation(fields: [resourceId], references: [id], onDelete: Restrict)
+  category       IssueCategory
+  note           String?
+  status         ReportStatus  @default(open)
+  resolutionNote String?
+  // The librarian who answered it (null while open, and if that account is gone).
+  resolvedById   String?
+  resolvedBy     User?         @relation("ReportResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+  createdAt      DateTime      @default(now())
+  resolvedAt     DateTime?
+
+  @@index([status, createdAt])
 }
 
 // One library message to one student: an overdue reminder or formal notice, or

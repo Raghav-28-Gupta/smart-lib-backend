@@ -6,6 +6,7 @@ import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '.
 import { prisma } from '../lib/prisma'
 import { dayLabel, slotLabel } from '../lib/timeLabels'
 import { applyReliabilityDelta } from './reliabilityService'
+import { isReportableBooking } from './reportService'
 import { expireStaleRequests } from './requestHolds'
 
 export interface BookingDto {
@@ -28,7 +29,13 @@ export interface BookingDto {
   cancelReason: string | null
   /** The name of the resource the library moved this booking from, for REQUEST_OUTCOME_VISIBLE_DAYS after the move. Null otherwise. */
   movedFrom: string | null
+  /** This booking entitles the student to report its resource (reportService.isReportableBooking) and they have no open report on it. */
+  canReport: boolean
+  /** The student has an open report on this booking's resource. */
+  reportOpen: boolean
 }
+
+type ReportFlags = Pick<BookingDto, 'canReport' | 'reportOpen'>
 
 /**
  * The statuses that occupy a slot. The no_overlapping_bookings constraint
@@ -89,7 +96,32 @@ function outcomeVisibleSince(now: Date): Date {
   return new Date(now.getTime() - REQUEST_OUTCOME_VISIBLE_DAYS * 24 * 60 * 60 * 1000)
 }
 
-function toBookingDto(booking: ResourceBooking & { resource: { name: string; type: string } }, now: Date): BookingDto {
+/**
+ * canReport and reportOpen for each of the student's bookings, in order, from one
+ * lookup of their open reports on those bookings' resources: the cost does not grow
+ * with the number of bookings. reportOpen is the resource's (every booking of a
+ * reported desk says so); canReport is the booking's own (it qualifies by itself, and
+ * the student has no open report on its resource), so it is true exactly when
+ * POST /reports for that resource would be accepted because of this booking.
+ */
+async function reportFlags(
+  userId: string,
+  bookings: ReadonlyArray<Pick<ResourceBooking, 'resourceId' | 'status' | 'startTime'>>,
+  now: Date,
+): Promise<ReportFlags[]> {
+  if (bookings.length === 0) return []
+  const open = await prisma.issueReport.findMany({
+    where: { userId, status: 'open', resourceId: { in: [...new Set(bookings.map((b) => b.resourceId))] } },
+    select: { resourceId: true },
+  })
+  const reported = new Set(open.map((r) => r.resourceId))
+  return bookings.map((b) => {
+    const reportOpen = reported.has(b.resourceId)
+    return { canReport: !reportOpen && isReportableBooking(b, now), reportOpen }
+  })
+}
+
+function toBookingDto(booking: ResourceBooking & { resource: { name: string; type: string } }, now: Date, flags: ReportFlags): BookingDto {
   const window = computeWindow(booking.startTime, booking.gracePeriodMinutes, now)
   // The library cancelled it exactly when cancelledById is set: a student's own cancel leaves it null.
   const cancelledByLibrary = booking.status === 'cancelled' && booking.cancelledById !== null
@@ -117,6 +149,7 @@ function toBookingDto(booking: ResourceBooking & { resource: { name: string; typ
     declineReason: booking.status === 'declined' ? booking.declineReason : null,
     cancelReason: cancelledByLibrary ? booking.cancelReason : null,
     movedFrom: booking.movedAt !== null && booking.movedAt >= outcomeVisibleSince(now) ? booking.movedFromName : null,
+    ...flags,
   }
 }
 
@@ -241,7 +274,8 @@ export async function createBooking(userId: string, resourceId: string, startTim
     } else {
       publishBookingChange()
     }
-    return toBookingDto(booking, now)
+    const [flags] = await reportFlags(userId, [booking], now)
+    return toBookingDto(booking, now, flags)
   } catch (e) {
     if (isExclusionViolation(e)) {
       const alternatives = await findAlternatives(resource, startTime, endTime, now)
@@ -270,7 +304,8 @@ export async function listMyBookings(userId: string): Promise<BookingDto[]> {
     include: { resource: { select: { name: true, type: true } } },
     orderBy: { startTime: 'asc' },
   })
-  return bookings.map((b) => toBookingDto(b, now))
+  const flags = await reportFlags(userId, bookings, now)
+  return bookings.map((b, i) => toBookingDto(b, now, flags[i]))
 }
 
 async function getOwnedBooking(userId: string, bookingId: string) {
@@ -309,7 +344,8 @@ export async function checkInBooking(userId: string, bookingId: string): Promise
   })
   if (!updated) throw new ConflictError('This booking cannot be checked into.')
   publishBookingChange()
-  return toBookingDto(updated, now)
+  const [flags] = await reportFlags(userId, [updated], now)
+  return toBookingDto(updated, now, flags)
 }
 
 export async function cancelBooking(userId: string, bookingId: string): Promise<BookingDto> {
@@ -334,5 +370,6 @@ export async function cancelBooking(userId: string, bookingId: string): Promise<
   })
   if (withdrawing) publish({ type: 'request.cancelled', topics: ['requests'], kind: 'room' })
   else publishBookingChange()
-  return toBookingDto(updated, now)
+  const [flags] = await reportFlags(userId, [updated], now)
+  return toBookingDto(updated, now, flags)
 }
