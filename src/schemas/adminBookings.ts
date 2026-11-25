@@ -1,9 +1,10 @@
 import { z } from 'zod'
 
 // What the console shows and filters by, worked out at read time (see
-// adminBookingService). Raw no_show, requested, declined and expired rows are
-// never listed, so none of them is a valid filter.
-export const adminBookingStatuses = ['booked', 'released', 'checked_in', 'completed', 'cancelled'] as const
+// adminBookingService). A recorded no-show is listed and filterable; raw
+// requested, declined and expired rows are never listed, so none of them is a
+// valid filter.
+export const adminBookingStatuses = ['booked', 'released', 'no_show', 'checked_in', 'completed', 'cancelled'] as const
 
 export const MAX_BOOKING_PAGE_SIZE = 100
 export const MAX_BOOKING_SEARCH_LENGTH = 100

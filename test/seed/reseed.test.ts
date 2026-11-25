@@ -5,6 +5,8 @@ import { app } from '../../src/app'
 import { JWT_SECRET } from '../../src/config/constants'
 import { sendEmail, setMailTransport } from '../../src/lib/mailer'
 import { prisma } from '../../src/lib/prisma'
+import { noShowDisputeDeadline, noShowInfo } from '../../src/services/bookingService'
+import { sweepBookings } from '../../src/services/noShowService'
 import { DEMO_EMAIL, runSeed, SEED_BOOK_IDS, SEED_RESOURCE_IDS, SEED_STUDENT_EMAILS } from '../../prisma/seedData'
 import { resetDb } from '../helpers/db'
 
@@ -172,12 +174,12 @@ describe('runSeed', () => {
       expect(disputes.map((d) => d.id)).toContain(row.dispute.id)
     }
 
-    // The queue shows the two disputes and the two reports (and the overdue loans the demo data already has).
+    // The queue shows the two fine disputes, the two no-show disputes and the two reports (and the overdue loans the demo data already has).
     const queue = await request(app).get('/admin/attention').set(asLibrarian)
     expect(queue.status).toBe(200)
-    expect(queue.body.counts).toMatchObject({ fine_dispute: 2, report: 2 })
+    expect(queue.body.counts).toMatchObject({ fine_dispute: 2, no_show_dispute: 2, report: 2 })
     expect(queue.body.counts.overdue).toBeGreaterThanOrEqual(1)
-    expect(queue.body.counts.all).toBe(queue.body.counts.overdue + 4)
+    expect(queue.body.counts.all).toBe(queue.body.counts.overdue + 6)
     const items = queue.body.items as Array<{ id: string; kind: string; waitingSince: string }>
     expect(items.filter((i) => i.kind === 'fine_dispute').map((i) => i.id).sort()).toEqual(disputes.map((d) => d.id).sort())
     expect(items.filter((i) => i.kind === 'report').map((i) => i.id).sort()).toEqual(reports.map((r) => r.id).sort())
@@ -206,13 +208,22 @@ describe('runSeed', () => {
     for (const fine of outstanding.slice(2)) expect(fine.disputedAt).toBeNull()
   }, SLOW)
 
-  it('a second run succeeds', async () => {
-    const first = await runSeed(prisma)
+  it('a second run succeeds and replaces the seeded disputes', async () => {
+    // One clock for both runs: the "taken" slots' final states depend on the time of day, which moves between two real runs.
+    const today = new Date()
+    const first = await runSeed(prisma, today)
     const firstDisputes = await prisma.fineDispute.findMany({ select: { id: true } })
+    const firstNoShowDisputes = await prisma.noShowDispute.findMany({ select: { id: true } })
     const firstReports = await prisma.issueReport.findMany({ select: { id: true } })
-    const second = await runSeed(prisma)
-    expect(first).toMatchObject({ books: 12, resources: 7, users: 7, disputes: 2, reports: 2 })
+    const second = await runSeed(prisma, today)
+    expect(first).toMatchObject({ books: 12, resources: 7, users: 7, disputes: 2, noShowDisputes: 2, reports: 2 })
+    expect(first.noShows).toBeGreaterThan(0)
     expect(second).toEqual(first)
+    // The no-show disputes are replaced, not kept beside the new ones, and the no-shows are not counted twice.
+    expect(await prisma.noShowDispute.count()).toBe(2)
+    expect(await prisma.noShowDispute.count({ where: { id: { in: firstNoShowDisputes.map((d) => d.id) } } })).toBe(0)
+    expect(await prisma.resourceBooking.count({ where: { status: 'no_show' } })).toBe(first.noShows)
+    expect(await prisma.noShowEvent.count()).toBe(first.noShows)
     expect(await prisma.book.count()).toBe(12)
     expect(await prisma.resource.count()).toBe(7)
     expect(await prisma.user.count()).toBe(7)
@@ -506,11 +517,12 @@ describe('runSeed', () => {
       data: { userId: other.id, relatedBookingId: otherMissed.id, amount: 50, reason: 'no_show' },
     })
 
-    await runSeed(prisma)
+    const summary = await runSeed(prisma)
 
     expect(await prisma.resource.findUnique({ where: { id: desk.id } })).not.toBeNull()
     expect(await prisma.resourceBooking.count({ where: { id: { in: [missed.id, otherMissed.id] } } })).toBe(0)
-    expect(await prisma.noShowEvent.count()).toBe(0)
+    // Their two records went; what is left is the new seed's own, one per no-show it wrote.
+    expect(await prisma.noShowEvent.count()).toBe(summary.noShows)
     expect(await prisma.fine.count({ where: { id: { in: [noShowFine.id, otherNoShowFine.id] } } })).toBe(0)
   }, SLOW)
 
@@ -653,6 +665,277 @@ describe('runSeed', () => {
     expect(await prisma.notice.count({ where: { id: { in: seedNotices.map((n) => n.id) } } })).toBe(0)
     expect(await prisma.notice.count({ where: { user: { email: { in: [DEMO_EMAIL, ...SEED_STUDENT_EMAILS] } } } })).toBe(0)
     expect(await prisma.notice.count()).toBe(3)
+  }, SLOW)
+
+  it("a re-seed deletes seed students' no-show disputes and a librarian-made dispute on a non-seed booking survives", async () => {
+    await runSeed(prisma)
+    const { user: librarianUser } = await librarian()
+    const student = await seedStudent(2)
+    const demo = await prisma.user.findUniqueOrThrow({ where: { email: DEMO_EMAIL } })
+    const other = await otherStudent()
+    // A desk a librarian added: not one of the demo resources.
+    const desk = await prisma.resource.create({ data: { type: 'seat', name: 'Console Desk', capacity: 1 } })
+
+    // A missed booking, hours ago on a day within the last week, and the student's dispute of it (open, or answered).
+    let n = 0
+    const missed = async (userId: string, resourceId: string) => {
+      const startTime = new Date(Date.now() - (2 + n++) * DAY_MS)
+      return prisma.resourceBooking.create({
+        data: { userId, resourceId, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status: 'no_show' },
+      })
+    }
+    const dispute = (bookingId: string, userId: string, resolvedById?: string) =>
+      prisma.noShowDispute.create({
+        data: {
+          bookingId,
+          userId,
+          reason: 'I was at the desk the whole time.',
+          ...(resolvedById ? { status: 'upheld', resolutionNote: 'The desk log shows nobody checked in.', resolvedById, resolvedAt: new Date() } : {}),
+        },
+      })
+
+    // Go with the seed accounts: a seed student's dispute on a demo resource and one on the librarian's desk
+    // (open and answered), and the demo student's.
+    const seedOnSeedResource = await missed(student.id, SEED_RESOURCE_IDS[0])
+    const seedOnDesk = await missed(student.id, desk.id)
+    const seedOnDeskAnswered = await missed(student.id, desk.id)
+    const demoOnDesk = await missed(demo.id, desk.id)
+    // Goes with the demo resource: another student's dispute on a booking of it, open or answered.
+    const otherOnSeedResource = await missed(other.id, SEED_RESOURCE_IDS[4])
+    const otherOnSeedResourceAnswered = await missed(other.id, SEED_RESOURCE_IDS[2])
+    const gone = [
+      await dispute(seedOnSeedResource.id, student.id),
+      await dispute(seedOnDesk.id, student.id),
+      await dispute(seedOnDeskAnswered.id, student.id, librarianUser.id),
+      await dispute(demoOnDesk.id, demo.id),
+      await dispute(otherOnSeedResource.id, other.id),
+      await dispute(otherOnSeedResourceAnswered.id, other.id, librarianUser.id),
+    ]
+    // Stay: the other student's disputes on the librarian's desk, one open and one answered by the librarian.
+    const keptOpenBooking = await missed(other.id, desk.id)
+    const keptAnsweredBooking = await missed(other.id, desk.id)
+    const keptOpen = await dispute(keptOpenBooking.id, other.id)
+    const keptAnswered = await dispute(keptAnsweredBooking.id, other.id, librarianUser.id)
+    // Notices about those bookings: the one on a booking that goes loses its link, the one on a booking that stays keeps it.
+    const noticeAbout = (bookingId: string) =>
+      prisma.notice.create({ data: { userId: other.id, kind: 'no_show', title: 'Missed booking', body: 'You did not check in.', bookingId } })
+    const aboutGoneBooking = await noticeAbout(otherOnSeedResource.id)
+    const aboutKeptBooking = await noticeAbout(keptOpenBooking.id)
+    const theirRows = async () => ({
+      disputes: await prisma.noShowDispute.findMany({ where: { userId: other.id, bookingId: { in: [keptOpenBooking.id, keptAnsweredBooking.id] } }, orderBy: { id: 'asc' } }),
+      bookings: await prisma.resourceBooking.findMany({ where: { id: { in: [keptOpenBooking.id, keptAnsweredBooking.id] } }, orderBy: { id: 'asc' } }),
+    })
+    const before = await theirRows()
+    expect(before.disputes.map((d) => d.id).sort()).toEqual([keptOpen.id, keptAnswered.id].sort())
+
+    await runSeed(prisma)
+
+    // Every dispute of a seed account, and every one on a booking of a demo resource, is gone, with those bookings.
+    expect(await prisma.noShowDispute.count({ where: { id: { in: gone.map((d) => d.id) } } })).toBe(0)
+    expect(
+      await prisma.resourceBooking.count({
+        where: { id: { in: [seedOnSeedResource, seedOnDesk, seedOnDeskAnswered, demoOnDesk, otherOnSeedResource, otherOnSeedResourceAnswered].map((b) => b.id) } },
+      }),
+    ).toBe(0)
+    // The librarian-made ones stand with their bookings, every column as it was (status, answer, who, when).
+    expect(await theirRows()).toEqual(before)
+    expect(await prisma.noShowDispute.findUniqueOrThrow({ where: { id: keptAnswered.id } })).toMatchObject({ status: 'upheld', resolvedById: librarianUser.id })
+    // The other student's notice keeps its text; its link is cleared only where the booking went.
+    expect(await prisma.notice.findUniqueOrThrow({ where: { id: aboutGoneBooking.id } })).toMatchObject({ userId: other.id, title: 'Missed booking', bookingId: null })
+    expect((await prisma.notice.findUniqueOrThrow({ where: { id: aboutKeptBooking.id } })).bookingId).toBe(keptOpenBooking.id)
+    // The librarian and the student are ordinary accounts and stay; the seed accounts were recreated.
+    expect(await prisma.user.findUnique({ where: { id: librarianUser.id } })).not.toBeNull()
+    expect(await prisma.user.findUnique({ where: { id: other.id } })).not.toBeNull()
+    expect(await prisma.user.count({ where: { email: { in: [DEMO_EMAIL, ...SEED_STUDENT_EMAILS] } } })).toBe(7)
+  }, SLOW)
+
+  it('a fresh seed leaves no booked row past its grace period', async () => {
+    // 11:05 today: the 9 and 10 o'clock "taken" slots are over, 11 o'clock has started and is inside its
+    // grace period, and every later slot is still to come, so each of the three final states appears.
+    const now = new Date()
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 11, 5)
+    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    await runSeed(prisma, today)
+    const graceEnd = (b: { startTime: Date; gracePeriodMinutes: number }) => b.startTime.getTime() + b.gracePeriodMinutes * 60_000
+
+    const bookings = await prisma.resourceBooking.findMany()
+    // The sweep would record any of these, so none may be left.
+    expect(bookings.filter((b) => b.status === 'booked' && graceEnd(b) < today.getTime())).toEqual([])
+    // The history is all over: each booking is attended or a recorded no-show.
+    const history = bookings.filter((b) => b.startTime < midnight)
+    expect(history.length).toBeGreaterThan(0)
+    expect(new Set(history.map((b) => b.status))).toEqual(new Set(['checked_in', 'no_show']))
+    // Today's "taken" slots follow the seed's clock.
+    const taken = bookings.filter((b) => b.startTime >= midnight)
+    expect(taken.length).toBeGreaterThan(0)
+    for (const b of taken) {
+      const expected = graceEnd(b) < today.getTime() ? 'no_show' : b.startTime.getTime() <= today.getTime() ? 'checked_in' : 'booked'
+      expect(b.status, `${b.resourceId} ${b.startTime.toISOString()}`).toBe(expected)
+      if (b.status === 'checked_in') {
+        expect(b.checkedInAt!.getTime()).toBeGreaterThanOrEqual(b.startTime.getTime())
+        expect(b.checkedInAt!.getTime()).toBeLessThanOrEqual(today.getTime())
+      } else {
+        expect(b.checkedInAt).toBeNull()
+      }
+    }
+    expect(new Set(taken.map((b) => b.status))).toEqual(new Set(['no_show', 'checked_in', 'booked']))
+  }, SLOW)
+
+  it('seeded no-shows have an event and no reliability log, notice or email', async () => {
+    const send = vi.fn(async () => ({ ok: true }))
+    vi.mocked(sendEmail).mockClear()
+    // With a transport injected the mailer counts as configured, so anything the seed tried to send would reach it.
+    setMailTransport({ send })
+    let summary: Awaited<ReturnType<typeof runSeed>>
+    try {
+      summary = await runSeed(prisma)
+    } finally {
+      setMailTransport(null)
+    }
+
+    const missed = await prisma.resourceBooking.findMany({ where: { status: 'no_show' }, include: { noShowEvent: true } })
+    expect(summary.noShows).toBeGreaterThan(0)
+    expect(missed).toHaveLength(summary.noShows)
+    for (const b of missed) {
+      // The record a later retraining reads: labelled a no-show, a probability a model could have given, and no points taken.
+      expect(b.noShowEvent, b.id).toMatchObject({ userId: b.userId, actualNoShow: true, reliabilityDelta: null })
+      expect(b.noShowEvent!.predictedProbability).toBeGreaterThan(0)
+      expect(b.noShowEvent!.predictedProbability).toBeLessThan(1)
+    }
+    // One event per no-show and no other event: an attended booking was never scored.
+    expect(await prisma.noShowEvent.count()).toBe(summary.noShows)
+
+    // Backstory, not events: no log line, no change of score, no notice, no email.
+    const demo = await prisma.user.findUniqueOrThrow({ where: { email: DEMO_EMAIL } })
+    expect(await prisma.reliabilityScoreLog.count({ where: { reason: { startsWith: 'No-show' } } })).toBe(0)
+    // The demo student's one existing log line is the whole log, and her score is still what it was.
+    expect(await prisma.reliabilityScoreLog.count({ where: { userId: { not: demo.id } } })).toBe(0)
+    expect(demo.reliabilityScore).toBe(50)
+    expect(await prisma.user.count({ where: { email: { in: [...SEED_STUDENT_EMAILS] }, reliabilityScore: { not: 100 } } })).toBe(0)
+    expect(await prisma.notice.count()).toBe(0)
+    expect(send).not.toHaveBeenCalled()
+    expect(sendEmail).not.toHaveBeenCalled()
+  }, SLOW)
+
+  it('the demo student has one disputable no-show and the two seeded disputes are open on other seed students', async () => {
+    const before = Date.now()
+    await runSeed(prisma)
+    const after = Date.now()
+    const demo = await prisma.user.findUniqueOrThrow({ where: { email: DEMO_EMAIL } })
+    const seedStudentIds = new Set(
+      (await prisma.user.findMany({ where: { email: { in: [...SEED_STUDENT_EMAILS] } } })).map((u) => u.id),
+    )
+    const graceEndedAt = (b: { startTime: Date; gracePeriodMinutes: number }) => b.startTime.getTime() + b.gracePeriodMinutes * 60_000
+
+    // The demo student has exactly one booking: a recent no-show with no dispute, which she can still dispute.
+    const hers = await prisma.resourceBooking.findMany({ where: { userId: demo.id }, include: { noShowDispute: true, noShowEvent: true } })
+    expect(hers).toHaveLength(1)
+    const [missed] = hers
+    expect(missed).toMatchObject({ status: 'no_show', noShowDispute: null })
+    expect(missed.noShowEvent).toMatchObject({ actualNoShow: true, reliabilityDelta: null })
+    expect(SEED_RESOURCE_IDS).toContain(missed.resourceId)
+    // Its grace period ended within the last 6 days, so the 7-day window has a day or more to run.
+    expect(graceEndedAt(missed)).toBeLessThan(before)
+    expect(graceEndedAt(missed)).toBeGreaterThan(before - 6 * DAY_MS)
+    expect(noShowInfo(missed, null, new Date())).toEqual({ canDispute: true, dispute: null })
+
+    // Two open disputes, on two different seed students' recent no-shows (not the demo student's).
+    const disputes = await prisma.noShowDispute.findMany({ include: { booking: true }, orderBy: { createdAt: 'asc' } })
+    expect(disputes).toHaveLength(2)
+    expect(new Set(disputes.map((d) => d.userId)).size).toBe(2)
+    for (const d of disputes) {
+      expect(d).toMatchObject({ status: 'open', resolutionNote: null, resolvedById: null, resolvedAt: null })
+      expect(seedStudentIds.has(d.userId)).toBe(true)
+      expect(d.booking).toMatchObject({ userId: d.userId, status: 'no_show' })
+      // A student's words as plain text, within the limit a real dispute has.
+      expect(d.reason).toBe(d.reason.trim())
+      expect(d.reason.length).toBeGreaterThan(0)
+      expect(d.reason.length).toBeLessThanOrEqual(300)
+      expect(d.reason).not.toMatch(/[<>]/)
+      // Opened after the miss and before the seed ran, with the window still open.
+      expect(d.createdAt.getTime()).toBeGreaterThan(graceEndedAt(d.booking))
+      expect(d.createdAt.getTime()).toBeLessThanOrEqual(after)
+      expect(noShowDisputeDeadline(d.booking).getTime()).toBeGreaterThan(after)
+      expect(noShowInfo(d.booking, d, new Date())).toEqual({ canDispute: false, dispute: { status: 'open', note: null } })
+    }
+  }, SLOW)
+
+  it('the first sweep after a seed records nothing for seeded rows', async () => {
+    // The sweep runs at the seed's own clock: one a minute later could legitimately catch a
+    // future "taken" slot whose grace period ends in between, as it would for any real booking.
+    const today = new Date()
+    await runSeed(prisma, today)
+    const state = async () => ({
+      bookings: await prisma.resourceBooking.findMany({ orderBy: { id: 'asc' } }),
+      events: await prisma.noShowEvent.findMany({ orderBy: { id: 'asc' } }),
+      logs: await prisma.reliabilityScoreLog.findMany({ orderBy: { id: 'asc' } }),
+      users: await prisma.user.findMany({ orderBy: { id: 'asc' } }),
+      notices: await prisma.notice.findMany({ orderBy: { id: 'asc' } }),
+    })
+    const before = await state()
+    expect(before.events.length).toBeGreaterThan(0)
+
+    expect(await sweepBookings(today)).toEqual({ noShows: 0, reminders: 0, remaining: 0 })
+
+    expect(await state()).toEqual(before)
+  }, SLOW)
+
+  it('a librarian-made no-show dispute on a non-seed booking survives a re-seed', async () => {
+    const today = new Date()
+    await runSeed(prisma, today)
+    const { user: librarianUser } = await librarian()
+    const other = await otherStudent()
+    // A desk a librarian added: not one of the demo resources.
+    const desk = await prisma.resource.create({ data: { type: 'seat', name: 'Console Desk', capacity: 1 } })
+    const seeded = await prisma.noShowDispute.findMany({ select: { id: true } })
+    expect(seeded).toHaveLength(2)
+
+    // Two no-shows of the other student's on that desk, as the sweep leaves them (with the event that holds the
+    // points taken): one disputed and still open, one disputed and answered by a librarian.
+    const missed = async (daysAgo: number) => {
+      const startTime = new Date(today.getTime() - daysAgo * DAY_MS)
+      const booking = await prisma.resourceBooking.create({
+        data: { userId: other.id, resourceId: desk.id, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status: 'no_show' },
+      })
+      await prisma.noShowEvent.create({
+        data: { resourceBookingId: booking.id, userId: other.id, predictedProbability: 0.4, actualNoShow: true, reliabilityDelta: -10 },
+      })
+      return booking
+    }
+    const openBooking = await missed(2)
+    const answeredBooking = await missed(3)
+    const open = await prisma.noShowDispute.create({
+      data: { bookingId: openBooking.id, userId: other.id, reason: 'I was at the desk the whole time.' },
+    })
+    const answered = await prisma.noShowDispute.create({
+      data: {
+        bookingId: answeredBooking.id,
+        userId: other.id,
+        reason: 'I was at the desk the whole time.',
+        status: 'upheld',
+        resolutionNote: 'The desk log shows nobody checked in.',
+        resolvedById: librarianUser.id,
+        resolvedAt: new Date(),
+      },
+    })
+    const bookingIds = [openBooking.id, answeredBooking.id]
+    const theirRows = async () => ({
+      disputes: await prisma.noShowDispute.findMany({ where: { userId: other.id }, orderBy: { id: 'asc' } }),
+      bookings: await prisma.resourceBooking.findMany({ where: { id: { in: bookingIds } }, orderBy: { id: 'asc' } }),
+      events: await prisma.noShowEvent.findMany({ where: { resourceBookingId: { in: bookingIds } }, orderBy: { id: 'asc' } }),
+    })
+    const before = await theirRows()
+    expect(before.disputes.map((d) => d.id).sort()).toEqual([open.id, answered.id].sort())
+
+    await runSeed(prisma, today)
+
+    // Every column of their rows is as it was: status, who answered and when, the booking and the points on the event.
+    expect(await theirRows()).toEqual(before)
+    expect(await prisma.noShowDispute.findUniqueOrThrow({ where: { id: answered.id } })).toMatchObject({ status: 'upheld', resolvedById: librarianUser.id })
+    expect(await prisma.user.findUnique({ where: { id: librarianUser.id } })).not.toBeNull()
+    // The first seed's two disputes were replaced, and the new seed's two stand beside the kept pair.
+    expect(await prisma.noShowDispute.count({ where: { id: { in: seeded.map((d) => d.id) } } })).toBe(0)
+    expect(await prisma.noShowDispute.count()).toBe(4)
   }, SLOW)
 
   it('the seed sends no email', async () => {

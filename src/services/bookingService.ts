@@ -1,10 +1,12 @@
-import { GRACE_PERIOD_MINUTES, RELIABILITY_ONTIME_BOOKING_BONUS, REQUEST_OUTCOME_VISIBLE_DAYS, TIME_SLOTS } from '../config/constants'
+import { GRACE_PERIOD_MINUTES, NO_SHOW_DISPUTE_DAYS, RELIABILITY_ONTIME_BOOKING_BONUS, REQUEST_OUTCOME_VISIBLE_DAYS, TIME_SLOTS } from '../config/constants'
 import { Prisma } from '../generated/prisma/client'
-import type { BookingStatus, ResourceBooking, ResourceType } from '../generated/prisma/client'
+import type { BookingStatus, NoShowDisputeStatus, ResourceBooking, ResourceType } from '../generated/prisma/client'
 import { publish, publishBookingChange } from '../lib/events'
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/httpError'
 import { prisma } from '../lib/prisma'
 import { dayLabel, slotLabel } from '../lib/timeLabels'
+import { logScoringFailure, scoreBooking } from './noShowScoring'
+import { sweepIfDue } from './noShowService'
 import { applyReliabilityDelta } from './reliabilityService'
 import { isReportableBooking } from './reportService'
 import { expireStaleRequests } from './requestHolds'
@@ -33,6 +35,16 @@ export interface BookingDto {
   canReport: boolean
   /** The student has an open report on this booking's resource. */
   reportOpen: boolean
+  /** Null unless the booking is a recorded no-show or carries a no-show dispute (see noShowInfo). */
+  noShow: NoShowInfo | null
+}
+
+/** What a student's booking says about a recorded no-show and their dispute of it. */
+export interface NoShowInfo {
+  /** A recorded no-show, inside the dispute window, with no dispute yet. */
+  canDispute: boolean
+  /** The student's dispute of it, if any; `note` is the librarian's answer (null while it is open). */
+  dispute: { status: NoShowDisputeStatus; note: string | null } | null
 }
 
 type ReportFlags = Pick<BookingDto, 'canReport' | 'reportOpen'>
@@ -43,9 +55,38 @@ type ReportFlags = Pick<BookingDto, 'canReport' | 'reportOpen'>
  */
 export const HOLDING_STATUSES: BookingStatus[] = ['requested', 'booked', 'checked_in']
 
+/** What a student is told about a booking whose grace period has ended (the librarian's cancel says the same for a released one). */
+const RELEASED_MESSAGE = 'This booking has already been released.'
+
 /** When a booking's check-in window closes -- and when a room request for it lapses. */
 export function graceEnd(booking: { startTime: Date; gracePeriodMinutes: number }): Date {
   return new Date(booking.startTime.getTime() + booking.gracePeriodMinutes * 60 * 1000)
+}
+
+/**
+ * The last instant a student may dispute a recorded no-show: NO_SHOW_DISPUTE_DAYS after the
+ * booking's own grace end. Computed from the booking's start and grace period, never from when the
+ * sweep happened to run, so a late sweep does not move it and no column is needed.
+ */
+export function noShowDisputeDeadline(booking: { startTime: Date; gracePeriodMinutes: number }): Date {
+  return new Date(graceEnd(booking).getTime() + NO_SHOW_DISPUTE_DAYS * 24 * 60 * 60 * 1000)
+}
+
+/**
+ * The `noShow` of a booking response. Null for every booking that is not a recorded no-show and has
+ * no no-show dispute. Otherwise `dispute` is the student's dispute (status, and the librarian's
+ * note once answered) and `canDispute` is true only for a `no_show` booking inside the window with
+ * no dispute yet. An overturned dispute leaves the booking `released`, and its card must keep
+ * saying what happened, so a dispute makes `noShow` non-null whatever the booking's status is.
+ */
+export function noShowInfo(
+  booking: { status: BookingStatus; startTime: Date; gracePeriodMinutes: number },
+  dispute: { status: NoShowDisputeStatus; resolutionNote: string | null } | null,
+  now: Date,
+): NoShowInfo | null {
+  if (dispute) return { canDispute: false, dispute: { status: dispute.status, note: dispute.resolutionNote } }
+  if (booking.status !== 'no_show') return null
+  return { canDispute: now <= noShowDisputeDeadline(booking), dispute: null }
 }
 
 interface BookingAlternative {
@@ -81,8 +122,11 @@ function slotForHour(hour: number) {
 
 // Computes the frontend's window-based status/countdown for a still-'booked'
 // row (checked_in and the request statuses are handled by the caller, which
-// has the raw status). No scheduler releases bookings, so 'released' is purely
-// a read-time label -- the DB status stays 'booked' regardless.
+// has the raw status). 'released' is the label for a row whose grace period
+// has passed, whatever the stored status is: the no-show sweep
+// (noShowService.sweepBookings) turns such a row into 'no_show' in the
+// database, but it runs about once a minute, so until it has, the stored
+// status is still 'booked' and this read-time label is what the student sees.
 function computeWindow(startTime: Date, gracePeriodMinutes: number, now: Date): { frontendStatus: 'upcomingFar' | 'inWindow' | 'released'; graceRemainingSeconds: number } {
   const end = graceEnd({ startTime, gracePeriodMinutes })
   if (now < startTime) return { frontendStatus: 'upcomingFar', graceRemainingSeconds: 0 }
@@ -121,7 +165,21 @@ async function reportFlags(
   })
 }
 
-function toBookingDto(booking: ResourceBooking & { resource: { name: string; type: string } }, now: Date, flags: ReportFlags): BookingDto {
+/**
+ * What every booking response loads with the booking row: its resource, and its no-show dispute
+ * (at most one) in the same query, so a list of bookings costs one read however many were disputed.
+ */
+const BOOKING_INCLUDE = {
+  resource: { select: { name: true, type: true } },
+  noShowDispute: { select: { status: true, resolutionNote: true } },
+} satisfies Prisma.ResourceBookingInclude
+
+type BookingRow = ResourceBooking & {
+  resource: { name: string; type: string }
+  noShowDispute: { status: NoShowDisputeStatus; resolutionNote: string | null } | null
+}
+
+function toBookingDto(booking: BookingRow, now: Date, flags: ReportFlags): BookingDto {
   const window = computeWindow(booking.startTime, booking.gracePeriodMinutes, now)
   // The library cancelled it exactly when cancelledById is set: a student's own cancel leaves it null.
   const cancelledByLibrary = booking.status === 'cancelled' && booking.cancelledById !== null
@@ -149,6 +207,7 @@ function toBookingDto(booking: ResourceBooking & { resource: { name: string; typ
     declineReason: booking.status === 'declined' ? booking.declineReason : null,
     cancelReason: cancelledByLibrary ? booking.cancelReason : null,
     movedFrom: booking.movedAt !== null && booking.movedAt >= outcomeVisibleSince(now) ? booking.movedFromName : null,
+    noShow: noShowInfo(booking, booking.noShowDispute, now),
     ...flags,
   }
 }
@@ -261,7 +320,7 @@ export async function createBooking(userId: string, resourceId: string, startTim
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${resourceId}))`
       return tx.resourceBooking.create({
         data: { userId, resourceId, startTime, endTime, status: isRoom ? 'requested' : 'booked', requestedAt: now },
-        include: { resource: { select: { name: true, type: true } }, user: { select: { name: true } } },
+        include: { ...BOOKING_INCLUDE, user: { select: { name: true } } },
       })
     })
     if (isRoom) {
@@ -275,7 +334,12 @@ export async function createBooking(userId: string, resourceId: string, startTim
       publishBookingChange()
     }
     const [flags] = await reportFlags(userId, [booking], now)
-    return toBookingDto(booking, now, flags)
+    const dto = toBookingDto(booking, now, flags)
+    // The no-show prediction (a seat's and a room's), off the request path: started only now, after the
+    // commit and with the answer in hand, and never awaited, so a slow or dead AI service costs this
+    // request nothing. It never throws (and does nothing without AI_BACKEND_URL); the catch is the net.
+    void scoreBooking(booking.id).catch((error) => logScoringFailure(booking.id, error))
+    return dto
   } catch (e) {
     if (isExclusionViolation(e)) {
       const alternatives = await findAlternatives(resource, startTime, endTime, now)
@@ -286,6 +350,9 @@ export async function createBooking(userId: string, resourceId: string, startTim
 }
 
 export async function listMyBookings(userId: string): Promise<BookingDto[]> {
+  // In the background and never awaited: this read still shows a just-missed booking as
+  // released; the next one shows the recorded no-show (see sweepIfDue).
+  sweepIfDue()
   const now = new Date()
   await expireStaleRequests(now)
   const since = outcomeVisibleSince(now)
@@ -301,7 +368,7 @@ export async function listMyBookings(userId: string): Promise<BookingDto[]> {
         { status: 'cancelled', cancelledById: { not: null }, cancelledAt: { gte: since } },
       ],
     },
-    include: { resource: { select: { name: true, type: true } } },
+    include: BOOKING_INCLUDE,
     orderBy: { startTime: 'asc' },
   })
   const flags = await reportFlags(userId, bookings, now)
@@ -319,6 +386,7 @@ async function getOwnedBooking(userId: string, bookingId: string) {
 }
 
 export async function checkInBooking(userId: string, bookingId: string): Promise<BookingDto> {
+  sweepIfDue()
   const booking = await getOwnedBooking(userId, bookingId)
   if (booking.status !== 'booked') throw new ConflictError('This booking cannot be checked into.')
 
@@ -336,10 +404,15 @@ export async function checkInBooking(userId: string, bookingId: string): Promise
       data: { status: 'checked_in', checkedInAt: now },
     })
     if (count === 0) return null
+    // A booking the AI scored when it was made has a NoShowEvent: the student came, so the
+    // labelled record says so (no event, nothing to do: this never creates one). It sits
+    // between the booking write above and the student's lock below on purpose: the sweep
+    // takes booking, event, student, and so must this, or the two could wait in a circle.
+    await tx.noShowEvent.updateMany({ where: { resourceBookingId: bookingId }, data: { actualNoShow: false } })
     await applyReliabilityDelta(tx, userId, RELIABILITY_ONTIME_BOOKING_BONUS, 'On-time check-in for a resource booking')
     return tx.resourceBooking.findUniqueOrThrow({
       where: { id: bookingId },
-      include: { resource: { select: { name: true, type: true } } },
+      include: BOOKING_INCLUDE,
     })
   })
   if (!updated) throw new ConflictError('This booking cannot be checked into.')
@@ -349,24 +422,42 @@ export async function checkInBooking(userId: string, bookingId: string): Promise
 }
 
 export async function cancelBooking(userId: string, bookingId: string): Promise<BookingDto> {
+  sweepIfDue()
   const booking = await getOwnedBooking(userId, bookingId)
+  // A recorded no-show and a plain release are the same fact the grace rule below names for a
+  // booking whose grace period has just ended and has not been swept yet: one reason, whichever
+  // side of the sweep the student pressed Cancel on (and the one the librarian's cancel uses).
+  if (booking.status === 'no_show' || booking.status === 'released') throw new ConflictError(RELEASED_MESSAGE)
   if (booking.status !== 'booked' && booking.status !== 'requested') {
     throw new ConflictError('This booking cannot be cancelled.')
   }
 
   const now = new Date()
   const withdrawing = booking.status === 'requested'
+  // Once the grace period has ended a booked slot is a missed one: cancelling it now would
+  // dodge the no-show the sweep is about to record. Strictly after the grace end, like a
+  // check-in's released window, so at the very end the student can still cancel; before it,
+  // even after the start, a cancel is allowed and costs nothing. A room REQUEST is
+  // withdrawn under its own lapse rules (expireStaleRequests), so it is exempt.
+  if (!withdrawing && now > graceEnd(booking)) throw new ConflictError(RELEASED_MESSAGE)
   // Conditional on the status just read, so a librarian's decision landing at
   // the same moment wins cleanly instead of being overwritten.
   const { count } = await prisma.resourceBooking.updateMany({
     where: { id: bookingId, status: booking.status },
     data: withdrawing ? { status: 'cancelled', decidedAt: now } : { status: 'cancelled' },
   })
-  if (count === 0) throw new ConflictError('This booking cannot be cancelled.')
+  if (count === 0) {
+    // Someone else's write landed between the read and this one: say what it was. When it was the
+    // sweep recording the no-show, it is the released wording; a librarian's cancel or a check-in
+    // keeps the generic one.
+    const current = await prisma.resourceBooking.findUnique({ where: { id: bookingId }, select: { status: true } })
+    const released = current?.status === 'no_show' || current?.status === 'released'
+    throw new ConflictError(released ? RELEASED_MESSAGE : 'This booking cannot be cancelled.')
+  }
 
   const updated = await prisma.resourceBooking.findUniqueOrThrow({
     where: { id: bookingId },
-    include: { resource: { select: { name: true, type: true } } },
+    include: BOOKING_INCLUDE,
   })
   if (withdrawing) publish({ type: 'request.cancelled', topics: ['requests'], kind: 'room' })
   else publishBookingChange()

@@ -2,10 +2,13 @@ import jwt from 'jsonwebtoken'
 import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { app } from '../../src/app'
-import { GRACE_PERIOD_MINUTES, JWT_SECRET } from '../../src/config/constants'
-import type { Prisma } from '../../src/generated/prisma/client'
+import { GRACE_PERIOD_MINUTES, JWT_SECRET, RELIABILITY_ONTIME_BOOKING_BONUS } from '../../src/config/constants'
+import type { BookingStatus, Prisma } from '../../src/generated/prisma/client'
 import { prisma } from '../../src/lib/prisma'
 import { dayLabel, slotLabel } from '../../src/lib/timeLabels'
+import { cancelBooking, checkInBooking } from '../../src/services/bookingService'
+import { sweepBookings } from '../../src/services/noShowService'
+import { bookingLockedThenCompete, waitUntilAWriterIsBlocked } from '../helpers/bookingLock'
 import { resetDb } from '../helpers/db'
 import { recordEvents } from '../helpers/events'
 
@@ -946,7 +949,13 @@ describe('GET /bookings/me with problem-report flags', () => {
       ['completed yesterday', -DAY_MS, 'completed', true],
       ['checked in', -HOUR_MS, 'checked_in', true],
       ['a request', 2 * HOUR_MS, 'requested', false],
-      ['a no-show', -HOUR_MS, 'no_show', false],
+      // The sweep turns a booking never checked into into a no-show, and an overturned one is a
+      // release: both still entitle, inside the same window as the rest.
+      ['a no-show', -HOUR_MS, 'no_show', true],
+      ['a release', -HOUR_MS, 'released', true],
+      ['a no-show a minute inside 7 days ago', -(7 * DAY_MS - MINUTE_MS), 'no_show', true],
+      ['a no-show a minute outside 7 days ago', -(7 * DAY_MS + MINUTE_MS), 'no_show', false],
+      ['a release a minute outside 7 days ago', -(7 * DAY_MS + MINUTE_MS), 'released', false],
     ]
     const expectedOf = new Map<string, [string, boolean]>()
     for (const [what, offset, status, qualifies] of cases) {
@@ -1034,7 +1043,7 @@ describe('GET /bookings/me with problem-report flags', () => {
     expect(cancelled.body).toMatchObject({ status: 'cancelled', canReport: false, reportOpen: true })
   })
 
-  it('the only change to a booking row is the two new keys', async () => {
+  it('a booking row has exactly these keys: slice 6 added the two flags, slice 7 added noShow, nothing else changed', async () => {
     const { user, token } = await seedUser()
     const desk = await seedResource('seat', 'Desk 1')
     await seedBooking(user.id, desk.id, -HOUR_MS, 'checked_in')
@@ -1045,8 +1054,506 @@ describe('GET /bookings/me with problem-report flags', () => {
       [
         'id', 'userId', 'resourceId', 'resourceName', 'resourceType', 'startTime', 'endTime', 'status', 'frontendStatus',
         'graceRemainingSeconds', 'checkedInAt', 'expiresAt', 'declineReason', 'cancelReason', 'movedFrom',
-        'canReport', 'reportOpen',
+        'canReport', 'reportOpen', 'noShow',
       ].sort(),
     )
+  })
+})
+
+// --- Slice 7: a cancel after the grace period, and a check-in's no-show event --------------------
+
+const MINUTE_MS = 60 * 1000
+const HOUR_MS = 60 * MINUTE_MS
+
+// A heavy test here is 25 to 30 round trips to a remote database (8 to 9 s on a slow day), so the
+// two describes take a longer timeout than the file's 15 s default.
+describe('POST /bookings/:id/cancel once the grace period has ended', { timeout: 60_000 }, () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+  })
+
+  /** A one-hour booking on a seat of its own whose grace period ends `graceEndsInMs` from now (negative: it ended that long ago). */
+  async function seatWithGraceEndingIn(userId: string, graceEndsInMs: number, status: BookingStatus = 'booked') {
+    const seat = await seedResource()
+    const startTime = new Date(Date.now() + graceEndsInMs - GRACE_PERIOD_MINUTES * MINUTE_MS)
+    return prisma.resourceBooking.create({
+      data: { userId, resourceId: seat.id, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status },
+    })
+  }
+  const cancel = (token: string, id: string) => request(app).post(`/bookings/${id}/cancel`).set('Authorization', `Bearer ${token}`)
+
+  it('a cancel after the grace period is 409 and the booking is untouched', async () => {
+    const { user, token } = await seedUser()
+    const booking = await seatWithGraceEndingIn(user.id, -MINUTE_MS)
+    recorder = recordEvents()
+
+    const res = await cancel(token, booking.id)
+
+    expect(res.status).toBe(409)
+    expect(res.body).toEqual({ error: 'This booking has already been released.' })
+    const after = await prisma.resourceBooking.findUniqueOrThrow({ where: { id: booking.id } })
+    expect(after).toEqual(booking)
+    expect(after.status).toBe('booked')
+    expect(after.cancelledAt).toBeNull()
+    // A refusal publishes nothing.
+    expect(recorder.events).toEqual([])
+
+    // It did not dodge the sweep: the next sweep records the no-show.
+    expect(await sweepBookings(new Date())).toEqual({ noShows: 1, reminders: 0, remaining: 0 })
+    expect((await prisma.resourceBooking.findUniqueOrThrow({ where: { id: booking.id } })).status).toBe('no_show')
+  })
+
+  it('a cancel one minute before the grace period ends is allowed and records no no-show', async () => {
+    const { user, token } = await seedUser()
+    // Started 14 minutes ago: after the start, inside the grace period.
+    const booking = await seatWithGraceEndingIn(user.id, MINUTE_MS)
+
+    const res = await cancel(token, booking.id)
+
+    expect(res.status).toBe(200)
+    expect(res.body.status).toBe('cancelled')
+    // Costs nothing now, and nothing later: not even a sweep run well after the grace end finds it.
+    expect(await sweepBookings(new Date(Date.now() + 30 * MINUTE_MS))).toEqual({ noShows: 0, reminders: 0, remaining: 0 })
+    expect(await prisma.noShowEvent.count()).toBe(0)
+    expect(await prisma.reliabilityScoreLog.count()).toBe(0)
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).reliabilityScore).toBe(100)
+  })
+
+  it('refuses only strictly after the grace end: exactly at it the cancel still works, a millisecond later it does not', async () => {
+    const { user } = await seedUser()
+    const atTheEnd = await seatWithGraceEndingIn(user.id, 5 * MINUTE_MS)
+    // A second booking with the very same start, so the same grace end.
+    const seat = await seedResource()
+    const justAfter = await prisma.resourceBooking.create({
+      data: { userId: user.id, resourceId: seat.id, startTime: atTheEnd.startTime, endTime: atTheEnd.endTime, status: 'booked' },
+    })
+    const graceEnd = atTheEnd.startTime.getTime() + GRACE_PERIOD_MINUTES * MINUTE_MS
+
+    // Only Date is faked: the clock cancelBooking reads stands still at the instant under test.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(graceEnd)
+      expect((await cancelBooking(user.id, atTheEnd.id)).status).toBe('cancelled')
+
+      vi.setSystemTime(graceEnd + 1)
+      await expect(cancelBooking(user.id, justAfter.id)).rejects.toMatchObject({ status: 409, message: 'This booking has already been released.' })
+    } finally {
+      vi.useRealTimers()
+    }
+    expect((await prisma.resourceBooking.findUniqueOrThrow({ where: { id: justAfter.id } })).status).toBe('booked')
+  })
+
+  it('a room request can still be withdrawn after its start: its own lapse rules apply, not this one', async () => {
+    const { user, token } = await seedUser()
+    const room = await seedResource('room', 'Room 201')
+    const startTime = new Date(Date.now() - 20 * MINUTE_MS)
+    const request_ = await prisma.resourceBooking.create({
+      data: { userId: user.id, resourceId: room.id, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status: 'requested' },
+    })
+
+    const res = await cancel(token, request_.id)
+
+    expect(res.status).toBe(200)
+    expect(res.body.status).toBe('cancelled')
+  })
+
+  // The same words the rule above uses, and the librarian's cancel uses for the same case: whether the
+  // student pressed Cancel a second before the sweep ran (a still-`booked` row past its grace) or a second
+  // after (a stored `no_show`), the reason is the same one.
+  it.each(['no_show', 'released'] as const)('a stored %s booking answers "already been released", and nothing changes', async (status) => {
+    const { user, token } = await seedUser()
+    const booking = await seatWithGraceEndingIn(user.id, -MINUTE_MS, status)
+
+    const res = await cancel(token, booking.id)
+
+    expect(res.status).toBe(409)
+    expect(res.body).toEqual({ error: 'This booking has already been released.' })
+    expect(await prisma.resourceBooking.findUniqueOrThrow({ where: { id: booking.id } })).toEqual(booking)
+  })
+
+  it.each(['cancelled', 'declined', 'expired', 'checked_in', 'completed'] as const)(
+    'a %s booking keeps the generic refusal, and nothing changes',
+    async (status) => {
+      const { user, token } = await seedUser()
+      const booking = await seatWithGraceEndingIn(user.id, -MINUTE_MS, status)
+
+      const res = await cancel(token, booking.id)
+
+      expect(res.status).toBe(409)
+      expect(res.body).toEqual({ error: 'This booking cannot be cancelled.' })
+      expect(await prisma.resourceBooking.findUniqueOrThrow({ where: { id: booking.id } })).toEqual(booking)
+    },
+  )
+
+  it('a cancel that loses its write to the sweep says "already been released", and the no-show stands', async () => {
+    const { user } = await seedUser()
+    // Inside the grace period when the student presses Cancel, so the rule above lets it through to its write.
+    const booking = await seatWithGraceEndingIn(user.id, 5 * MINUTE_MS)
+
+    // The sweep's committed result lands while the cancel's write waits on the booking row.
+    const settled = await bookingLockedThenCompete(
+      booking.id,
+      () => cancelBooking(user.id, booking.id),
+      async (tx) => {
+        await tx.resourceBooking.update({ where: { id: booking.id }, data: { status: 'no_show' } })
+      },
+    )
+
+    expect(settled.status).toBe('rejected')
+    expect((settled as PromiseRejectedResult).reason).toMatchObject({ status: 409, message: 'This booking has already been released.' })
+    const after = await prisma.resourceBooking.findUniqueOrThrow({ where: { id: booking.id } })
+    expect(after.status).toBe('no_show')
+    expect(after.cancelledAt).toBeNull()
+  })
+
+  it.each([
+    ['a librarian cancelled it', { status: 'cancelled', cancelledAt: new Date() }],
+    ['the student checked in on another device', { status: 'checked_in', checkedInAt: new Date() }],
+  ] as const)('a cancel that loses its write because %s keeps the generic refusal', async (_what, change) => {
+    const { user } = await seedUser()
+    const booking = await seatWithGraceEndingIn(user.id, 5 * MINUTE_MS)
+
+    const settled = await bookingLockedThenCompete(
+      booking.id,
+      () => cancelBooking(user.id, booking.id),
+      async (tx) => {
+        await tx.resourceBooking.update({ where: { id: booking.id }, data: change })
+      },
+    )
+
+    expect(settled.status).toBe('rejected')
+    expect((settled as PromiseRejectedResult).reason).toMatchObject({ status: 409, message: 'This booking cannot be cancelled.' })
+  })
+})
+
+describe('POST /bookings/:id/checkin and the no-show event', { timeout: 60_000 }, () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+  })
+
+  /** A booking whose window opened `startedMsAgo` ago, on a seat of its own. */
+  async function seatStartedAgo(userId: string, startedMsAgo: number, status: BookingStatus = 'booked') {
+    const seat = await seedResource()
+    const startTime = new Date(Date.now() - startedMsAgo)
+    return prisma.resourceBooking.create({
+      data: { userId, resourceId: seat.id, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status },
+    })
+  }
+  const checkIn = (token: string, id: string) => request(app).post(`/bookings/${id}/checkin`).set('Authorization', `Bearer ${token}`)
+  const scoreOf = (id: string) => prisma.user.findUniqueOrThrow({ where: { id } }).then((u) => u.reliabilityScore)
+
+  it('check-in on a no_show booking is 409', async () => {
+    const { user, token } = await seedUser()
+    // One inside what would have been the window (so only the status can refuse it) and one after it.
+    const inside = await seatStartedAgo(user.id, 1_000, 'no_show')
+    const after = await seatStartedAgo(user.id, 20 * MINUTE_MS, 'no_show')
+    const event = await prisma.noShowEvent.create({ data: { resourceBookingId: after.id, userId: user.id, actualNoShow: true, reliabilityDelta: -10 } })
+    recorder = recordEvents()
+
+    for (const booking of [inside, after]) {
+      const res = await checkIn(token, booking.id)
+      expect(res.status).toBe(409)
+      expect(res.body).toEqual({ error: 'This booking cannot be checked into.' })
+      expect((await prisma.resourceBooking.findUniqueOrThrow({ where: { id: booking.id } })).status).toBe('no_show')
+    }
+    // No bonus, no log, nothing published, and the event still says what the sweep recorded.
+    expect(await scoreOf(user.id)).toBe(100)
+    expect(await prisma.reliabilityScoreLog.count()).toBe(0)
+    expect(recorder.events).toEqual([])
+    expect(await prisma.noShowEvent.findUniqueOrThrow({ where: { id: event.id } })).toEqual(event)
+  })
+
+  it('a check-in marks an existing NoShowEvent actualNoShow=false', async () => {
+    const { user, token } = await seedUser()
+    await prisma.user.update({ where: { id: user.id }, data: { reliabilityScore: 90 } })
+    const { user: other } = await seedUser()
+    const booking = await seatStartedAgo(user.id, 1_000)
+    const scored = await prisma.noShowEvent.create({ data: { resourceBookingId: booking.id, userId: user.id, predictedProbability: 0.31 } })
+    // Another booking's event is none of this check-in's business.
+    const otherBooking = await seatStartedAgo(other.id, 1_000)
+    const otherEvent = await prisma.noShowEvent.create({ data: { resourceBookingId: otherBooking.id, userId: other.id, predictedProbability: 0.5 } })
+
+    const res = await checkIn(token, booking.id)
+
+    expect(res.status).toBe(200)
+    expect(res.body.frontendStatus).toBe('checkedIn')
+    const after = await prisma.noShowEvent.findUniqueOrThrow({ where: { id: scored.id } })
+    expect(after.actualNoShow).toBe(false)
+    // Only that flag changes: the score the model gave it stays, for the retraining.
+    expect(after).toEqual({ ...scored, actualNoShow: false })
+    expect(await prisma.noShowEvent.findUniqueOrThrow({ where: { id: otherEvent.id } })).toEqual(otherEvent)
+    // ...and the on-time bonus is still paid, once.
+    expect(await scoreOf(user.id)).toBe(90 + RELIABILITY_ONTIME_BOOKING_BONUS)
+  })
+
+  it('a check-in of a booking that was never scored makes no event', async () => {
+    const { user, token } = await seedUser()
+    const booking = await seatStartedAgo(user.id, 1_000)
+
+    const res = await checkIn(token, booking.id)
+
+    expect(res.status).toBe(200)
+    expect(await prisma.noShowEvent.count()).toBe(0)
+  })
+
+  it('a refused check-in leaves the event alone', async () => {
+    const { user, token } = await seedUser()
+    const booking = await seatStartedAgo(user.id, 20 * MINUTE_MS) // booked, grace period over
+    const event = await prisma.noShowEvent.create({ data: { resourceBookingId: booking.id, userId: user.id, predictedProbability: 0.4 } })
+
+    const res = await checkIn(token, booking.id)
+
+    expect(res.status).toBe(409)
+    expect(await prisma.noShowEvent.findUniqueOrThrow({ where: { id: event.id } })).toEqual(event)
+  })
+
+  it('a check-in that loses to the sweep leaves the event as the sweep wrote it', async () => {
+    const { user } = await seedUser()
+    const booking = await seatStartedAgo(user.id, 1_000)
+    await prisma.noShowEvent.create({ data: { resourceBookingId: booking.id, userId: user.id, predictedProbability: 0.4 } })
+
+    // The sweep's committed result lands while the check-in's write waits on the booking row.
+    const settled = await bookingLockedThenCompete(
+      booking.id,
+      () => checkInBooking(user.id, booking.id),
+      async (tx) => {
+        await tx.resourceBooking.update({ where: { id: booking.id }, data: { status: 'no_show' } })
+        await tx.noShowEvent.update({ where: { resourceBookingId: booking.id }, data: { actualNoShow: true, reliabilityDelta: -10 } })
+      },
+    )
+
+    expect(settled.status).toBe('rejected')
+    expect((settled as PromiseRejectedResult).reason).toMatchObject({ status: 409, message: 'This booking cannot be checked into.' })
+    // The event is still the sweep's: the check-in wrote nothing, the flag was not flipped back.
+    const event = await prisma.noShowEvent.findUniqueOrThrow({ where: { resourceBookingId: booking.id } })
+    expect(event.actualNoShow).toBe(true)
+    expect(event.reliabilityDelta).toBe(-10)
+    expect(await scoreOf(user.id)).toBe(100)
+  })
+
+  it('takes the booking row, then the event row, then the student row: the sweep\'s lock order', async () => {
+    const { user, token } = await seedUser()
+    const booking = await seatStartedAgo(user.id, 1_000)
+    await prisma.noShowEvent.create({ data: { resourceBookingId: booking.id, userId: user.id, predictedProbability: 0.4 } })
+
+    // Hold the STUDENT's row, so the check-in gets as far as its student-row lock and waits there.
+    // By then it must already hold the other two: a competing sweep (booking, event, student) could
+    // otherwise wait on it in a circle.
+    let pending: PromiseLike<request.Response> | undefined
+    await prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${user.id} FOR UPDATE`
+        pending = checkIn(token, booking.id).then((res) => res)
+        await waitUntilAWriterIsBlocked()
+        await expect(prisma.$queryRaw`SELECT id FROM "ResourceBooking" WHERE id = ${booking.id} FOR UPDATE NOWAIT`).rejects.toThrow()
+        await expect(prisma.$queryRaw`SELECT id FROM "NoShowEvent" WHERE "resourceBookingId" = ${booking.id} FOR UPDATE NOWAIT`).rejects.toThrow()
+      },
+      { timeout: 30_000, maxWait: 30_000 },
+    ).finally(async () => {
+      await pending
+    })
+
+    const res = await pending!
+    expect(res.status).toBe(200)
+    expect((await prisma.noShowEvent.findUniqueOrThrow({ where: { resourceBookingId: booking.id } })).actualNoShow).toBe(false)
+  })
+})
+
+// --- Slice 7: the `noShow` key every booking response carries --------------------------------------
+// (The dispute route itself is in test/routes/noShowDisputes.test.ts.)
+
+describe('booking responses and the no-show state', { timeout: 60_000 }, () => {
+  beforeEach(resetDb)
+  afterEach(() => vi.restoreAllMocks())
+
+  const DAY_MS = 24 * HOUR_MS
+  const auth = (token: string) => ({ Authorization: `Bearer ${token}` })
+
+  type NoShowRow = {
+    id: string
+    resourceId: string
+    status: string
+    frontendStatus: string
+    graceRemainingSeconds: number
+    noShow: { canDispute: boolean; dispute: { status: string; note: string | null } | null } | null
+  }
+
+  /** A one-hour booking on a seat of its own whose check-in window closed `endedAgoMs` ago. */
+  async function seatEndedAgo(userId: string, endedAgoMs: number, status: BookingStatus = 'no_show') {
+    const seat = await seedResource()
+    const startTime = new Date(Date.now() - endedAgoMs - GRACE_PERIOD_MINUTES * MINUTE_MS)
+    return prisma.resourceBooking.create({
+      data: { userId, resourceId: seat.id, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status },
+    })
+  }
+
+  function seedDispute(bookingId: string, userId: string, status: 'open' | 'overturned' | 'upheld', resolutionNote: string | null = null) {
+    return prisma.noShowDispute.create({
+      data: { bookingId, userId, reason: 'The scanner was down', status, resolutionNote, ...(status === 'open' ? {} : { resolvedAt: new Date() }) },
+    })
+  }
+
+  const myBookings = (token: string) => request(app).get('/bookings/me').set(auth(token))
+  const byResource = (rows: NoShowRow[]) => new Map(rows.map((row) => [row.resourceId, row]))
+
+  it("GET /bookings/me shows noShow {canDispute, dispute} and keeps frontendStatus 'released'", async () => {
+    const { user, token } = await seedUser()
+    const fresh = await seatEndedAgo(user.id, HOUR_MS)
+    const opened = await seatEndedAgo(user.id, HOUR_MS)
+    const upheld = await seatEndedAgo(user.id, 2 * HOUR_MS)
+    const late = await seatEndedAgo(user.id, 8 * DAY_MS)
+    await seedDispute(opened.id, user.id, 'open')
+    await seedDispute(upheld.id, user.id, 'upheld', 'The scanner log shows no tap')
+
+    const res = await myBookings(token)
+
+    expect(res.status).toBe(200)
+    const rows = byResource(res.body)
+    expect(rows.size).toBe(4)
+    // Inside the 7 days with no dispute yet: the one state the Dispute button shows for.
+    expect(rows.get(fresh.resourceId)!.noShow).toEqual({ canDispute: true, dispute: null })
+    // A dispute under review, then one the library kept: canDispute is false, the note is null until there is one.
+    expect(rows.get(opened.resourceId)!.noShow).toEqual({ canDispute: false, dispute: { status: 'open', note: null } })
+    expect(rows.get(upheld.resourceId)!.noShow).toEqual({ canDispute: false, dispute: { status: 'upheld', note: 'The scanner log shows no tap' } })
+    // Past the 7 days: nothing to dispute with, nothing disputed.
+    expect(rows.get(late.resourceId)!.noShow).toEqual({ canDispute: false, dispute: null })
+    // An older app decodes only the values it knows: a no-show is still 'released' to it, the stored status says no_show.
+    for (const row of rows.values()) {
+      expect(row).toMatchObject({ status: 'no_show', frontendStatus: 'released', graceRemainingSeconds: 0 })
+    }
+  })
+
+  it('an overturned booking is released again and keeps saying what happened', async () => {
+    const { user, token } = await seedUser()
+    const overturned = await seatEndedAgo(user.id, 2 * HOUR_MS, 'released')
+    const plain = await seatEndedAgo(user.id, 2 * HOUR_MS, 'released')
+    await seedDispute(overturned.id, user.id, 'overturned', 'The scanner was down that morning')
+
+    const rows = byResource((await myBookings(token)).body)
+
+    expect(rows.get(overturned.resourceId)).toMatchObject({
+      status: 'released',
+      frontendStatus: 'released',
+      noShow: { canDispute: false, dispute: { status: 'overturned', note: 'The scanner was down that morning' } },
+    })
+    // A release that never was a recorded no-show has nothing to say.
+    expect(rows.get(plain.resourceId)).toMatchObject({ status: 'released', frontendStatus: 'released', noShow: null })
+  })
+
+  it('a booking that is not a no-show has noShow null', async () => {
+    const { user, token } = await seedUser()
+    const { user: librarian } = await seedUser()
+    const now = Date.now()
+    const hourFrom = (offsetMs: number) => ({ startTime: new Date(now + offsetMs), endTime: new Date(now + offsetMs + HOUR_MS) })
+    const cases: Array<[string, Prisma.ResourceBookingUncheckedCreateWithoutResourceInput]> = [
+      ['booked, window not open yet', { userId: user.id, status: 'booked', ...hourFrom(3 * HOUR_MS) }],
+      ['booked, inside the window', { userId: user.id, status: 'booked', ...hourFrom(-5 * MINUTE_MS) }],
+      ['booked, grace ended but not swept yet', { userId: user.id, status: 'booked', ...hourFrom(-2 * HOUR_MS) }],
+      ['checked in', { userId: user.id, status: 'checked_in', ...hourFrom(-HOUR_MS), checkedInAt: new Date(now - HOUR_MS) }],
+      ['completed', { userId: user.id, status: 'completed', ...hourFrom(-2 * DAY_MS) }],
+      ['a room request', { userId: user.id, status: 'requested', ...hourFrom(5 * HOUR_MS) }],
+      ['a declined request', { userId: user.id, status: 'declined', decidedAt: new Date(now), ...hourFrom(5 * HOUR_MS) }],
+      ['an expired request', { userId: user.id, status: 'expired', decidedAt: new Date(now), ...hourFrom(-2 * HOUR_MS) }],
+      ['cancelled by the library', { userId: user.id, status: 'cancelled', cancelledById: librarian.id, cancelledAt: new Date(now), ...hourFrom(5 * HOUR_MS) }],
+      ['released, never a recorded no-show', { userId: user.id, status: 'released', ...hourFrom(-2 * DAY_MS) }],
+    ]
+    const expected = new Map<string, string>()
+    for (const [what, data] of cases) {
+      const resource = await seedResource('seat', what)
+      await prisma.resourceBooking.create({ data: { ...data, resourceId: resource.id } })
+      expected.set(resource.id, what)
+    }
+
+    const res = await myBookings(token)
+
+    expect(res.body).toHaveLength(cases.length)
+    for (const row of res.body as NoShowRow[]) {
+      // The key is there and null: a booking that is not a no-show says so rather than leaving the key out.
+      expect(row, expected.get(row.resourceId)).toHaveProperty('noShow', null)
+    }
+  })
+
+  it('every booking-returning route carries the noShow key', async () => {
+    const { user, token } = await seedUser()
+    const seat = await seedResource('seat', 'Desk 1')
+    const room = await seedResource('room', 'Group Room 201')
+    const otherSeat = await seedResource('seat', 'Desk 2')
+    const soon = new Date(Date.now() + 2 * HOUR_MS)
+    const book = (resourceId: string) =>
+      request(app)
+        .post('/bookings')
+        .set(auth(token))
+        .send({ resourceId, startTime: soon.toISOString(), endTime: new Date(soon.getTime() + HOUR_MS).toISOString() })
+
+    const seatBooked = await book(seat.id)
+    const roomRequested = await book(room.id)
+    const started = await prisma.resourceBooking.create({
+      data: { userId: user.id, resourceId: otherSeat.id, startTime: new Date(Date.now() - MINUTE_MS), endTime: new Date(Date.now() + HOUR_MS) },
+    })
+    const checkedIn = await request(app).post(`/bookings/${started.id}/checkin`).set(auth(token))
+    const cancelled = await request(app).post(`/bookings/${seatBooked.body.id}/cancel`).set(auth(token))
+    const listed = await myBookings(token)
+
+    expect(seatBooked.status).toBe(201)
+    expect(roomRequested.status).toBe(201)
+    expect(checkedIn.status).toBe(200)
+    expect(cancelled.status).toBe(200)
+    expect(listed.status).toBe(200)
+    for (const [what, body] of [
+      ['POST /bookings (a seat)', seatBooked.body],
+      ['POST /bookings (a room request)', roomRequested.body],
+      ['check-in', checkedIn.body],
+      ['cancel', cancelled.body],
+      ...(listed.body as unknown[]).map((row, i) => [`GET /bookings/me row ${i}`, row] as const),
+    ] as Array<[string, object]>) {
+      expect(body, what).toHaveProperty('noShow', null)
+    }
+    expect(listed.body.length).toBeGreaterThan(0)
+  })
+
+  it('loads the disputes with the bookings in one query however many are listed', async () => {
+    const { user, token } = await seedUser()
+    const spies = [
+      vi.spyOn(prisma.noShowDispute, 'findMany'),
+      vi.spyOn(prisma.noShowDispute, 'findFirst'),
+      vi.spyOn(prisma.noShowDispute, 'findUnique'),
+      vi.spyOn(prisma.noShowDispute, 'count'),
+      vi.spyOn(prisma.resourceBooking, 'findMany'),
+      vi.spyOn(prisma.resourceBooking, 'findFirst'),
+      vi.spyOn(prisma.resourceBooking, 'count'),
+    ]
+    // How often each of those reads ran during the one request made by `read`.
+    async function callsDuring(read: () => Promise<request.Response>) {
+      spies.forEach((spy) => spy.mockClear())
+      const res = await read()
+      return { res, calls: spies.map((spy) => spy.mock.calls.length) }
+    }
+    const statuses = ['open', 'upheld', 'overturned'] as const
+    let added = 0
+    async function addDisputed() {
+      const status = statuses[added++ % statuses.length]
+      const booking = await seatEndedAgo(user.id, HOUR_MS, status === 'overturned' ? 'released' : 'no_show')
+      await seedDispute(booking.id, user.id, status, status === 'open' ? null : `Note ${added}`)
+    }
+
+    await addDisputed()
+    const one = await callsDuring(() => myBookings(token))
+    for (let i = 0; i < 6; i++) await addDisputed()
+    const seven = await callsDuring(() => myBookings(token))
+
+    expect(one.res.body).toHaveLength(1)
+    expect(seven.res.body).toHaveLength(7)
+    // The disputes came with the bookings: every row carries its own, so none was read one at a time.
+    const noShows = (seven.res.body as NoShowRow[]).map((row) => row.noShow?.dispute?.status).sort()
+    expect(noShows).toEqual(['open', 'open', 'open', 'overturned', 'overturned', 'upheld', 'upheld'])
+    // One read of the student's bookings (the disputes loaded with it) and none of the dispute table's own, whatever the list holds.
+    expect(one.calls).toEqual([0, 0, 0, 0, 1, 0, 0])
+    expect(seven.calls).toEqual(one.calls)
   })
 })

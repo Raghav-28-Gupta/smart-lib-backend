@@ -51,7 +51,9 @@ with `npx prisma migrate dev --create-only` and read the SQL before applying
 it. Prisma doesn't model any of these, so a generated migration may try to drop
 them. (`20261121215218_console_catalogue` also hand-writes the barcode sequence
 and the `next_copy_barcode()` function that is `BookCopy.barcode`'s default; see
-*Catalogue and copies*.)
+*Catalogue and copies*; `20261124083414_no_show_handling` ends with a hand-written
+backfill `UPDATE`, see *No-shows*, and is why the database should be backed up
+before that migration is deployed.)
 
 The `EXCLUDE` constraint makes double-booking a resource a *database-level*
 impossibility rather than something application code has to get right on
@@ -100,7 +102,24 @@ It also generates four weeks of past activity, ending yesterday, for the six
 about 1 in 5 missed) and 40-60 loans. The admin console's Dashboard reads it.
 The same seed (`HISTORY_SEED` in `prisma/history.ts`) gives the same history
 every time, shifted to end yesterday. The demo student's account gets none of
-it, so the student app looks exactly as before.
+it, apart from the one missed booking described below.
+
+**No-shows.** Every seeded booking whose grace period has already ended is
+written in its final state, so the first sweep after a seed finds nothing old to
+penalize: the history's missed bookings are `no_show` rows, each with its
+`NoShowEvent` (labelled a no-show, with a plausible predicted probability and no
+points recorded as taken). Today's "taken" slots follow the seed's clock: over
+is `no_show`, started but inside its grace period is `checked_in`, still to come
+stays `booked` (and the sweep treats it like any real booking). A seeded no-show
+is backstory, not an event: it has no reliability log line, no notice and no
+email, and nobody's score moves. The demo student has exactly one such booking,
+a Group Room 201 slot two or more days back (its grace period ended within the
+last 6 days), so she can open My Bookings and dispute it within the 7-day
+window; overturning it restores no points, since none were taken. The seed also
+opens two no-show disputes, on the newest recent no-shows of two different seed
+students (a short plain-text reason each, a few hours old), so the Needs
+attention queue has a "No-show disputes" chip with data. The printed summary
+shows both counts.
 
 Each late return in that history also has its overdue fine: one waived and one
 lowered (with their notes), the older ones paid, and at least the two newest
@@ -117,7 +136,8 @@ So that **Needs attention** has data on a fresh seed, it also opens two fine
 disputes (on the two newest outstanding fines, each marked disputed, so *Mark
 paid* is refused until a librarian answers), one problem report on a copy of a
 demo book (damaged, on the shelf) and one on a seed seat or room (not working),
-all by seed students, a few hours old, and none naming a librarian. The queue's
+all by seed students, a few hours old, and none naming a librarian (the two
+no-show disputes above join them in the queue). The queue's
 overdue items include the demo student's overdue loan and the seed students'
 open history loans that are a day or more past due. The seed creates no notices
 and sends no email.
@@ -134,8 +154,9 @@ the console added.
 - every loan, borrow request, waitlist entry, cached recommendation and fine
   tied to a demo book or one of its copies, including other students' and ones
   made through the live app, so no fine is left without its loan;
-- the demo resources, and every booking on them, with its no-show record and
-  fines;
+- the demo resources, and every booking on them, with its no-show record,
+  no-show dispute (the seeded two included, and other students' on a demo
+  resource, open or answered) and fines;
 - every fine dispute on a fine that goes (so none is left without its fine,
   other students' on demo books included), and every problem report on a demo
   book's copy or a demo resource, whoever made it;
@@ -148,10 +169,22 @@ the console added.
   as it is.
 
 **A re-seed never touches:** books and resources a librarian added, their
-copies, other students' loans, requests, bookings, fines, disputes and problem
-reports on them, other students' notices (one about a demo loan or fine only
+copies, other students' loans, requests, bookings, fines, disputes (a no-show
+dispute a librarian answered, or a student opened, on a booking of such a
+resource stays with its booking and its no-show record) and problem reports on
+them, other students' notices (one about a demo loan, fine or booking only
 loses that link), other accounts (including admin accounts), and the shared
-barcode sequence.
+barcode sequence. Running the seed twice in a row is safe: the second run
+replaces the seeded no-shows and disputes, and sends nothing.
+
+**Stop a running dev server before re-seeding.** The server's 60-second sweep
+timer can record a no-show for a seed student's booking in the instant between
+the reset deleting the no-show records and deleting the bookings. The reset
+then fails on a foreign key (`NoShowEvent_resourceBookingId_fkey`) and rolls back
+whole, so nothing is half-deleted; stop the server and run `npm run seed`
+again. The same goes for any seed that fails with a foreign-key (`23001`) or
+deadlock (`40P01`) error while a server is running: it rolled back whole, so run
+it again. (A known limitation: the reset does not lock the bookings first.)
 
 Only the reset is atomic: it runs in one transaction, so a failure part-way
 through it leaves the database as it was. The recreate that follows is not in
@@ -246,7 +279,8 @@ TypeScript, a dev dependency. Node 22 comes from `engines` in `package.json`.
 | `MAIL_FROM_NAME` | Optional: the sender's display name. `SmartLib` when unset |
 | `MAIL_ALLOWED_DOMAINS` | Optional, comma-separated, for example `thapar.edu`: only addresses at exactly these domains get email (the whole part after the `@`: `thapar.edu` does not match `mail.thapar.edu`) and every other address is skipped. Unset: every address except the seed's demo accounts |
 | `PORT` | Set by Render |
-| `AI_BACKEND_URL` | Unset: the AI service isn't deployed, so recommendations fall back to what's popular |
+| `SWEEP_TOKEN` | Optional, and a secret: a long random string (generator command in `.env.example`). `POST /internal/sweep` answers 404 until it is set; the scheduled workflow sends the same value (see *Owner steps for the no-show slice* below). Set it only here and as a repo secret, never in a file you commit |
+| `AI_BACKEND_URL` | Unset: the AI service isn't deployed, so recommendations fall back to what's popular and **no booking is scored**, so every room request keeps priority 1.0 (see *No-shows*). Set it to the AI service's own address only when that service is deployed |
 
 ### First-time setup
 
@@ -275,6 +309,67 @@ next request takes about a minute while it wakes.
 **Running the production build locally:** `npm run build && npm start`
 (compiled JavaScript, as Render runs it, rather than `npm run dev`).
 
+### Owner steps for the no-show slice
+
+In this order. The backend ships as **one** deploy: the migration backfills old
+rows and the cancel rule, the report rule and the Bookings filter change with it,
+so shipping part of it would leave old unattended bookings as `released` rows
+that the rest of the code does not handle yet.
+
+1. **Back up the database first.** Migration `20261124083414_no_show_handling`
+   updates rows (every past `booked` booking whose grace period has ended becomes
+   `released`) and Render's build runs it (`prisma migrate deploy`). A booking
+   whose grace period ends between the migration and the first sweep is swept
+   with a penalty (negligible; avoid a deploy straddling a quarter past the hour).
+   **If the deploy fails after its migration ran** (for example the new server
+   fails its health check and Render keeps the old one running on the migrated
+   database), the old code keeps letting unattended bookings stay `booked`. Before
+   the fixed deploy goes live, run the migration's backfill `UPDATE` again by hand
+   (it is the last statement of `prisma/migrations/20261124083414_no_show_handling/migration.sql`),
+   or the first sweep after the fix will penalize and email every miss of the last
+   24 hours, all made under the old app.
+2. **Deploy in this order:** the backend with its migration, then the admin
+   console (it reads `counts.no_show_dispute`), then the app with a new APK tag,
+   then enable the workflow.
+3. **Set the sweep up.** On Render set `SWEEP_TOKEN` (a long random string:
+   `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"`).
+   In the repository's Settings → Secrets and variables → Actions add the secrets
+   `SWEEP_TOKEN` (the same value) and `SWEEP_URL`
+   (`https://<the backend host>/internal/sweep`). Enable
+   `.github/workflows/sweep.yml` and, after the deploy, run it once by hand
+   (Actions → Sweep bookings → Run workflow): green means the secrets, the token
+   and the endpoint agree. Until then the sweep still runs whenever the server is
+   awake and whenever anyone opens My Bookings or the console's Bookings page, but
+   nothing records a missed booking on a sleeping instance.
+4. **Check the repository's visibility before relying on the 10-minute cron.**
+   It is about 4,320 Actions minutes a month: free for a public repository, over
+   the 2,000 free minutes of a private one on the free plan (CI stops when they run
+   out). For a private repository change the cron to `*/30 * * * *` (about 1,440).
+   A call every 10 minutes also keeps a free Render instance awake, which uses most
+   of its monthly instance hours. GitHub pauses scheduled workflows in a
+   repository with no activity for 60 days (a commit, or re-enabling the workflow
+   under the Actions tab, turns it back on). The workflow is the only loud failure
+   channel (GitHub emails a failed run); the timer and the lazy sweep log to
+   Render's logs only.
+5. **The AI service is not deployed in production** (`AI_BACKEND_URL` unset), so
+   every booking keeps priority 1.0 and everything else in this slice works. To get
+   predictions deploy `ai-backend/` as a second Render web service with its pinned
+   requirements (numpy 2.5.2, scikit-learn 1.9.0, xgboost 3.4.1 and joblib 1.5.3
+   among them: the committed model artifact fails to load on other versions and the
+   service then answers 503, which the backend treats as "no nudge"), then set
+   `AI_BACKEND_URL` on the backend to its address. The start command, the Python
+   version (3.13), the cold-start behaviour and why its address must not be shared
+   are in `ai-backend/README.md` under Deploy.
+6. **The Dashboard moves once.** After the backfill, past unattended bookings no
+   longer count as used hours (utilization counts `booked` and `checked_in`
+   bookings only), so past-period utilization drops once; the freshly seeded
+   Dashboard occupancy is slightly lower too (about 1 in 5 seeded history bookings
+   are now no-shows).
+7. **Email.** Brevo's free plan allows about 300 emails a day. A no-show notice,
+   a dispute outcome and a room's reminder use it; a seat's reminder is in-app only.
+8. **The database session's time zone should be GMT/UTC** (Neon's default); see
+   *Time zones in raw SQL* under *No-shows*.
+
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
@@ -296,20 +391,21 @@ next request takes about a minute while it wakes.
 | DELETE | `/reservations/:id` | ✓ | Leave the waitlist / decline a claim |
 | GET | `/resources/availability?type=&date=` | — | Seats/rooms with per-slot occupancy for a date |
 | POST | `/bookings` | ✓ | Book a seat, or request a room (`{ resourceId, startTime, endTime }`); 409 + alternatives on conflict |
-| GET | `/bookings/me` | ✓ | Your bookings and room requests, with computed grace-window status; also a booking the library cancelled or moved, for 7 days (see *Bookings and resources*). Every booking answer, this one and the ones from `POST /bookings`, check-in and cancel, also carries `canReport` and `reportOpen` (see *Problem reports*) |
-| POST | `/bookings/:id/checkin` | ✓ | Check in within the grace window |
-| POST | `/bookings/:id/cancel` | ✓ | Cancel before check-in, or withdraw a room request |
+| GET | `/bookings/me` | ✓ | Your bookings and room requests, with computed grace-window status; also a booking the library cancelled or moved, for 7 days (see *Bookings and resources*). Every booking answer, this one and the ones from `POST /bookings`, check-in and cancel, also carries `canReport` and `reportOpen` (see *Problem reports*) and `noShow` (`null`, or `{ canDispute, dispute }` for a recorded no-show or a booking with a no-show dispute; see *No-shows*) |
+| POST | `/bookings/:id/checkin` | ✓ | Check in within the grace window; 409 for a booking that was released or recorded as a no-show |
+| POST | `/bookings/:id/cancel` | ✓ | Cancel before check-in, or withdraw a room request; 409 "This booking has already been released." once the grace period has ended (see *No-shows*) |
+| POST | `/bookings/:id/dispute` | ✓ | Dispute a booking the library recorded as a no-show, once: `{ reason }` (trimmed, 1-300 characters); answers 201 `{ id, status: 'open' }`. 404 for an unknown booking or another student's; 409 if it is not a recorded no-show, the 7 days have passed, or you already disputed it (see *No-shows*) |
 | GET | `/profile/reliability` | ✓ | Reliability score, tier, and recent history |
 | GET | `/fines/me` | ✓ | Your fines, newest first (up to 50), with `outstandingTotal` over all of them (see *Fines*). Each also carries `dispute`: `{ status, note }`, or `null` when you never disputed it (see *Fine disputes*) |
 | POST | `/fines/:id/dispute` | ✓ | Dispute one of your own fines, once: `{ reason }` (trimmed, 1-300 characters); answers 201 `{ id, status: 'open' }`. 404 for an unknown fine or another student's; 409 once it is paid or waived, or when you already disputed it (see *Fine disputes*) |
-| GET | `/notices/me` | ✓ | Your library notices (overdue reminders, dispute and report outcomes) from the last 7 days, newest first, at most 20: an array of `{ id, kind, title, body, createdAt }` (see *Notices and email*) |
+| GET | `/notices/me` | ✓ | Your library notices (overdue reminders, dispute and report outcomes, booking reminders, no-shows and their outcomes) from the last 7 days, newest first, at most 20: an array of `{ id, kind, title, body, createdAt }` (see *Notices and email*) |
 | POST | `/reports` | ✓ | Report a seat or room you booked: `{ resourceId, category, note? }` (`category` is `not_working`, `dirty` or `other`; a note of up to 300 characters, required for `other`); answers 201 `{ id }`. 403 unless one of your bookings of it qualifies, 409 if you already have an open report on it (see *Problem reports*) |
 | GET | `/recommendations/me` | ✓ | AI-backend recommendations, falling back to "popular right now" |
 | GET | `/admin/metrics/utilization` | admin | Booked share of open hours: today, the same weekday last week, and seats/rooms for the last 7 days |
 | GET | `/admin/metrics/circulation` | admin | Borrows, returns and top 5 titles over the last 7 days |
 | GET | `/admin/metrics/overdue` | admin | Loans overdue now and 24 hours ago |
 | GET | `/admin/metrics/demand` | admin | Booked share and busiest slot per area over the last 7 days |
-| GET | `/admin/requests` | admin | Pending borrow and room requests, oldest first, with counts |
+| GET | `/admin/requests?order=` | admin | Pending borrow and room requests with counts. `order` is `suggested` (the default: scored room requests sit up to 72 minutes later than their request time) or `request` (plain request time); anything else is a 400. A scored room request carries `room.priority` (see *No-shows*) |
 | POST | `/admin/requests/:kind/:id/approve` | admin | Approve (`kind` is `borrow` or `room`); 409 if it was already settled |
 | POST | `/admin/requests/:kind/:id/decline` | admin | Decline, with an optional `{ reason }` (up to 300 characters) |
 | GET | `/admin/resources?type=` | admin | Every seat and room (`type` is `seat` or `room`; omit for both), by name, with its status and how many bookings it still holds (`upcomingBookings`) |
@@ -317,7 +413,7 @@ next request takes about a minute while it wakes.
 | PATCH | `/admin/resources/:id` | admin | Change `name`, `location` and/or `capacity` (at least one; a blank `location` clears it); the type cannot change |
 | POST | `/admin/resources/:id/offline` | admin | Take it offline, with an optional `{ note }` (up to 300 characters); 409 if it already is |
 | POST | `/admin/resources/:id/online` | admin | Bring it back and clear the note; 409 if it already is |
-| GET | `/admin/bookings?search=&status=&page=&pageSize=` | admin | Bookings, newest start time first, 25 per page (up to 100), with the total behind the filters |
+| GET | `/admin/bookings?search=&status=&page=&pageSize=` | admin | Bookings, newest start time first, 25 per page (up to 100), with the total behind the filters; `status` is `booked`, `released`, `no_show`, `checked_in`, `completed` or `cancelled` |
 | POST | `/admin/bookings/:id/cancel` | admin | Cancel a booking for the library, with an optional `{ reason }` (up to 300 characters); 409 if it can no longer be cancelled |
 | GET | `/admin/bookings/:id/reassign-options` | admin | Resources the booking could move to: online, same type, free for its time |
 | POST | `/admin/bookings/:id/reassign` | admin | Move the booking to another resource of the same type (`{ resourceId }`), keeping its time |
@@ -325,6 +421,8 @@ next request takes about a minute while it wakes.
 | POST | `/admin/fines/:id/paid` | admin | Record a payment: `{ amount }`, the amount the librarian saw; 409 if the fine is already paid, was waived, is being disputed, or is no longer that amount |
 | POST | `/admin/fines/:id/adjust` | admin | Lower a fine, or waive it at 0: `{ amount, reason, disputeId? }` (whole rupees below the current amount; reason up to 300 characters, required). `disputeId` is the open dispute the librarian saw with the fine and is required while the fine has one; it also settles that dispute (see *Fine disputes*) |
 | POST | `/admin/disputes/:id/uphold` | admin | The fine stands: closes the dispute, with an optional `{ note }` (up to 300 characters; no body is no note); answers `{ id }`. 404 for an unknown dispute; 409 "This dispute was already resolved." |
+| POST | `/admin/no-show-disputes/:id/overturn` | admin | Remove a no-show the student disputed: `{ reason }` (required, up to 300 characters). The booking goes back to `released`, the points the no-show took are restored, the student is told; answers `{ id }`. 404 "No-show dispute not found"; 409 "This dispute was already resolved." (see *No-shows*) |
+| POST | `/admin/no-show-disputes/:id/uphold` | admin | The no-show stands: closes the dispute, with an optional `{ note }` (up to 300 characters; no body is no note); answers `{ id }`. 404 and 409 as for overturn |
 | GET | `/admin/books?search=&page=&pageSize=` | admin | Books in title order, each with its copies, 25 per page (up to 100), with the total behind the search and the genres in use |
 | POST | `/admin/books` | admin | Add a book and its first copies: `{ isbn, title, author, genre, description?, publishedYear?, copies }`; answers 201; 409 for an ISBN already in the catalogue |
 | PATCH | `/admin/books/:id` | admin | Change those fields except `copies` (at least one); `null` clears `description` and `publishedYear` |
@@ -334,7 +432,7 @@ next request takes about a minute while it wakes.
 | POST | `/admin/copies/:id/restore` | admin | Bring a maintenance or lost copy back to available, optionally with `{ waiveReplacementCharge }` for a copy lost on loan; answers `{ book, replacementWaived }` |
 | GET | `/admin/students/:id` | admin | A student's profile, reliability score and log, and their loan, booking and fine history; 404 for an unknown id or an admin account |
 | POST | `/admin/students/:id/reliability` | admin | Adjust the score by hand: `{ delta, reason }` (a whole number from -10 to 10, not 0; reason up to 300 characters, required) |
-| GET | `/admin/attention?kind=` | admin | The Needs attention queue: `{ items, counts, emailEnabled }`, oldest waiting first. `kind` is `overdue`, `fine_dispute` or `report` (omit for all; anything else is a 400) and narrows `items` only: `counts` (`all`, `overdue`, `fine_dispute`, `report`) always count the whole queue (see *Needs attention*) |
+| GET | `/admin/attention?kind=` | admin | The Needs attention queue: `{ items, counts, emailEnabled }`, oldest waiting first. `kind` is `overdue`, `fine_dispute`, `report` or `no_show_dispute` (omit for all; anything else is a 400) and narrows `items` only: `counts` (`all`, `overdue`, `fine_dispute`, `report`, `no_show_dispute`) always count the whole queue (see *Needs attention*) |
 | POST | `/admin/loans/:id/remind` | admin | Send the student an overdue reminder (no body): a notice and, when email is set up, an email. Answers the loan's queue item. 404 for an unknown loan; 409 if the loan is no longer a whole day overdue or a reminder went out in the last 24 hours |
 | POST | `/admin/loans/:id/escalate` | admin | Send a formal overdue notice, once per loan: an optional `{ note }` (up to 300 characters). Answers the loan's queue item. 404 for an unknown loan; 409 if the loan is no longer a whole day overdue or was already escalated |
 | POST | `/admin/reports/:id/confirm` | admin | Agree with a problem report: `{ outcome?, note? }`. For a copy `outcome` is required, `maintenance` or `lost`; a resource report is taken offline and ignores it (so a bare POST is complete). Answers `{ id }`. 400 for a copy report with no outcome; 404 for an unknown report; 409 if it is already resolved, or if the copy action is refused (the report then stays open; see *Problem reports*) |
@@ -343,6 +441,7 @@ next request takes about a minute while it wakes.
 | GET | `/health` | — | Is this service up |
 | GET | `/health/db` | — | Proves the Node → Postgres link |
 | GET | `/health/ai` | — | Proves the Node → FastAPI link |
+| POST | `/internal/sweep` | `x-sweep-token` header | Runs the no-show sweep and answers its counts. Not a login route: 404 while `SWEEP_TOKEN` is unset, 401 for a missing or wrong token (see *No-shows*) |
 
 `admin` routes need a token for an account with the admin role: 401 without a
 token, 403 for a student. Admin accounts are created with `npm run create-admin`
@@ -377,6 +476,7 @@ instant.
   and runs the waitlist cascade.
 - Lapsed requests are expired by a sweep that runs at startup and every minute
   (`src/services/requestHolds.ts`), and before the request paths read or write.
+  The same timer also runs the no-show sweep (see *No-shows*).
 - Students see declined and expired requests for 7 days.
 
 ## Bookings and resources
@@ -398,25 +498,27 @@ with no field to change is a 400.
 **The bookings list.** `GET /admin/bookings` returns
 `{ bookings, total, page, pageSize }`. `search` (up to 100 characters) matches
 the student's name or email or the resource name, ignoring case. `status` is
-`booked`, `released`, `checked_in`, `completed` or `cancelled`; anything else,
-including `requested` and `no_show`, is a 400. As for students, the status is
+`booked`, `released`, `no_show`, `checked_in`, `completed` or `cancelled`;
+anything else, including `requested`, is a 400. As for students, the status is
 worked out when it is read: a booking is `released` once its grace period has
-passed without a check-in, and a checked-in one is `completed` once its end time
-is reached. Room requests that are still pending, declined or expired, or that
+passed without a check-in (until the no-show sweep records it as `no_show`; an
+overturned no-show reads `released` again), and a checked-in one is `completed`
+once its end time is reached. Room requests that are still pending, declined or expired, or that
 the student withdrew, are not listed (they live on the Requests page). A room
 booking a librarian approved is listed, and stays listed if it is cancelled
 later, by the student or the library; so is a seat booking the student
 cancelled. Each booking carries `cancelledBy` (`student` or `library`),
 `cancelReason`, `movedFromName` and `canManage`, which is true exactly while the
-booking is `booked`. `page` starts at 1 and `pageSize` defaults to 25 (up to
-100).
+booking is `booked` (so false for `released` and `no_show`). `page` starts at 1
+and `pageSize` defaults to 25 (up to 100).
 
 **Cancel and reassign.** Both are conditional updates on the booking still
 being `booked` and not past its grace period, so of a librarian and a student
 acting at once only the first write lands, and a librarian who lost is told what
 happened with a 409: "Already cancelled by the library.", "The student already cancelled
 this booking.", "The student already checked in.", "This booking has already
-finished.", "This booking has already been released.", or, for a room request,
+finished.", "This booking has already been released." (also for a recorded
+no-show, and for `reassign-options` of one), or, for a room request,
 "This is a room request. Decide it on the Requests page." An unknown booking, or
 a room request the student withdrew, is a 404. Neither changes the student's reliability score. A cancel records who
 did it, when and why (`cancelledById`, `cancelledAt`, `cancelReason`). A
@@ -439,6 +541,236 @@ do. A student's own cancel is not listed, as before. A booking the library moved
 shows the new resource's name and id, and `movedFrom`, the old resource's name,
 for 7 days after `movedAt` (null otherwise). The booking's `status` stays the
 raw database value (`cancelled` for a library cancel).
+
+## No-shows
+
+A seat or room booking nobody checks into is recorded as a no-show within
+minutes, costs the student reliability points they can earn back, can be
+disputed, and, for room requests, nudges the order of the librarian's list by a
+small, capped amount. Everything degrades safely: with the AI service absent,
+detection, points, notices and disputes all still work and the nudge is zero.
+
+**Statuses.** A booking stays `booked` until its grace period (15 minutes after
+the start, `gracePeriodMinutes`) has ended strictly before now. After that it is
+`released` (nothing has penalized it: what a `booked` row past its grace period
+reads as until a sweep reaches it, what the migration stored for bookings from
+before no-shows were recorded, and what an overturned no-show goes back to) or
+`no_show` (recorded by the sweep; it frees the slot, since the exclusion
+constraint covers only `requested`, `booked` and `checked_in`). **`frontendStatus`
+stays `'released'` for both**, so an older app keeps showing "released after the
+grace period" and never "Update the app"; `BookingDto.noShow` tells them apart. A
+student's check-in on either is a 409. A student's cancel once the grace period
+has ended is a 409 "This booking has already been released." (also for a stored
+`no_show` or `released` row, and when the sweep wins the race); before the grace
+period ends, even after the start, a cancel is allowed and costs nothing. A room
+*request* is withdrawn under its own lapse rules and is exempt. `no_show` and
+`released` bookings can still be reported (`POST /reports`) within the usual
+window, and a report never penalizes anyone.
+
+**The sweep.** `sweepBookings(now)` (`src/services/noShowService.ts`) is
+idempotent and safe to run twice at once. It has two steps, each isolated from the
+other:
+
+1. *Record.* Bookings still `booked` whose grace period ended strictly before now
+   and no more than `SWEEP_LOOKBACK_HOURS` (24, a constant) ago, oldest first, at
+   most `SWEEP_BATCH` (200) per call. One transaction per booking (10 s to get a
+   connection, 15 s to run): a conditional update `booked` to `no_show` (so a
+   check-in landing at the same moment has exactly one winner, and a checked-in
+   student is never penalized), the `NoShowEvent` (`actualNoShow = true`), the
+   penalty, and the `no_show` notice. After the commit: the email, then
+   `booking.changed` and `student.changed`, once.
+2. *Remind.* `booked` bookings with no `reminderSentAt` that start within the next
+   `REMINDER_LEAD_MINUTES` (30) and were made, or approved, at least that long
+   before the start (`COALESCE(decidedAt, requestedAt)`), so a room approved ten
+   minutes before it starts, or a seat booked inside the window, gets none. A
+   booking that has already started is never reminded. One transaction per
+   booking: a conditional update that marks it, and the `booking_reminder` notice.
+   Only a room's reminder is emailed; a seat's stays an in-app notice.
+
+The result is `{ noShows, reminders, remaining }` (`remaining` is the missed
+bookings still waiting for the next call) and, only when a step failed,
+`failed: ['record' | 'remind']`. A step counts as failed when its candidate query
+threw or any of its bookings' own transactions did (the counts then hold only what
+succeeded; zero counts next to `failed` mean "could not run", never "nothing to
+do"). When both candidate queries fail the sweep throws.
+
+**Three callers**, all running the same function:
+
+- `POST /internal/sweep`, for the scheduled workflow
+  (`.github/workflows/sweep.yml`: every 10 minutes and on demand, `curl
+  --fail-with-body --max-time 120 --retry 2` with the repo secrets `SWEEP_URL`
+  and `SWEEP_TOKEN`). The credential is the `x-sweep-token` header, compared as
+  SHA-256 digests in constant time; there is no login, and an admin's token is no
+  substitute. It answers 404 while `SWEEP_TOKEN` is unset or blank (it looks like
+  a path that never existed), 401 for a missing or wrong token, and otherwise
+  awaits the sweep: 200 with the counts, or 500 with the counts and `failed` when
+  a step failed, or 500 `{ "error": "The sweep failed." }` when it threw. **A red
+  run** therefore means the endpoint was unreachable, the token was wrong, or a
+  step could not run, and GitHub emails the owner. A run that stays red for a
+  whole day and then turns green means a booking aged out of the 24-hour look-back
+  unrecorded (a booking that fails on every sweep for a day is never penalized;
+  each failure was logged by booking id). Zero counts with a green run mean there
+  was nothing to do.
+- The server's 60-second timer (`runScheduledSweeps` in
+  `src/services/requestHolds.ts`, at startup and every minute, beside the request
+  expiry; not started under test), so detection is about a minute behind while
+  the instance is awake.
+- `sweepIfDue()`: in the background, at most once per 60 seconds per process,
+  before `listMyBookings`, `checkInBooking`, `cancelBooking` and the console's
+  Bookings list. It is never awaited, so the read that triggers it still shows the
+  booking as released and the next read shows the no-show. Off under Vitest unless
+  a test turns it on.
+
+The timer and `sweepIfDue` share one in-process guard, `sweepUnlessRunning`: while
+a sweep one of them started is still running (a slow database), the next is skipped
+silently (one error line is logged, once, if that sweep has been running for more than
+10 minutes: it is hung), so sweeps cannot pile up and starve the connection pool. The route runs
+regardless. Every caller logs counts only (never a name, email, resource or id; a
+failed step is logged at error level even when every count is zero), and none
+prints the token.
+
+**Old bookings.** The migration persists every past `booked` row whose grace period
+had ended as `released`, with no penalty, no notice and no email, and the look-back
+means nothing older than 24 hours is ever swept.
+
+**Reliability.** `RELIABILITY_NOSHOW_PENALTY = 10` is taken through
+`applyReliabilityDelta` (clamped to 0-100, the student's row locked) with the
+reason `No-show: <resource>`; each on-time check-in gives +2
+(`RELIABILITY_ONTIME_BOOKING_BONUS`), so five earn a miss back. **Both numbers are
+flagged ARBITRARY placeholders**, not a team decision. A first no-show is not
+special (no warning tier). The amount actually applied after the clamp is stored on
+the `NoShowEvent` (`reliabilityDelta`, negative), so an overturn restores exactly
+what was taken, never above 100, and not 10 for a student who was clamped at 0. The
+history ring (`GET /profile/reliability`, the last 8 log rows) draws a row as a
+miss when its delta is below 0 *or* its reason starts with `NO_SHOW_REASON_PREFIX`
+(`No-show: `, `reliabilityService.ts`), because a no-show at score 0 writes a
+zero-delta row; the restore row says `No-show overturned: <resource>`, which does
+not start with it and so draws as ok. Two known behaviours, both consequences of
+rules that already existed:
+
+- A student swept from 100 to 90 sees a miss dot and the normal Good-standing note
+  ("No missed bookings yet"): the existing design shows that note for any
+  automatic miss at 80 or more (pinned by a `profile.test.ts` case) and the
+  library-adjustment note only for a librarian's adjustment. An owner decision; the
+  fix is one line in `buildNote` (extend that branch to the no-show prefix).
+- Overturning a no-show that took 0 points (the score was already 0, the stored
+  delta is 0 or null, or it is the seed's backstory no-show) restores nothing and
+  writes no history row, so the ring keeps a lone miss dot and, below 80, the note
+  still names the removed no-show as the most recent drop until it ages out of the
+  8 rows.
+
+**Disputes.** `POST /bookings/:id/dispute` `{ reason }` opens the student's one
+dispute of a no-show. 404 for an unknown booking or another student's (the same
+answer); then 409 "This booking is not a recorded no-show.", 409 "The 7 days to
+dispute this no-show have passed." (7 days, `NO_SHOW_DISPUTE_DAYS`, from the
+booking's own grace end, computed, so a late sweep does not move it), and 409
+"You've already disputed this no-show." (the unique `NoShowDispute.bookingId`; a
+second dispute of an overturned no-show says "not a recorded no-show", since the
+booking is `released` again). It publishes `attention.changed` once and writes no
+notice. `BookingDto.noShow` is `null` for an ordinary booking and otherwise
+`{ canDispute, dispute }`: for a `no_show` booking inside the window with no
+dispute `canDispute` is true; once disputed `dispute` is
+`{ status: 'open' | 'overturned' | 'upheld', note }` (the librarian's note, null
+until answered); an overturned booking is `released` again and keeps `noShow` so
+the card can still say "No-show removed".
+
+The librarian answers from the Needs attention queue. **Overturn**
+(`POST /admin/no-show-disputes/:id/overturn`, a reason required) runs one
+transaction of conditional updates, taking rows in this order and no other: it
+locks the booking row (`FOR NO KEY UPDATE`), closes the dispute (`open` to
+`overturned`), moves the booking (`no_show` to `released`), relabels the event
+(`actualNoShow = false`, reading `reliabilityDelta`), then locks the student and
+gives back exactly the points taken, and writes the `no_show_outcome` notice
+"No-show removed". **Uphold**
+(`POST /admin/no-show-disputes/:id/uphold`) closes the dispute, leaves the booking
+a no-show, moves no points and writes "No-show stands". After the commit the
+notice is emailed and then the events are published: overturn publishes
+`booking.changed`, `student.changed` and `attention.changed`, uphold only
+`attention.changed`. A dispute already answered is 409 "This dispute was already
+resolved."; a booking that is no longer a no-show is 409 "This booking is not a
+recorded no-show."; a refusal writes, sends and publishes nothing.
+
+**Prediction and bounded priority.** After a seat booking or a room request
+commits, `scoreBooking(id)` (`noShowScoring.ts`) runs in the background, never
+awaited and never inside a transaction. It builds ten features from the database
+(`noShowFeatures.ts`), calls the AI service's `POST /predict/no-show` with a
+2-second timeout (`PREDICT_TIMEOUT_MS`), and writes
+`NoShowEvent.predictedProbability` and
+`ResourceBooking.priorityScore = 1 - clamp(penalty_factor, 0, MAX_PENALTY_CAP)`
+(the booking row first, then the event, the order the sweep and a check-in take).
+For a room request it then publishes one `request.scored` event (topic `requests`),
+so an open Requests page refetches. The features, identical in the Node builder
+and the Python simulator: `hour_of_day` and `day_of_week` (Monday = 0, in the
+server's time zone, `TZ`), `duration_minutes`, `lead_time_hours` (start minus the
+booking's own `requestedAt`), `resource_type`, `reliability_score` as stored, and
+four counts over the student's *other* bookings: `past_attendance_ratio` (attended
+over attended plus missed, 0.85 with no history), `consecutive_attended_count`
+(attended bookings that start strictly after the latest miss, at most 20),
+`recent_noshows_count` (misses in the last 30 days, at most 10) and
+`bookings_last_30d` (bookings made in the last 30 days that were not cancelled,
+declined or expired, at most 30). History is bookings that started in the last 90
+days: `checked_in`, `completed` and `released` with an overturned dispute count as
+attended (the student was there), `no_show` as missed, anything else is ignored.
+
+The nudge is bounded: `MAX_PENALTY_CAP = 0.2` (the AI service computes
+`min(0.5 x probability, 0.2)` and the backend clamps the answer again, never
+trusting it) and `PRIORITY_WINDOW_HOURS = 6`. The Requests list orders by
+`requestedAt + (1 - priorityScore) x 6 hours`, so **the worst case is a room
+request that sits 72 minutes (0.2 x 6 hours) later in the list than its time says**.
+It applies to room requests only (a borrow request keeps its request time), only in
+`order=suggested`; nothing is hidden, declined or relabelled, a librarian can sort
+by request time (`?order=request`), ties go to the earlier request then the id, and
+the penalty is recomputed from current history for each new request, so recovering
+reliability shows on the very next one. A scored room request carries
+`room.priority = { suggestedDelayMinutes, riskPercent }` (whole numbers; `riskPercent`
+is null when there is no probability); an unscored one carries no `priority`, and a
+null `priorityScore` reads as 1.0.
+
+**It fails open.** `AI_BACKEND_URL` unset or blank means **no scoring at all**: no
+request is made, to a guessed address or any other (production today). Under
+Vitest scoring is also off unless a test calls `enableScoringForTests(true)`,
+because the dev `.env` sets the URL for every test file. A booking longer than 24
+hours stays unscored, because the AI service refuses a `duration_minutes` over 1440
+(the booking API has no length limit). When the service is down, slow, returns 503
+(no usable model) or returns garbage, the booking, check-in, approval and sweep are
+unaffected, `priorityScore` stays null (priority 1.0), and one `console.warn` line
+names the booking id and the reason. With the URL set and the service not running,
+that is one warning per new booking.
+
+**Where the model lives.** Training, the model's numbers and the pinned library
+versions are in `../ai-backend/README.md`; the model is trained on **simulated**
+bookings (there is no production history yet), and retraining is
+`python -m app.ml.noshow.train --seed 42` from `ai-backend/` with its venv. The
+backend's feature definitions are pinned to the simulator's by one shared fixture:
+`test/fixtures/noshow-features.json` is a byte-identical copy of
+`../ai-backend/tests/fixtures/noshow_features.json` (`.gitattributes` keeps it LF).
+Change a definition in `noShowFeatures.ts`, in `ai-backend/app/ml/noshow/history.py`
+and in the fixture together, then re-copy and check with `cmp`.
+
+**Database.** Migration `20261124083414_no_show_handling` is additive: the table
+`NoShowDispute` (unique `bookingId`, an index on `status, createdAt`; RESTRICT
+foreign keys to the booking and the student, SET NULL for the resolving librarian),
+the enum `NoShowDisputeStatus`, three `NoticeKind` values (`booking_reminder`,
+`no_show`, `no_show_outcome`), `Notice.bookingId` (nullable, ON DELETE SET NULL,
+like `loanId` and `fineId`), `ResourceBooking.reminderSentAt`,
+`NoShowEvent.reliabilityDelta`, and `NoShowEvent.predictedProbability` becomes
+nullable (a booking never scored has none); the backfill is its last statement. The
+five hand-written constraints are untouched. The re-seed deletes disputes before
+bookings and no-show events before bookings and users.
+
+**Time zones in raw SQL.** The pg driver adapter binds a JS `Date` as text with no
+offset, so a `Date` compared with a `timestamptz` column (booking times) is read in
+the *session's* time zone unless it goes through `asUtcInstant(d)`
+(`(${d}::timestamp AT TIME ZONE 'UTC')`, exported from `noShowService.ts` and used
+for every bound in the sweep). The read side has the mirror rule: a raw `SELECT`
+of a `timestamptz` column must read it `AT TIME ZONE 'UTC'` (the queue's booking
+times and the dispute's lock read do), because under a non-UTC session the value
+comes back shifted by the zone's offset (5½ hours under `Asia/Kolkata`). **Known
+limitation:** the older raw reads (`adminBookingService.filteredBookings`,
+`adminStudentService.bookingsFor`, `derivedStatusSql` and `requestHolds`'s expiry
+update) do neither and are correct only because the Neon and test database
+sessions are UTC. Keep the production session on GMT (Neon's default); a session
+set to another zone would shift those by its offset.
 
 ## Fines
 
@@ -612,12 +944,13 @@ logged.
 ## Needs attention
 
 `GET /admin/attention` is the librarian's queue of the few things that need a
-person: a loan a whole day or more overdue, a fine a student disputes and a
-problem a student reports. It answers `{ items, counts, emailEnabled }`. `items`
+person: a loan a whole day or more overdue, a fine a student disputes, a
+problem a student reports and a no-show a student disputes. It answers
+`{ items, counts, emailEnabled }`. `items`
 are oldest waiting first (the id breaks a tie, so a refetch never reorders).
-`kind` (`overdue`, `fine_dispute` or `report`; anything else is a 400) narrows
-`items` only: `counts` (`all`, `overdue`, `fine_dispute`, `report`) are always
-the whole queue's. `emailEnabled` is whether the mailer is set up (see *Notices
+`kind` (`overdue`, `fine_dispute`, `report` or `no_show_dispute`; anything else is
+a 400) narrows `items` only: `counts` (`all`, `overdue`, `fine_dispute`, `report`,
+`no_show_dispute`) are always the whole queue's. `emailEnabled` is whether the mailer is set up (see *Notices
 and email*). Each item has an `id`, a `kind`, the `student` (`{ id, name, email }`),
 `waitingSince` and the part that belongs to its kind:
 
@@ -634,6 +967,10 @@ and email*). Each item has an `id`, a `kind`, the `student` (`{ id, name, email 
   `{ reportId, target, category, note, copy?, resource? }`: `target` is `copy`
   (with `copy: { id, barcode, title }`) or `resource` (with
   `resource: { id, name }`).
+- `no_show_dispute`: `id` is the dispute's and `waitingSince` when it was opened.
+  `noShow` is `{ disputeId, bookingId, resource: { id, name }, startTime,
+  endTime, studentReason }` (the slot as instants, the student's words exactly as
+  written). The librarian answers it with the two routes under *No-shows*.
 
 **Overdue items are not stored.** One is an active loan a whole day or more past
 due, valued by `accruingAmountSql` (`src/services/fineRules.ts`), the rule the
@@ -671,8 +1008,8 @@ notice was written, the notice stands with its email outcome stored, and the
 event is published once. The loan drops out of the queue when the console
 refetches, as after any return.
 
-Fine disputes and problem reports are settled by the routes in their own
-sections below; their items leave the queue when they are resolved.
+Fine disputes, problem reports and no-show disputes are settled by the routes in
+their own sections; their items leave the queue when they are resolved.
 
 ## Fine disputes
 
@@ -778,11 +1115,13 @@ report a copy: it has to be back on the shelf before a librarian can act on it.
 **A seat or room is reported with `POST /reports`** (`{ resourceId, category,
 note? }`; `not_working`, `dirty` or `other`, a note required for `other`; a copy
 category is a 400). The student needs one of their own bookings of that resource
-with a raw status of `booked`, `checked_in` or `completed` that started within
-the last 7 days or starts within the next 24 hours, both limits included
-(`REPORT_BOOKING_LOOKBACK_DAYS` and `REPORT_BOOKING_LOOKAHEAD_HOURS` in
-`src/config/constants.ts`). A booking the student never checked into counts (its
-status is still `booked`); a cancelled booking, a room request, one that
+with a raw status of `booked`, `checked_in`, `completed`, `no_show` or `released`
+that started within the last 7 days or starts within the next 24 hours, both limits
+included (`REPORT_BOOKING_LOOKBACK_DAYS` and `REPORT_BOOKING_LOOKAHEAD_HOURS` in
+`src/config/constants.ts`). A booking the student never checked into counts (it is
+`booked`, then `no_show` once the sweep has recorded it, or `released`): the
+student who finds the seat broken and leaves can still report it, and a report
+never charges or penalizes anyone. A cancelled booking, a room request, one that
 started longer ago or starts more than 24 hours ahead does not, and the answer is
 403 "You can only report a seat or room you have booked." (an unknown resource id
 is the same 403). A second open report on the same resource is 409 "You already
@@ -848,14 +1187,18 @@ notice.
 ## Notices and email
 
 A **notice** is one message from the library to one student, shown at the top of My
-Loans. `GET /notices/me` (student auth, nothing to pass) returns the caller's own
+Loans, or of My Bookings for the booking kinds. `GET /notices/me` (student auth, nothing to pass) returns the caller's own
 notices as an array of `{ id, kind, title, body, createdAt }`: the last 7 days
 (`REQUEST_OUTCOME_VISIBLE_DAYS`), newest first, at most 20. It never shows the
 email outcome or the librarian, and there is no "mark as read". The kinds are
-`overdue_reminder`, `overdue_escalation`, `dispute_outcome` and `report_outcome`.
-A notice may point at the loan or fine it is about; those links, and the
-librarian who caused it, are cleared (the text stays) if that row or account is
-deleted.
+`overdue_reminder`, `overdue_escalation`, `dispute_outcome`, `report_outcome`,
+`booking_reminder`, `no_show` and `no_show_outcome`. A notice may point at the loan,
+fine or booking it is about (`Notice.bookingId`); those links, and the librarian
+who caused it, are cleared (the text stays) if that row or account is deleted. A
+`booking_reminder` is left out of the list once its booking is no longer `booked`
+(checked in, cancelled, released, a no-show) or its grace period has ended, and
+that is decided before the 20-notice limit, so a stale reminder never takes the
+place of a notice the student can see.
 
 **How an action writes one.** The notice is created inside the transaction of the
 action that causes it (`createNotice`), so it is committed or rolled back with
@@ -864,11 +1207,16 @@ notice, awaited for at most the mailer's 5 seconds) and its outcome written to
 the notice; only then is the live event published. So a refused action sends
 nothing, a repeated click sends nothing extra (it is refused first), and a
 console that refetches on the event sees the true "emailed" or "not emailed".
-Only these events send email: a reminder, an escalation, a dispute resolved (by
-adjusting or waiving the fine from the queue or the Fines page, by restoring a
-copy with its charge waived, or by upholding it) and a problem report confirmed
-or dismissed. Request decisions, booking cancels and moves, and fine waives made
-outside a dispute send none, and the seed sends no email and writes no notice.
+Only these events send email: an overdue reminder, an escalation, a dispute
+resolved (by adjusting or waiving the fine from the queue or the Fines page, by
+restoring a copy with its charge waived, or by upholding it), a problem report
+confirmed or dismissed, a recorded no-show, a no-show dispute answered (overturned
+or upheld) and a **room's** "booking starts soon" reminder: a seat's reminder is an
+in-app notice only (a library's seat bookings would burn a free Brevo plan's
+roughly 300 emails a day), and no reminder goes out for a booking made inside the
+reminder window. Request decisions, booking cancels and moves, and fine waives
+made outside a dispute send none, and the seed sends no email and writes no
+notice. A student's own dispute writes no notice.
 
 **The text.** Placeholders: `<days>` reads `1 day` for one day and `<n> days`
 otherwise; `<date>` is the due date, like `20 Nov 2026`; `<item>` is the book's
@@ -886,6 +1234,15 @@ a blank line, then `Note from the library: <note>`.
 | Dispute upheld (`dispute_outcome`) | Your fine stands | `The library kept your ₹<now> fine for <item>.` |
 | Report confirmed (`report_outcome`) | Thanks for the report | `Thanks for reporting a problem with <target>. The library has taken it out of use for now.` |
 | Report dismissed (`report_outcome`) | About your report | `The library looked at your report about <target> and no action was needed.` |
+| Booking reminder (`booking_reminder`) | Your booking starts soon | `<resource>, <time>. Check in within 15 minutes of the start or the slot is released.` |
+| No-show recorded (`no_show`) | Missed booking | `You didn't check in to <resource> (<day>, <time>), so the slot was released and a no-show was recorded. Your reliability score went from <a> to <b>. If this is wrong, you can dispute it from My Bookings within 7 days.` |
+| No-show overturned (`no_show_outcome`) | No-show removed | `The library removed the no-show for <resource> (<day>) and restored your reliability score to <n>.` |
+| No-show upheld (`no_show_outcome`) | No-show stands | `The library kept the no-show for <resource> (<day>).` |
+
+`<day>` reads like `Thu, Oct 22` and `<time>` like `2–3 PM` (library time, the
+server's `TZ`); the scores are whole numbers (a fractional one prints as stored).
+For an overturn the required reason, and for an upheld one the optional note,
+follows as the usual `Note from the library: <note>` paragraph.
 
 In a dispute notice `<was>` is what the fine stood at just before this change
 (read under the lock), so a fine lowered once and disputed afterwards reads at its
@@ -996,11 +1353,17 @@ after its email outcome has been written, so the refetch shows the true
 | A reminder or escalation sent; a seat or room report filed | `attention.changed` | `attention` |
 | A problem report confirmed or dismissed | for a confirm, the action's own event first (`catalogue.changed` for a copy, `resource.changed` for a resource; none when the target was already where the librarian wanted it), then `attention.changed` (after the email outcome) | the action's topics, then `attention` |
 | A manual reliability adjustment | `student.changed` | `students` |
+| A sweep that recorded no-shows (once per sweep, after the emails) | `booking.changed`, then `student.changed` | `bookings`, `metrics`; then `students`. A sweep that recorded nothing, and every reminder, publishes nothing |
+| A new booking or room request scored by the model (a room request only) | `request.scored` | `requests` |
+| A student disputes a no-show | `attention.changed` | `attention` |
+| A no-show dispute overturned | `booking.changed`, `student.changed`, then `attention.changed` (after the email outcome) | `bookings`, `metrics`; `students`; `attention` |
+| A no-show dispute upheld | `attention.changed` (after the email outcome) | `attention` |
 
 The publish helpers are in `src/lib/events.ts`: `publishActivity`,
 `publishBookingChange`, `publishResourceChange`, `publishFineChange`,
 `publishCatalogueChange(extra)` (the topics a change also moves),
-`publishStudentChange`, `publishAttentionChange` (`attention.changed` on the
+`publishStudentChange`, `publish` (the raw call: the request events and
+`request.scored`), `publishAttentionChange` (`attention.changed` on the
 `attention` topic: the Needs attention queue changed) and
 `publishLoanChange(pastDue)`. A `: ping` comment goes
 out every 25 seconds, and each stream ends after 15 minutes, so the console
@@ -1020,9 +1383,11 @@ its `availableCopies`/`heldCopies`/`waitlistCount` are all counted from rows
 which only that student may borrow); a loan
 carries the raw Prisma `status` next to the frontend-facing `frontendStatus`
 (`normal`/`overdue`). Apart from the request-lapse sweep (see *Request
-approvals*), nothing here runs on a schedule — grace-window expiry, overdue
-status, and waitlist-claim expiry are all computed lazily, at read time or
-when an adjacent write happens (a return, a renewal), not by a background job.
+approvals*) and the no-show sweep (see *No-shows*), nothing here runs on a
+schedule — overdue status and waitlist-claim expiry are computed lazily, at read
+time or when an adjacent write happens (a return, a renewal), not by a background
+job, and a booking's `released` status is computed at read time until the sweep
+records it as `no_show` (or the migration stored it).
 
 ## Notes on Prisma 7
 
@@ -1052,6 +1417,9 @@ prisma/
 ├── seed.ts              # the `npm run seed` command line
 ├── seedData.ts          # demo data and the re-seed reset — see `npm run seed` above
 └── history.ts           # the generated four-week history, fines included
+.github/workflows/
+├── ci.yml               # tests, build and start check on every push
+└── sweep.yml            # calls POST /internal/sweep every 10 minutes (see *No-shows*)
 src/
 ├── index.ts              # app bootstrap (listen())
 ├── app.ts                # Express app factory — supertest mounts this directly
@@ -1070,5 +1438,6 @@ src/
     └── mailer.ts          # the optional email sender (Brevo) — see *Notices and email*
 test/
 ├── routes/                 # integration tests, one file per resource
+├── fixtures/               # noshow-features.json: the feature contract shared with ai-backend
 └── helpers/db.ts           # resetDb() — truncates between test files
 ```

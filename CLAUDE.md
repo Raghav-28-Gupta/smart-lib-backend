@@ -61,6 +61,8 @@ PORT=3000
 
 Optional email settings (all commented out in `.env.example`; email is off unless the first two are set, and nothing else depends on them): `BREVO_API_KEY` (a secret), `MAIL_FROM`, `MAIL_FROM_NAME` (default "SmartLib") and `MAIL_ALLOWED_DOMAINS` (comma-separated). Never put a real key in a committed file. The rules are under *Notices, Disputes and Reports*.
 
+`SWEEP_TOKEN` (optional, a secret, commented out in `.env.example`): the credential of `POST /internal/sweep`, which answers 404 while it is unset or blank. Environment only, never committed, printed or logged. `AI_BACKEND_URL` unset or blank means **no no-show scoring at all** (production today: the AI service is not deployed); recommendations and `/health/ai` still read it with the localhost default. The rules are under *No-shows, the Sweep and Scoring*.
+
 ---
 
 ## Prisma 7 Architecture & Nuances
@@ -126,11 +128,14 @@ has committed, and a refused write publishes nothing. Topics: `requests`,
 - `publish(event)`: the raw call; the request events (`request.created`,
   `request.decided`, `request.cancelled`, `request.expired`) use it, on
   `requests` (an approval also `metrics`, an approved room request also
-  `bookings`).
+  `bookings`), and so does `request.scored` (`scoreBooking`, once after it wrote
+  a room request's priority: the create event fired before the score existed, so
+  an open Requests page refetches on this one).
 - `publishActivity()`: a change that only moves Dashboard numbers (a waitlist
   join or leave); `metrics`.
 - `publishBookingChange()`: a booking that is not a request (`booking.changed`);
-  `bookings` and `metrics`.
+  `bookings` and `metrics`. The no-show sweep publishes it once per sweep that
+  recorded any no-show, and an overturned no-show publishes it too.
 - `publishResourceChange()`: a resource added, edited, taken offline or brought
   back (`resource.changed`); `resources` and `metrics`.
 - `publishFineChange()`: a fine marked paid, adjusted or waived, a dispute opened
@@ -143,8 +148,9 @@ has committed, and a refused write publishes nothing. Topics: `requests`,
   removes its overdue item from the queue); a restore that waived the
   replacement fine passes `['fines']`, and `['fines', 'attention']` when it also
   closed a student's dispute of that fine.
-- `publishStudentChange()`: a manual reliability adjustment
-  (`student.changed`); `students`.
+- `publishStudentChange()`: a manual reliability adjustment, a no-show the sweep
+  recorded (its penalty) or an overturned one (its restore) (`student.changed`);
+  `students`.
 - `publishLoanChange(pastDue)`: a student's return or renewal (`loan.changed`);
   `metrics` and `catalogue` (a renewal's new due date shows on the Catalogue and
   student pages), and `fines` and `attention` as well when the loan was past due
@@ -155,7 +161,8 @@ has committed, and a refused write publishes nothing. Topics: `requests`,
 - `publishAttentionChange()`: the Needs attention queue changed
   (`attention.changed`, topic `attention`): a reminder or escalation sent, a fine
   dispute opened or settled, a problem report filed, confirmed or dismissed, a
-  return that carried a report. A service publishes it once, after the commit
+  return that carried a report, a no-show dispute opened (by the student) or
+  answered (overturned or upheld). A service publishes it once, after the commit
   and after the notice's email outcome has been written (see *Notices, Disputes
   and Reports* below), so the console's refetch sees the true "emailed" or "not
   emailed"; a refused write publishes nothing. `loan.changed` carries `attention`
@@ -197,16 +204,33 @@ console should see must publish one, with a test using `recordEvents()` from
   `${now}::timestamp`, never `::timestamptz`, which the session's time zone would
   shift by hours. `fineRules`, `adminFineService`, `adminCopyService` and
   `adminAttentionService` rely on it.
+  **`timestamptz` columns (the booking times) need the other rules.** The pg adapter
+  binds a `Date` as text with no offset, so a bare `${d}` against a `timestamptz`
+  column is read in the database SESSION's zone and the instant moves by the zone's
+  offset. A `Date` bound against one goes through `asUtcInstant(d)`
+  (`noShowService.ts`: `(${d}::timestamp AT TIME ZONE 'UTC')`), including any
+  `now + minutes` worked out in JS. The read side is the mirror: a raw `SELECT` of a
+  `timestamptz` column must read it `AT TIME ZONE 'UTC'` (`adminAttentionService`'s
+  no-show queue and `noShowDisputeService`'s lock read do; a bare read came back
+  5½ hours shifted under `Asia/Kolkata`). A typed Prisma read has no such problem.
+  Test it under `SET LOCAL TIME ZONE` (the sweep's tests do, in New York and
+  Kolkata). **Known limitation:** the older raw reads (`adminBookingService.filteredBookings`,
+  `adminStudentService.bookingsFor`, `derivedStatusSql` and `requestHolds`'s
+  expiry update) do neither and are correct only because the Neon and test DB
+  sessions are UTC; keep the production session on GMT (Neon's default) and do not
+  copy them.
 
 ---
 
 ## Notices, Disputes and Reports
 
 A **notice** is the library's message to one student (`Notice`; kinds
-`overdue_reminder`, `overdue_escalation`, `dispute_outcome`, `report_outcome`),
+`overdue_reminder`, `overdue_escalation`, `dispute_outcome`, `report_outcome`,
+`booking_reminder`, `no_show`, `no_show_outcome`),
 shown for 7 days (`REQUEST_OUTCOME_VISIBLE_DAYS`), at most 20, by
 `GET /notices/me`. Everything that writes one (`adminAttentionService` for a
-reminder or escalation, `disputeService`, `reportService`, and
+reminder or escalation, `disputeService`, `reportService`, the sweep and
+`noShowDisputeService` for the booking kinds, and
 `adminFineService.adjustFine` and `adminCopyService.restoreCopy` when they close
 a dispute) follows the same order:
 
@@ -281,9 +305,81 @@ Conventions the new services follow:
 - **Tests never send.** Inject a fake with `setMailTransport(...)` and restore it
   with `setMailTransport(null)`; with none injected and `NODE_ENV=test` or `VITEST`
   set (Vitest sets it whatever `NODE_ENV` the shell has) the mailer is `skipped`.
-- **Only this slice's events send email:** a reminder, an escalation, a dispute
-  resolved and a report resolved. Do not email from anything else without being
-  asked.
+- **Only these events send email:** an overdue reminder, an escalation, a fine
+  dispute resolved, a report resolved, a recorded no-show, a no-show dispute
+  answered and a **room's** booking reminder (never a seat's: a free Brevo plan
+  allows about 300 a day; the in-app notice is a seat's only reminder channel). Do
+  not email from anything else without being asked.
+
+---
+
+## No-shows, the Sweep and Scoring
+
+The behaviour and the owner's deploy steps are in README *No-shows*; these are the
+rules to keep when changing the code.
+
+- **`sweepBookings(now)`** (`noShowService.ts`) is idempotent: every change is a
+  conditional update on the status just read (`WHERE status = 'booked'`), one
+  transaction per booking (`SWEEP_TX_OPTIONS`, 10 s to get a connection and 15 s to
+  run), the email and the events only after the commit. Two isolated steps: record
+  and remind. `SweepResult.failed` is present ONLY when a step failed (its candidate
+  query or any of its bookings threw): every caller must act on it (the route
+  answers 500 with the counts, the timer and the lazy sweep log at error level), and
+  zero counts next to `failed` mean "could not run", never "nothing to do".
+- **Three callers, one function.** `POST /internal/sweep` (`routes/internal.ts`:
+  `x-sweep-token` against `SWEEP_TOKEN` as SHA-256 digests with `timingSafeEqual`,
+  404 when unset, mounted outside `/admin` and without `requireAuth` on purpose);
+  the 60-second timer (`runScheduledSweeps` in `requestHolds.ts`, passed to
+  `startExpirySweep` in `index.ts`); and `sweepIfDue()` (background, at most once a
+  minute per process, called first in `listMyBookings`, `checkInBooking`,
+  `cancelBooking` and the admin bookings list; never await it). The timer and
+  `sweepIfDue` share one in-process guard, `sweepUnlessRunning` (a skip is silent,
+  except for one error line when the running sweep has hung for over 10 minutes);
+  the route does not use it. The timer and the lazy sweep are off under Vitest
+  unless a test calls `enableLazySweepForTests(true)`, and
+  `settleSweepsForTests()` / `resetLazySweepForTests()` wait for them. Log counts
+  and booking ids only: never a name, email, the token or free text.
+- **Lock order, everywhere:** booking row, then (the dispute row,) then the
+  `NoShowEvent`, then the user row (`applyReliabilityDelta` locks it `FOR UPDATE`).
+  Sweep: booking, event, user. Check-in: booking, event (`actualNoShow = false`),
+  user. Scoring: booking, event. Overturn: booking (`FOR NO KEY UPDATE`), then the
+  dispute's conditional `open` update (first, so a loser rolls back having taken no
+  other lock), the booking update, the event, the user. A new writer that takes them
+  in another order can deadlock (`40P01`, a 500).
+- **Statuses.** `released` and `no_show` both read as `frontendStatus: 'released'`
+  (a value an installed app does not know would show "Update the app"), and
+  `BookingDto.noShow` is the only difference: non-null for a `no_show` booking or
+  any booking carrying a dispute (an overturned one is `released` again). A
+  student's cancel after the grace end is 409 "This booking has already been
+  released."; `REPORTABLE_BOOKING_STATUSES` includes `no_show` and `released`.
+  `NoShowEvent.reliabilityDelta` is stored NEGATIVE (the applied, clamped amount); an
+  overturn gives back `-delta` when it is below 0, and nothing for 0 or null.
+- **Reliability.** `RELIABILITY_NOSHOW_PENALTY = 10` and the +2 bonus are flagged
+  ARBITRARY placeholders. The history ring counts a row as a miss when `delta < 0`
+  or its reason starts with `NO_SHOW_REASON_PREFIX` (`"No-show: "`, exported from
+  `reliabilityService.ts`: the sweep writes a zero-delta row at score 0); the
+  overturn's restore reads "No-show overturned: ..." so it is not a miss.
+  `buildNote` says "No missed bookings yet" for any automatic miss at 80 or more
+  (existing, test-pinned design), and a zero-points overturn leaves a lone miss dot:
+  both are known and documented, not bugs to fix in passing.
+- **Scoring** (`noShowScoring.ts`, `noShowFeatures.ts`, `aiClient.predictNoShow`):
+  `void scoreBooking(id)` after the booking commits; never inside a transaction,
+  never awaited, and it FAILS OPEN (a null `priorityScore` reads as 1.0). It does
+  nothing when `AI_BACKEND_URL` is unset or blank, and under Vitest unless a test
+  calls `enableScoringForTests(true)`. The AI service's penalty is clamped to
+  `MAX_PENALTY_CAP` (0.2) again here and `PRIORITY_WINDOW_HOURS` (6) turns it into
+  at most 72 minutes in the Requests order (`orderRequests`: room requests only,
+  `order=suggested` only). A booking over 24 hours stays unscored (the AI service
+  refuses a `duration_minutes` over 1440). The feature definitions must match
+  `ai-backend/app/ml/noshow/history.py`: `test/fixtures/noshow-features.json` is a
+  byte-identical copy of `ai-backend/tests/fixtures/noshow_features.json`
+  (`.gitattributes` keeps it LF); change both and the fixture together and `cmp` them.
+- **Migration and seed.** `20261124083414_no_show_handling` is additive and ends with
+  a backfill `UPDATE` (past unattended `booked` rows become `released`): ship it with
+  the rest of the slice, never alone, after a database backup. The re-seed deletes
+  disputes before bookings and no-show events before bookings and users, and writes
+  every seeded past booking in its final state, so a sweep right after a seed finds
+  nothing old to penalize.
 
 ---
 

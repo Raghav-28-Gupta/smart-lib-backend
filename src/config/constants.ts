@@ -55,11 +55,49 @@ export const FINE_PER_DAY_INR = 10
 // [ARBITRARY — flagged, not yet a team decision] Same status as
 // FINE_PER_DAY_INR above: a concrete placeholder so the reliability system is
 // testable, not a value the team has actually agreed on. Applied per
-// on-time booking check-in, capped at 100 (see reliabilityService.ts).
-// No-show detection isn't implemented in this phase (no scheduler exists to
-// detect a missed grace window yet), so there's currently no negative
-// trigger — only this positive one.
+// on-time booking check-in, capped at 100 (see reliabilityService.ts). The
+// negative trigger is RELIABILITY_NOSHOW_PENALTY, below.
 export const RELIABILITY_ONTIME_BOOKING_BONUS = 2
+
+// No-show handling (slice 7; spec 2026-11-24-no-show-handling-design.md).
+
+// [ARBITRARY — flagged, not yet a team decision] Like the +2 bonus above, a
+// placeholder: five on-time check-ins earn a miss back. Taken from the score
+// (clamped to [0, 100]) when the sweep records a no-show; an overturn gives back
+// exactly what was taken, which is stored on the NoShowEvent.
+export const RELIABILITY_NOSHOW_PENALTY = 10
+
+// The sweep only records a no-show whose grace period ended no more than this
+// long ago, so nothing older than a day is ever penalized (the migration turns
+// the older unattended bookings into plain `released` rows instead).
+export const SWEEP_LOOKBACK_HOURS = 24
+
+// A booking starting within this many minutes gets a "starts soon" reminder, and
+// only if it was made (or approved) at least this long before it starts.
+export const REMINDER_LEAD_MINUTES = 30
+
+// The most bookings one sweep call handles per action (record, remind); the rest
+// wait for the next call.
+export const SWEEP_BATCH = 200
+
+// A student may dispute a recorded no-show for this many days after the
+// booking's grace period ended.
+export const NO_SHOW_DISPUTE_DAYS = 7
+
+// Fairness bound on the prediction's effect on the order of room requests: the
+// penalty factor never exceeds this (the AI service caps it, and the backend
+// clamps it again). With PRIORITY_WINDOW_HOURS the worst case is a request that
+// waits 72 minutes longer in the librarian's list than its time alone says.
+export const MAX_PENALTY_CAP = 0.2
+export const PRIORITY_WINDOW_HOURS = 6
+
+// The most the backend waits for the AI service's no-show prediction. It is never
+// awaited by a request: a booking never waits on it.
+export const PREDICT_TIMEOUT_MS = 2000
+
+// A student with no booking history is assumed to attend this often when the
+// prediction's features are built (the simulator uses the same prior).
+export const NO_SHOW_PRIOR_ATTENDANCE = 0.85
 
 // Same validate-at-startup pattern as lib/prisma.ts's DATABASE_URL check —
 // fail loudly at boot rather than the first time a route tries to sign a token.

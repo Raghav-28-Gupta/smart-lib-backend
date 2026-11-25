@@ -1,0 +1,353 @@
+[
+  {
+    "name": "no_history_uses_the_prior",
+    "description": "No history at all: past_attendance_ratio is the 0.85 prior and every count is 0.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [],
+    "reliability_score": 100.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 0.85, "consecutive_attended_count": 0, "recent_noshows_count": 0, "reliability_score": 100.0, "bookings_last_30d": 0}
+  },
+  {
+    "name": "all_attended",
+    "description": "Four attended rows (checked_in and completed) inside 90 days, none missed: ratio 1.0, consecutive is all four; bookings_last_30d counts only rows requested on or after Oct 25 12:00.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "completed", "startTime": "2026-11-20T10:00:00+05:30", "requestedAt": "2026-11-19T10:00:00+05:30"},
+      {"status": "checked_in", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-11-09T09:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-10-30T10:00:00+05:30", "requestedAt": "2026-10-28T10:00:00+05:30"},
+      {"status": "checked_in", "startTime": "2026-10-05T10:00:00+05:30", "requestedAt": "2026-10-04T10:00:00+05:30"}
+    ],
+    "reliability_score": 96.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 1.0, "consecutive_attended_count": 4, "recent_noshows_count": 0, "reliability_score": 96.0, "bookings_last_30d": 3}
+  },
+  {
+    "name": "one_miss_then_three_attended",
+    "description": "Consecutive attended counts only rows after the most recent miss, ordered by startTime (the list is shuffled). A miss inside 30 days is a recent no-show and still a booking made in the last 30 days.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-26T14:00:00+05:30", "endTime": "2026-11-26T15:30:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "room"},
+    "history": [
+      {"status": "completed", "startTime": "2026-11-12T10:00:00+05:30", "requestedAt": "2026-11-11T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-01T10:00:00+05:30", "requestedAt": "2026-10-31T10:00:00+05:30"},
+      {"status": "checked_in", "startTime": "2026-10-03T10:00:00+05:30", "requestedAt": "2026-10-02T10:00:00+05:30"},
+      {"status": "checked_in", "startTime": "2026-11-20T10:00:00+05:30", "requestedAt": "2026-11-19T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-05T10:00:00+05:30", "requestedAt": "2026-11-04T10:00:00+05:30"}
+    ],
+    "reliability_score": 88.0,
+    "expected": {"hour_of_day": 14, "day_of_week": 3, "duration_minutes": 90, "lead_time_hours": 50.0, "resource_type": "room", "past_attendance_ratio": 0.8, "consecutive_attended_count": 3, "recent_noshows_count": 1, "reliability_score": 88.0, "bookings_last_30d": 4}
+  },
+  {
+    "name": "overturned_miss_counts_as_attended",
+    "description": "A released row whose no-show was overturned counts as attended (ratio and consecutive), never as a miss; the genuine no-show before it is still a miss.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "no_show", "startTime": "2026-10-28T10:00:00+05:30", "requestedAt": "2026-10-27T10:00:00+05:30"},
+      {"status": "released", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-11-09T10:00:00+05:30", "overturned": true},
+      {"status": "checked_in", "startTime": "2026-11-18T10:00:00+05:30", "requestedAt": "2026-11-17T10:00:00+05:30"}
+    ],
+    "reliability_score": 90.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 0.6666666666666666, "consecutive_attended_count": 2, "recent_noshows_count": 1, "reliability_score": 90.0, "bookings_last_30d": 3}
+  },
+  {
+    "name": "legacy_released_is_ignored",
+    "description": "A released row that was not overturned (overturned false, or the key missing) is ignored for attendance, but it is still a booking made in the last 30 days.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-27T20:00:00+05:30", "endTime": "2026-11-27T22:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "released", "startTime": "2026-11-06T10:00:00+05:30", "requestedAt": "2026-11-05T10:00:00+05:30", "overturned": false},
+      {"status": "released", "startTime": "2026-10-30T10:00:00+05:30", "requestedAt": "2026-10-29T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-12T10:00:00+05:30", "requestedAt": "2026-11-11T10:00:00+05:30"}
+    ],
+    "reliability_score": 84.0,
+    "expected": {"hour_of_day": 20, "day_of_week": 4, "duration_minutes": 120, "lead_time_hours": 80.0, "resource_type": "seat", "past_attendance_ratio": 1.0, "consecutive_attended_count": 1, "recent_noshows_count": 0, "reliability_score": 84.0, "bookings_last_30d": 3}
+  },
+  {
+    "name": "cancelled_declined_expired_are_ignored",
+    "description": "Cancelled, declined and expired rows are ignored for attendance and are not counted in bookings_last_30d; only the one no-show is.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T16:00:00+05:30", "endTime": "2026-11-25T17:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "cancelled", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-11-09T10:00:00+05:30"},
+      {"status": "declined", "startTime": "2026-11-12T10:00:00+05:30", "requestedAt": "2026-11-11T10:00:00+05:30"},
+      {"status": "expired", "startTime": "2026-11-08T10:00:00+05:30", "requestedAt": "2026-11-07T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-15T10:00:00+05:30", "requestedAt": "2026-11-14T10:00:00+05:30"}
+    ],
+    "reliability_score": 90.0,
+    "expected": {"hour_of_day": 16, "day_of_week": 2, "duration_minutes": 60, "lead_time_hours": 28.0, "resource_type": "seat", "past_attendance_ratio": 0.0, "consecutive_attended_count": 0, "recent_noshows_count": 1, "reliability_score": 90.0, "bookings_last_30d": 1}
+  },
+  {
+    "name": "row_exactly_90_days_old_is_in",
+    "description": "A completed row whose startTime is exactly now minus 90 days is inside the window (inclusive boundary).",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "completed", "startTime": "2026-08-26T12:00:00+05:30", "requestedAt": "2026-08-25T12:00:00+05:30"}
+    ],
+    "reliability_score": 100.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 1.0, "consecutive_attended_count": 1, "recent_noshows_count": 0, "reliability_score": 100.0, "bookings_last_30d": 0}
+  },
+  {
+    "name": "row_91_days_old_is_out",
+    "description": "A no-show 91 days old is outside the window and ignored; an attended row 89 days old is inside.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "no_show", "startTime": "2026-08-25T12:00:00+05:30", "requestedAt": "2026-08-24T12:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-08-27T12:00:00+05:30", "requestedAt": "2026-08-26T12:00:00+05:30"}
+    ],
+    "reliability_score": 100.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 1.0, "consecutive_attended_count": 1, "recent_noshows_count": 0, "reliability_score": 100.0, "bookings_last_30d": 0}
+  },
+  {
+    "name": "consecutive_attended_is_capped_at_20",
+    "description": "22 attended rows after the last miss: consecutive_attended_count is capped at 20 while the ratio still uses the real counts (22 of 23).",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "room"},
+    "history": [
+      {"status": "no_show", "startTime": "2026-10-20T10:00:00+05:30", "requestedAt": "2026-10-19T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-02T10:00:00+05:30", "requestedAt": "2026-11-01T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-03T10:00:00+05:30", "requestedAt": "2026-11-02T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-04T10:00:00+05:30", "requestedAt": "2026-11-03T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-05T10:00:00+05:30", "requestedAt": "2026-11-04T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-06T10:00:00+05:30", "requestedAt": "2026-11-05T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-07T10:00:00+05:30", "requestedAt": "2026-11-06T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-08T10:00:00+05:30", "requestedAt": "2026-11-07T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-09T10:00:00+05:30", "requestedAt": "2026-11-08T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-11-09T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-11T10:00:00+05:30", "requestedAt": "2026-11-10T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-12T10:00:00+05:30", "requestedAt": "2026-11-11T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-13T10:00:00+05:30", "requestedAt": "2026-11-12T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-14T10:00:00+05:30", "requestedAt": "2026-11-13T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-15T10:00:00+05:30", "requestedAt": "2026-11-14T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-16T10:00:00+05:30", "requestedAt": "2026-11-15T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-17T10:00:00+05:30", "requestedAt": "2026-11-16T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-18T10:00:00+05:30", "requestedAt": "2026-11-17T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-19T10:00:00+05:30", "requestedAt": "2026-11-18T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-20T10:00:00+05:30", "requestedAt": "2026-11-19T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-21T10:00:00+05:30", "requestedAt": "2026-11-20T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-22T10:00:00+05:30", "requestedAt": "2026-11-21T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-23T10:00:00+05:30", "requestedAt": "2026-11-22T10:00:00+05:30"}
+    ],
+    "reliability_score": 100.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "room", "past_attendance_ratio": 0.9565217391304348, "consecutive_attended_count": 20, "recent_noshows_count": 0, "reliability_score": 100.0, "bookings_last_30d": 22}
+  },
+  {
+    "name": "recent_noshows_is_capped_at_10",
+    "description": "12 no-shows in the last 30 days: recent_noshows_count is capped at 10; ratio 0 of 12; consecutive 0.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "no_show", "startTime": "2026-11-12T10:00:00+05:30", "requestedAt": "2026-11-11T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-13T10:00:00+05:30", "requestedAt": "2026-11-12T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-14T10:00:00+05:30", "requestedAt": "2026-11-13T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-15T10:00:00+05:30", "requestedAt": "2026-11-14T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-16T10:00:00+05:30", "requestedAt": "2026-11-15T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-17T10:00:00+05:30", "requestedAt": "2026-11-16T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-18T10:00:00+05:30", "requestedAt": "2026-11-17T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-19T10:00:00+05:30", "requestedAt": "2026-11-18T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-20T10:00:00+05:30", "requestedAt": "2026-11-19T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-21T10:00:00+05:30", "requestedAt": "2026-11-20T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-22T10:00:00+05:30", "requestedAt": "2026-11-21T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-23T10:00:00+05:30", "requestedAt": "2026-11-22T10:00:00+05:30"}
+    ],
+    "reliability_score": 0.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 0.0, "consecutive_attended_count": 0, "recent_noshows_count": 10, "reliability_score": 0.0, "bookings_last_30d": 12}
+  },
+  {
+    "name": "bookings_last_30d_is_capped_at_30",
+    "description": "32 booked rows requested within 30 days (none attended or missed yet): bookings_last_30d is capped at 30 and the ratio is the 0.85 prior.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "booked", "startTime": "2026-11-25T09:00:00+05:30", "requestedAt": "2026-11-01T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-25T15:00:00+05:30", "requestedAt": "2026-11-01T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-26T09:00:00+05:30", "requestedAt": "2026-11-02T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-26T15:00:00+05:30", "requestedAt": "2026-11-02T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-27T09:00:00+05:30", "requestedAt": "2026-11-03T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-27T15:00:00+05:30", "requestedAt": "2026-11-03T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-28T09:00:00+05:30", "requestedAt": "2026-11-04T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-28T15:00:00+05:30", "requestedAt": "2026-11-04T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-29T09:00:00+05:30", "requestedAt": "2026-11-05T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-29T15:00:00+05:30", "requestedAt": "2026-11-05T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-30T09:00:00+05:30", "requestedAt": "2026-11-06T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-30T15:00:00+05:30", "requestedAt": "2026-11-06T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-01T09:00:00+05:30", "requestedAt": "2026-11-07T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-01T15:00:00+05:30", "requestedAt": "2026-11-07T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-02T09:00:00+05:30", "requestedAt": "2026-11-08T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-02T15:00:00+05:30", "requestedAt": "2026-11-08T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-03T09:00:00+05:30", "requestedAt": "2026-11-09T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-03T15:00:00+05:30", "requestedAt": "2026-11-09T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-04T09:00:00+05:30", "requestedAt": "2026-11-10T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-04T15:00:00+05:30", "requestedAt": "2026-11-10T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-05T09:00:00+05:30", "requestedAt": "2026-11-11T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-05T15:00:00+05:30", "requestedAt": "2026-11-11T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-06T09:00:00+05:30", "requestedAt": "2026-11-12T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-06T15:00:00+05:30", "requestedAt": "2026-11-12T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-07T09:00:00+05:30", "requestedAt": "2026-11-13T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-07T15:00:00+05:30", "requestedAt": "2026-11-13T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-08T09:00:00+05:30", "requestedAt": "2026-11-14T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-08T15:00:00+05:30", "requestedAt": "2026-11-14T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-09T09:00:00+05:30", "requestedAt": "2026-11-15T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-09T15:00:00+05:30", "requestedAt": "2026-11-15T14:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-10T09:00:00+05:30", "requestedAt": "2026-11-16T08:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-10T15:00:00+05:30", "requestedAt": "2026-11-16T14:00:00+05:30"}
+    ],
+    "reliability_score": 95.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 0.85, "consecutive_attended_count": 0, "recent_noshows_count": 0, "reliability_score": 95.0, "bookings_last_30d": 30}
+  },
+  {
+    "name": "late_night_crosses_midnight_in_the_library_zone",
+    "description": "A booking at 20:30 UTC on Monday Nov 23 is 02:00 on Tuesday Nov 24 in Asia/Kolkata: hour_of_day and day_of_week are taken in the library zone (2 and 1), not UTC (20 and 0). Lead 1.5 h.",
+    "now": "2026-11-23T19:00:00Z",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-23T20:30:00Z", "endTime": "2026-11-23T22:30:00Z", "requestedAt": "2026-11-23T19:00:00Z", "resourceType": "room"},
+    "history": [
+      {"status": "completed", "startTime": "2026-11-20T04:30:00Z", "requestedAt": "2026-11-19T04:30:00Z"}
+    ],
+    "reliability_score": 92.5,
+    "expected": {"hour_of_day": 2, "day_of_week": 1, "duration_minutes": 120, "lead_time_hours": 1.5, "resource_type": "room", "past_attendance_ratio": 1.0, "consecutive_attended_count": 1, "recent_noshows_count": 0, "reliability_score": 92.5, "bookings_last_30d": 1}
+  },
+  {
+    "name": "tz_parameter_is_honoured",
+    "description": "The same booking with tz UTC gives hour_of_day 20 and day_of_week 0 (Monday): the zone comes from the tz field, it is not hard-coded.",
+    "now": "2026-11-23T19:00:00Z",
+    "tz": "UTC",
+    "booking": {"startTime": "2026-11-23T20:30:00Z", "endTime": "2026-11-23T22:30:00Z", "requestedAt": "2026-11-23T19:00:00Z", "resourceType": "room"},
+    "history": [
+      {"status": "completed", "startTime": "2026-11-20T04:30:00Z", "requestedAt": "2026-11-19T04:30:00Z"}
+    ],
+    "reliability_score": 92.5,
+    "expected": {"hour_of_day": 20, "day_of_week": 0, "duration_minutes": 120, "lead_time_hours": 1.5, "resource_type": "room", "past_attendance_ratio": 1.0, "consecutive_attended_count": 1, "recent_noshows_count": 0, "reliability_score": 92.5, "bookings_last_30d": 1}
+  },
+  {
+    "name": "monday_is_day_of_week_0",
+    "description": "A Monday booking has day_of_week 0 (Monday = 0). Lead is Friday 12:00 to Monday 09:00 = 69 h; 90 minutes long.",
+    "now": "2026-11-20T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-23T09:00:00+05:30", "endTime": "2026-11-23T10:30:00+05:30", "requestedAt": "2026-11-20T12:00:00+05:30", "resourceType": "seat"},
+    "history": [],
+    "reliability_score": 70.0,
+    "expected": {"hour_of_day": 9, "day_of_week": 0, "duration_minutes": 90, "lead_time_hours": 69.0, "resource_type": "seat", "past_attendance_ratio": 0.85, "consecutive_attended_count": 0, "recent_noshows_count": 0, "reliability_score": 70.0, "bookings_last_30d": 0}
+  },
+  {
+    "name": "sunday_is_day_of_week_6",
+    "description": "A Sunday booking has day_of_week 6. Lead is Tuesday 12:00 to Sunday 18:30 = 126.5 h; 150 minutes long.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-29T18:30:00+05:30", "endTime": "2026-11-29T21:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "room"},
+    "history": [],
+    "reliability_score": 100.0,
+    "expected": {"hour_of_day": 18, "day_of_week": 6, "duration_minutes": 150, "lead_time_hours": 126.5, "resource_type": "room", "past_attendance_ratio": 0.85, "consecutive_attended_count": 0, "recent_noshows_count": 0, "reliability_score": 100.0, "bookings_last_30d": 0}
+  },
+  {
+    "name": "lead_time_is_clamped_at_zero",
+    "description": "requestedAt after startTime (a walk-up recorded late): lead_time_hours is 0.0, never negative (raw value -20 minutes).",
+    "now": "2026-11-24T10:20:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-24T10:00:00+05:30", "endTime": "2026-11-24T11:00:00+05:30", "requestedAt": "2026-11-24T10:20:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "completed", "startTime": "2026-11-23T10:00:00+05:30", "requestedAt": "2026-11-22T10:00:00+05:30"}
+    ],
+    "reliability_score": 100.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 1, "duration_minutes": 60, "lead_time_hours": 0.0, "resource_type": "seat", "past_attendance_ratio": 1.0, "consecutive_attended_count": 1, "recent_noshows_count": 0, "reliability_score": 100.0, "bookings_last_30d": 1}
+  },
+  {
+    "name": "future_and_unresolved_rows_only_count_as_bookings",
+    "description": "Rows that start in the future, start exactly now, or are still `booked` after their start are neither attended nor missed (startTime must be before now), but they count in bookings_last_30d when requested within 30 days; a future row requested 54 days ago does not.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "requested", "startTime": "2026-12-02T10:00:00+05:30", "requestedAt": "2026-11-23T10:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-30T10:00:00+05:30", "requestedAt": "2026-11-10T10:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-23T09:00:00+05:30", "requestedAt": "2026-11-22T10:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-12-05T10:00:00+05:30", "requestedAt": "2026-10-01T10:00:00+05:30"},
+      {"status": "checked_in", "startTime": "2026-11-18T10:00:00+05:30", "requestedAt": "2026-11-17T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-24T12:00:00+05:30", "requestedAt": "2026-11-23T12:00:00+05:30"}
+    ],
+    "reliability_score": 100.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 1.0, "consecutive_attended_count": 1, "recent_noshows_count": 0, "reliability_score": 100.0, "bookings_last_30d": 5}
+  },
+  {
+    "name": "thirty_day_boundaries_are_inclusive",
+    "description": "A no-show starting exactly now minus 30 days is a recent no-show, one minute earlier is not (both are misses inside 90 days); a booking requested exactly now minus 30 days counts for bookings_last_30d, one minute earlier does not.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "no_show", "startTime": "2026-10-25T12:00:00+05:30", "requestedAt": "2026-10-24T12:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-10-25T11:59:00+05:30", "requestedAt": "2026-10-24T11:59:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-10-25T12:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-11T10:00:00+05:30", "requestedAt": "2026-10-25T11:59:00+05:30"}
+    ],
+    "reliability_score": 60.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 0.5, "consecutive_attended_count": 2, "recent_noshows_count": 1, "reliability_score": 60.0, "bookings_last_30d": 1}
+  },
+  {
+    "name": "attended_row_at_the_same_instant_as_the_last_miss_is_not_after_it",
+    "description": "An attended row with exactly the same startTime as the most recent miss does not count as after it (strictly later only); it still counts in the ratio. Rows are listed attended-first on purpose.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "completed", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-11-09T10:00:00+05:30"},
+      {"status": "no_show", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-11-09T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-15T10:00:00+05:30", "requestedAt": "2026-11-14T10:00:00+05:30"}
+    ],
+    "reliability_score": 80.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 0.6666666666666666, "consecutive_attended_count": 1, "recent_noshows_count": 1, "reliability_score": 80.0, "bookings_last_30d": 3}
+  },
+  {
+    "name": "bookings_last_30d_upper_bound_is_inclusive_at_now",
+    "description": "A history row requested exactly at now counts toward bookings_last_30d (requestedAt <= now); rows requested one second and one day after now do not. Only the completed row is attended.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "completed", "startTime": "2026-11-20T10:00:00+05:30", "requestedAt": "2026-11-19T10:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-28T10:00:00+05:30", "requestedAt": "2026-11-20T10:00:00+05:30"},
+      {"status": "requested", "startTime": "2026-11-27T10:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30"},
+      {"status": "booked", "startTime": "2026-11-26T10:00:00+05:30", "requestedAt": "2026-11-24T12:00:01+05:30"},
+      {"status": "requested", "startTime": "2026-12-01T10:00:00+05:30", "requestedAt": "2026-11-25T09:00:00+05:30"}
+    ],
+    "reliability_score": 100.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 1.0, "consecutive_attended_count": 1, "recent_noshows_count": 0, "reliability_score": 100.0, "bookings_last_30d": 3}
+  },
+  {
+    "name": "local_hour_0_in_the_library_zone",
+    "description": "A booking starting at exactly 00:00 Monday Nov 30 in Asia/Kolkata (18:30 UTC Sunday Nov 29): hour_of_day is 0 (never 24) and day_of_week is 0, the library-zone Monday, not the UTC Sunday (6). Lead 60 h.",
+    "now": "2026-11-27T06:30:00Z",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-29T18:30:00Z", "endTime": "2026-11-29T20:30:00Z", "requestedAt": "2026-11-27T06:30:00Z", "resourceType": "seat"},
+    "history": [],
+    "reliability_score": 75.0,
+    "expected": {"hour_of_day": 0, "day_of_week": 0, "duration_minutes": 120, "lead_time_hours": 60.0, "resource_type": "seat", "past_attendance_ratio": 0.85, "consecutive_attended_count": 0, "recent_noshows_count": 0, "reliability_score": 75.0, "bookings_last_30d": 0}
+  },
+  {
+    "name": "same_instant_tie_with_the_miss_listed_first",
+    "description": "Twin of the previous tie case with the miss listed before the attended row that starts at the same instant: the result must not depend on list order (strictly later startTime only), so the values are identical.",
+    "now": "2026-11-24T12:00:00+05:30",
+    "tz": "Asia/Kolkata",
+    "booking": {"startTime": "2026-11-25T10:00:00+05:30", "endTime": "2026-11-25T12:00:00+05:30", "requestedAt": "2026-11-24T12:00:00+05:30", "resourceType": "seat"},
+    "history": [
+      {"status": "no_show", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-11-09T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-10T10:00:00+05:30", "requestedAt": "2026-11-09T10:00:00+05:30"},
+      {"status": "completed", "startTime": "2026-11-15T10:00:00+05:30", "requestedAt": "2026-11-14T10:00:00+05:30"}
+    ],
+    "reliability_score": 80.0,
+    "expected": {"hour_of_day": 10, "day_of_week": 2, "duration_minutes": 120, "lead_time_hours": 22.0, "resource_type": "seat", "past_attendance_ratio": 0.6666666666666666, "consecutive_attended_count": 1, "recent_noshows_count": 1, "reliability_score": 80.0, "bookings_last_30d": 3}
+  }
+]

@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken'
 import request from 'supertest'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { app } from '../../src/app'
 import { JWT_SECRET } from '../../src/config/constants'
 import { prisma } from '../../src/lib/prisma'
@@ -116,6 +116,209 @@ describe('GET /admin/requests', () => {
     const res = await request(app).get('/admin/requests').set('Authorization', `Bearer ${admin}`)
 
     expect(res.body.requests[0].book).toMatchObject({ availableCopies: 2, totalCopies: 3 })
+  })
+})
+
+// Slice 7: a scored room request is listed up to 72 minutes later than its request time says (the
+// bounded priority); nothing is hidden, declined or expired because of it. Rows are made directly so each
+// one gets its own request time and score; scoring itself is off under test.
+describe('GET /admin/requests: bounded priority', () => {
+  beforeEach(resetDb)
+  let recorder: ReturnType<typeof recordEvents> | undefined
+  afterEach(() => {
+    recorder?.stop()
+    recorder = undefined
+    vi.restoreAllMocks()
+  })
+
+  const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * MINUTE_MS)
+  const list = (token: string, query = '') => request(app).get(`/admin/requests${query}`).set('Authorization', `Bearer ${token}`)
+  const idsOf = (res: { body: { requests: { id: string }[] } }) => res.body.requests.map((r) => r.id)
+  type Listed = { id: string; kind: string; expiresAt: string; room?: { priority?: { suggestedDelayMinutes: number; riskPercent: number | null } } }
+  const byId = (res: { body: { requests: Listed[] } }) => Object.fromEntries(res.body.requests.map((r) => [r.id, r]))
+
+  async function pendingBorrow(userId: string, requestedAt: Date) {
+    const book = await prisma.book.create({ data: { isbn: `isbn-${Math.random()}`, title: 'Sapiens', author: 'Harari', totalCopies: 1 } })
+    const copy = await prisma.bookCopy.create({ data: { bookId: book.id, status: 'requested' } })
+    return prisma.borrowRequest.create({
+      data: { userId, bookId: book.id, bookCopyId: copy.id, requestedAt, expiresAt: new Date(Date.now() + 24 * HOUR_MS) },
+    })
+  }
+
+  // `probability` undefined: no NoShowEvent at all; null or a number: an event with that predictedProbability.
+  async function roomRequest(userId: string, requestedAt: Date, priorityScore: number | null, probability?: number | null) {
+    const resource = await prisma.resource.create({ data: { type: 'room', name: `Room ${Math.random()}` } })
+    const booking = await prisma.resourceBooking.create({
+      data: { userId, resourceId: resource.id, startTime: tomorrowAt(14), endTime: tomorrowAt(15), status: 'requested', requestedAt, priorityScore },
+    })
+    if (probability !== undefined) {
+      await prisma.noShowEvent.create({ data: { resourceBookingId: booking.id, userId, predictedProbability: probability } })
+    }
+    return booking
+  }
+
+  it('a room request with priorityScore 0.8 sits at most 72 minutes later than its request time says', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    const penalised = await roomRequest(user.id, minutesAgo(100), 0.8) // sorts as if requested 28 minutes ago
+    const before = await roomRequest(user.id, minutesAgo(60), null)
+    const seventyAfter = await roomRequest(user.id, minutesAgo(30), null) // 70 minutes after it: now ahead of it
+    const seventyFiveAfter = await roomRequest(user.id, minutesAgo(25), null) // 75 minutes after it: still behind it
+    const last = await roomRequest(user.id, minutesAgo(10), null)
+
+    const res = await list(admin)
+
+    expect(res.status).toBe(200)
+    expect(idsOf(res)).toEqual([before.id, seventyAfter.id, penalised.id, seventyFiveAfter.id, last.id])
+    expect(byId(res)[penalised.id].room?.priority).toEqual({ suggestedDelayMinutes: 72, riskPercent: null })
+  })
+
+  it('a null score changes nothing', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    const first = await roomRequest(user.id, minutesAgo(50), null)
+    const borrow = await pendingBorrow(user.id, minutesAgo(35))
+    const last = await roomRequest(user.id, minutesAgo(20), null, 0.4) // an event with no score does not count either
+
+    const suggested = await list(admin)
+    const plain = await list(admin, '?order=request')
+
+    expect(idsOf(suggested)).toEqual([first.id, borrow.id, last.id])
+    expect(idsOf(plain)).toEqual(idsOf(suggested))
+    for (const entry of Object.values(byId(suggested))) expect(entry.room ?? {}).not.toHaveProperty('priority')
+  })
+
+  it('borrow requests are never reordered by priority', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    const b1 = await pendingBorrow(user.id, minutesAgo(90))
+    const b2 = await pendingBorrow(user.id, minutesAgo(60))
+    const b3 = await pendingBorrow(user.id, minutesAgo(30))
+    const penalised = await roomRequest(user.id, minutesAgo(80), 0.8) // sorts as if requested 8 minutes ago: after every borrow
+
+    const suggested = await list(admin)
+
+    expect(idsOf(suggested)).toEqual([b1.id, b2.id, b3.id, penalised.id])
+    expect(idsOf(await list(admin, '?order=request'))).toEqual([b1.id, penalised.id, b2.id, b3.id])
+    for (const id of [b1.id, b2.id, b3.id]) expect(byId(suggested)[id]).not.toHaveProperty('room')
+  })
+
+  it('order=request returns plain request-time order', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    const penalised = await roomRequest(user.id, minutesAgo(100), 0.8)
+    const other = await roomRequest(user.id, minutesAgo(60), null)
+
+    expect(idsOf(await list(admin, '?order=suggested'))).toEqual([other.id, penalised.id])
+    expect(idsOf(await list(admin))).toEqual([other.id, penalised.id]) // suggested is the default
+    expect(idsOf(await list(admin, '?order=request'))).toEqual([penalised.id, other.id])
+  })
+
+  it('a priority never hides, declines or expires a request', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    const borrow = await pendingBorrow(user.id, minutesAgo(30))
+    const rooms = [
+      await roomRequest(user.id, minutesAgo(100), 0.8, 0.9),
+      await roomRequest(user.id, minutesAgo(90), 0.8, 0.9),
+      await roomRequest(user.id, minutesAgo(80), 0.85, 0.5),
+    ]
+    recorder = recordEvents()
+
+    for (const query of ['', '?order=suggested', '?order=request']) {
+      const res = await list(admin, query)
+      expect(res.body.counts).toEqual({ all: 4, borrow: 1, room: 3 })
+      expect(idsOf(res).sort()).toEqual([borrow.id, ...rooms.map((r) => r.id)].sort())
+    }
+    // Still open, with the same deadline (start plus the 15-minute grace period), and nothing was published.
+    const rows = await prisma.resourceBooking.findMany({ where: { id: { in: rooms.map((r) => r.id) } } })
+    expect(rows.map((r) => [r.status, r.declineReason, r.decidedAt])).toEqual(rows.map(() => ['requested', null, null]))
+    expect((await prisma.borrowRequest.findUniqueOrThrow({ where: { id: borrow.id } })).status).toBe('pending')
+    const listed = byId(await list(admin))
+    for (const room of rooms) expect(listed[room.id].expiresAt).toBe(new Date(tomorrowAt(14).getTime() + 15 * MINUTE_MS).toISOString())
+    expect(recorder.events).toEqual([])
+  })
+
+  it('a score above 1 or below 0.8 in the database is clamped when read', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    const high = await roomRequest(user.id, minutesAgo(40), 5)
+    const low = await roomRequest(user.id, minutesAgo(100), -3) // sorts as if requested 28 minutes ago, not a day later
+    const inRange = await roomRequest(user.id, minutesAgo(60), 0.9)
+    const belowCap = await roomRequest(user.id, minutesAgo(90), 0.5)
+
+    const res = await list(admin)
+
+    const minutes = (id: string) => byId(res)[id].room?.priority?.suggestedDelayMinutes
+    expect([minutes(high.id), minutes(low.id), minutes(inRange.id), minutes(belowCap.id)]).toEqual([0, 72, 36, 72])
+    // keys: belowCap -18, high -40, low -28, inRange -24
+    expect(idsOf(res)).toEqual([high.id, low.id, inRange.id, belowCap.id])
+  })
+
+  it('the order is stable and deterministic for equal keys', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    const t = minutesAgo(100)
+    const t36 = new Date(t.getTime() + 36 * MINUTE_MS)
+    const earlier = await roomRequest(user.id, t, 0.9) // key t + 36 minutes
+    const ties = [await roomRequest(user.id, t36, null), await roomRequest(user.id, t36, null), await roomRequest(user.id, t36, 1)]
+    // Equal key: the earlier real request time first, then the id.
+    const expected = [earlier.id, ...ties.map((r) => r.id).sort()]
+
+    const first = await list(admin)
+    const second = await list(admin)
+    const plain = await list(admin, '?order=request')
+
+    expect(idsOf(first)).toEqual(expected)
+    expect(idsOf(second)).toEqual(expected)
+    expect(idsOf(plain)).toEqual(expected) // the same tie-break in plain order
+  })
+
+  it('riskPercent comes from the NoShowEvent', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    const scored = await roomRequest(user.id, minutesAgo(50), 0.9, 0.314)
+    const rounded = await roomRequest(user.id, minutesAgo(49), 0.9, 0.375) // 37.5 rounds up
+    const noProbability = await roomRequest(user.id, minutesAgo(48), 0.9, null)
+    const noEvent = await roomRequest(user.id, minutesAgo(47), 0.9)
+    const noScore = await roomRequest(user.id, minutesAgo(46), null, 0.5) // an event alone gives no priority
+
+    const listed = byId(await list(admin))
+
+    expect(listed[scored.id].room?.priority).toEqual({ suggestedDelayMinutes: 36, riskPercent: 31 })
+    expect(listed[rounded.id].room?.priority).toEqual({ suggestedDelayMinutes: 36, riskPercent: 38 })
+    expect(listed[noProbability.id].room?.priority).toEqual({ suggestedDelayMinutes: 36, riskPercent: null })
+    expect(listed[noEvent.id].room?.priority).toEqual({ suggestedDelayMinutes: 36, riskPercent: null })
+    expect(listed[noScore.id].room).not.toHaveProperty('priority')
+  })
+
+  it('loads the events with the room requests, not one query per request', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user } = await seedUser()
+    for (let i = 0; i < 3; i++) await roomRequest(user.id, minutesAgo(50 + i), 0.9, 0.3)
+    const spies = [
+      vi.spyOn(prisma.noShowEvent, 'findUnique'),
+      vi.spyOn(prisma.noShowEvent, 'findFirst'),
+      vi.spyOn(prisma.noShowEvent, 'findMany'),
+    ]
+
+    const res = await list(admin)
+
+    expect(res.body.requests.map((r: Listed) => r.room?.priority?.riskPercent)).toEqual([30, 30, 30])
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled()
+    // Control: the spies do see a call made through the same client.
+    await prisma.noShowEvent.findMany()
+    expect(spies[2]).toHaveBeenCalledTimes(1)
+  })
+
+  it('answers 400 for an unknown ?order=', async () => {
+    const { token: admin } = await seedUser('admin')
+
+    for (const query of ['?order=newest', '?order=', '?order=REQUEST', '?order=request&order=suggested']) {
+      expect([query, (await list(admin, query)).status]).toEqual([query, 400])
+    }
+    expect((await list(admin, '?order=request')).status).toBe(200)
+    expect((await list(admin, '?order=suggested')).status).toBe(200)
   })
 })
 

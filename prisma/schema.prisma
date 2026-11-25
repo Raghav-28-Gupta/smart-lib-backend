@@ -104,6 +104,11 @@ enum NoticeKind {
   overdue_escalation
   dispute_outcome
   report_outcome
+  // Booking notices: a "starts soon" reminder, a recorded no-show, and the answer
+  // to a student's dispute of one (they carry Notice.bookingId).
+  booking_reminder
+  no_show
+  no_show_outcome
 }
 
 // Where a fine dispute stands. `open` while the librarians have not answered;
@@ -112,6 +117,15 @@ enum DisputeStatus {
   open
   waived
   adjusted
+  upheld
+}
+
+// Where a no-show dispute stands. `open` while the librarians have not answered;
+// `overturned` means the no-show was removed (the booking goes back to `released`
+// and the points are restored), `upheld` that it stands.
+enum NoShowDisputeStatus {
+  open
+  overturned
   upheld
 }
 
@@ -162,19 +176,21 @@ model User {
   reliabilityLogs ReliabilityScoreLog[]
   recommendations RecommendationCache[]
 
-  borrowRequests        BorrowRequest[]       @relation("BorrowRequester")
-  decidedBorrowRequests BorrowRequest[]       @relation("BorrowRequestDecider")
-  decidedBookings       ResourceBooking[]     @relation("BookingDecider")
-  cancelledBookings     ResourceBooking[]     @relation("BookingCanceller")
-  adjustedFines         Fine[]                @relation("FineAdjuster")
-  recordedFinePayments  Fine[]                @relation("FinePaymentRecorder")
-  adjustedReliability   ReliabilityScoreLog[] @relation("ReliabilityAdjuster")
-  notices               Notice[]              @relation("NoticeRecipient")
-  authoredNotices       Notice[]              @relation("NoticeAuthor")
-  fineDisputes          FineDispute[]         @relation("DisputeStudent")
-  resolvedFineDisputes  FineDispute[]         @relation("DisputeResolver")
-  issueReports          IssueReport[]         @relation("ReportAuthor")
-  resolvedIssueReports  IssueReport[]         @relation("ReportResolver")
+  borrowRequests         BorrowRequest[]       @relation("BorrowRequester")
+  decidedBorrowRequests  BorrowRequest[]       @relation("BorrowRequestDecider")
+  decidedBookings        ResourceBooking[]     @relation("BookingDecider")
+  cancelledBookings      ResourceBooking[]     @relation("BookingCanceller")
+  adjustedFines          Fine[]                @relation("FineAdjuster")
+  recordedFinePayments   Fine[]                @relation("FinePaymentRecorder")
+  adjustedReliability    ReliabilityScoreLog[] @relation("ReliabilityAdjuster")
+  notices                Notice[]              @relation("NoticeRecipient")
+  authoredNotices        Notice[]              @relation("NoticeAuthor")
+  fineDisputes           FineDispute[]         @relation("DisputeStudent")
+  resolvedFineDisputes   FineDispute[]         @relation("DisputeResolver")
+  issueReports           IssueReport[]         @relation("ReportAuthor")
+  resolvedIssueReports   IssueReport[]         @relation("ReportResolver")
+  noShowDisputes         NoShowDispute[]       @relation("NoShowDisputeStudent")
+  resolvedNoShowDisputes NoShowDispute[]       @relation("NoShowDisputeResolver")
 }
 
 model Book {
@@ -289,9 +305,14 @@ model ResourceBooking {
   // from, and when.
   movedFromName      String?
   movedAt            DateTime?     @db.Timestamptz(3)
+  // When the "starts soon" reminder was written. Set once, by the sweep's
+  // conditional update, so a booking is reminded at most once.
+  reminderSentAt     DateTime?     @db.Timestamptz(3)
 
-  noShowEvent NoShowEvent?
-  fines       Fine[]
+  noShowEvent   NoShowEvent?
+  noShowDispute NoShowDispute?
+  fines         Fine[]
+  notices       Notice[]
 
   @@index([status, startTime])
   @@index([startTime])
@@ -328,8 +349,13 @@ model NoShowEvent {
   resourceBookingId    String          @unique
   resourceBooking      ResourceBooking @relation(fields: [resourceBookingId], references: [id])
   userId               String
-  predictedProbability Float
+  // Null when the booking was never scored (the AI service was down or slow): the
+  // sweep still records the no-show.
+  predictedProbability Float?
   actualNoShow         Boolean?
+  // The reliability points the no-show actually took (negative, after the clamp
+  // to [0, 100]), so an overturn gives back exactly that. Null until a penalty.
+  reliabilityDelta     Float?
   recordedAt           DateTime        @default(now())
 }
 
@@ -392,6 +418,28 @@ model FineDispute {
   @@index([status, createdAt])
 }
 
+// A student's dispute of one recorded no-show: why they think it is wrong, and how
+// the library answered. At most one per booking, ever (the unique bookingId), open
+// or answered. Overturning it puts the booking back to `released` and restores the
+// points the no-show took.
+model NoShowDispute {
+  id             String              @id @default(uuid())
+  bookingId      String              @unique
+  booking        ResourceBooking     @relation(fields: [bookingId], references: [id])
+  userId         String
+  user           User                @relation("NoShowDisputeStudent", fields: [userId], references: [id])
+  reason         String
+  status         NoShowDisputeStatus @default(open)
+  resolutionNote String?
+  // The librarian who answered it (null while open, and if that account is gone).
+  resolvedById   String?
+  resolvedBy     User?               @relation("NoShowDisputeResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+  createdAt      DateTime            @default(now())
+  resolvedAt     DateTime?
+
+  @@index([status, createdAt])
+}
+
 // A student's report of a problem with one thing: a book copy (made as the copy is
 // returned) or a seat or room (made from the app). Exactly one of bookCopyId and
 // resourceId is set, and a student has at most one open report per target; both
@@ -427,23 +475,28 @@ model IssueReport {
 // after the commit and its outcome recorded here. The student sees it in the app
 // for REQUEST_OUTCOME_VISIBLE_DAYS (GET /notices/me).
 model Notice {
-  id          String      @id @default(uuid())
+  id          String           @id @default(uuid())
   userId      String
-  user        User        @relation("NoticeRecipient", fields: [userId], references: [id])
+  user        User             @relation("NoticeRecipient", fields: [userId], references: [id])
   kind        NoticeKind
   title       String
   body        String
   // The loan or fine it concerns, cleared when that row is deleted (the text is
   // already rendered, so the notice stays).
   loanId      String?
-  loan        Loan?       @relation(fields: [loanId], references: [id], onDelete: SetNull)
+  loan        Loan?            @relation(fields: [loanId], references: [id], onDelete: SetNull)
   fineId      String?
-  fine        Fine?       @relation(fields: [fineId], references: [id], onDelete: SetNull)
+  fine        Fine?            @relation(fields: [fineId], references: [id], onDelete: SetNull)
+  // The booking a reminder, no-show or no-show outcome notice is about, cleared
+  // when that booking is deleted. The reminder is also hidden from the student's
+  // list once the booking is no longer `booked` (read through this link).
+  bookingId   String?
+  booking     ResourceBooking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
   // The librarian whose action caused it (null if the account is gone).
   createdById String?
-  createdBy   User?       @relation("NoticeAuthor", fields: [createdById], references: [id], onDelete: SetNull)
-  createdAt   DateTime    @default(now())
-  emailStatus EmailStatus @default(skipped)
+  createdBy   User?            @relation("NoticeAuthor", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime         @default(now())
+  emailStatus EmailStatus      @default(skipped)
   // When the email was attempted: set for `sent` and `failed`, null for `skipped`.
   emailedAt   DateTime?
 

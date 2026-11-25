@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MAIL_TIMEOUT_MS, REQUEST_OUTCOME_VISIBLE_DAYS } from '../../src/config/constants'
-import type { Notice } from '../../src/generated/prisma/client'
+import type { BookingStatus, Notice } from '../../src/generated/prisma/client'
 import { setMailTransport, type MailTransport } from '../../src/lib/mailer'
 import { prisma } from '../../src/lib/prisma'
 import { NOTICE_EMAIL_FOOTER, createNotice, deliverNotice, listMyNotices } from '../../src/services/noticeService'
@@ -259,7 +259,8 @@ describe('listMyNotices', () => {
 
     // Another student sees only theirs.
     expect((await listMyNotices(other.id, now)).map((n) => n.title)).toEqual(['Someone else'])
-  })
+    // About 100 sequential round trips to seed: it hit the 15 s default once on a slow remote database.
+  }, 60_000)
 
   it('shows each notice as id, kind, title, body and date, and nothing else', async () => {
     const student = await seedUser()
@@ -288,5 +289,175 @@ describe('listMyNotices', () => {
 
     expect(first.map((n) => n.id)).toEqual(second.map((n) => n.id))
     expect(first.map((n) => n.id)).toEqual([a.id, b.id].sort())
+  })
+})
+
+// A "your booking starts soon" reminder is only useful while the booking can still
+// be checked into: once it is checked in, cancelled, released, recorded as a
+// no-show or past its grace period, the reminder is moot and the list hides it
+// (read through Notice.bookingId). The 20-notice cap is applied AFTER that, so a
+// hidden reminder never takes a slot from a notice the student can see.
+describe('listMyNotices and booking reminders', () => {
+  const MINUTE_MS = 60 * 1000
+  const REMINDER_BODY = 'Desk 1, 3–4 PM. Check in within 15 minutes of the start or the slot is released.'
+
+  async function seedBooking(userId: string, o: { startTime: Date; status?: BookingStatus; gracePeriodMinutes?: number }) {
+    const resource = await prisma.resource.create({ data: { type: 'seat', name: `Desk ${Math.random()}` } })
+    return prisma.resourceBooking.create({
+      data: {
+        userId,
+        resourceId: resource.id,
+        startTime: o.startTime,
+        endTime: new Date(o.startTime.getTime() + HOUR_MS),
+        status: o.status ?? 'booked',
+        gracePeriodMinutes: o.gracePeriodMinutes ?? 15,
+      },
+    })
+  }
+
+  const reminderFor = (userId: string, bookingId: string, title = 'Your booking starts soon') =>
+    seedNotice(userId, { kind: 'booking_reminder', title, body: REMINDER_BODY, bookingId })
+
+  const titles = async (userId: string, now: Date) => (await listMyNotices(userId, now)).map((n) => n.title)
+
+  it('shows a reminder while its booking is booked and its grace period has not ended', async () => {
+    const now = new Date()
+    const student = await seedUser()
+    const upcoming = await seedBooking(student.id, { startTime: new Date(now.getTime() + 20 * MINUTE_MS) })
+    const started = await seedBooking(student.id, { startTime: new Date(now.getTime() - 5 * MINUTE_MS) })
+    await reminderFor(student.id, upcoming.id, 'Upcoming')
+    await reminderFor(student.id, started.id, 'Started, inside its grace period')
+
+    expect((await titles(student.id, now)).sort()).toEqual(['Started, inside its grace period', 'Upcoming'])
+  })
+
+  it('the reminder disappears from the list once the booking is checked in, cancelled or past grace', async () => {
+    const now = new Date()
+    const student = await seedUser()
+    const startsSoon = new Date(now.getTime() + 20 * MINUTE_MS)
+    // Every way a booking stops being `booked` before its grace period ends.
+    const statuses: BookingStatus[] = ['checked_in', 'cancelled', 'released', 'no_show', 'completed', 'declined', 'expired']
+    for (const status of statuses) {
+      const booking = await seedBooking(student.id, { startTime: startsSoon, status })
+      await reminderFor(student.id, booking.id, `Reminder of a ${status} booking`)
+    }
+    const stillBooked = await seedBooking(student.id, { startTime: startsSoon })
+    await reminderFor(student.id, stillBooked.id, 'Reminder of a booked booking')
+
+    expect(await titles(student.id, now)).toEqual(['Reminder of a booked booking'])
+
+    // The same booking, once it is checked in or cancelled after the reminder was written.
+    await prisma.resourceBooking.update({ where: { id: stillBooked.id }, data: { status: 'checked_in' } })
+    expect(await titles(student.id, now)).toEqual([])
+    await prisma.resourceBooking.update({ where: { id: stillBooked.id }, data: { status: 'cancelled' } })
+    expect(await titles(student.id, now)).toEqual([])
+  })
+
+  it('hides a reminder from the moment its grace period has ended, and not a moment before', async () => {
+    const now = new Date()
+    const student = await seedUser()
+    const booking = await seedBooking(student.id, { startTime: new Date(now.getTime() - 15 * MINUTE_MS), gracePeriodMinutes: 15 })
+    await reminderFor(student.id, booking.id, 'Reminder')
+
+    // Grace ends exactly at `now` (started 15 minutes ago, 15 minutes of grace): the same
+    // "strictly after" the sweep uses, so the booking can still be checked into.
+    expect(await titles(student.id, now)).toEqual(['Reminder'])
+    expect(await titles(student.id, new Date(now.getTime() + 1))).toEqual([])
+  })
+
+  it("uses the booking's own grace period", async () => {
+    const now = new Date()
+    const student = await seedUser()
+    // Both started 20 minutes ago: 15 minutes of grace is over, 30 minutes is not.
+    const shortGrace = await seedBooking(student.id, { startTime: new Date(now.getTime() - 20 * MINUTE_MS), gracePeriodMinutes: 15 })
+    const longGrace = await seedBooking(student.id, { startTime: new Date(now.getTime() - 20 * MINUTE_MS), gracePeriodMinutes: 30 })
+    await reminderFor(student.id, shortGrace.id, 'Short grace')
+    await reminderFor(student.id, longGrace.id, 'Long grace')
+
+    expect(await titles(student.id, now)).toEqual(['Long grace'])
+  })
+
+  it('hides a reminder whose booking is gone, and leaves another kind of booking notice alone', async () => {
+    const now = new Date()
+    const student = await seedUser()
+    const deleted = await seedBooking(student.id, { startTime: new Date(now.getTime() + 20 * MINUTE_MS) })
+    const reminder = await reminderFor(student.id, deleted.id, 'Reminder of a deleted booking')
+    await seedNotice(student.id, { kind: 'no_show', title: 'Missed booking', body: 'You missed it.', bookingId: deleted.id })
+
+    await prisma.resourceBooking.delete({ where: { id: deleted.id } })
+
+    // The link is cleared, not the notice (the text is already written).
+    expect((await stored(reminder.id)).bookingId).toBeNull()
+    expect(await titles(student.id, now)).toEqual(['Missed booking'])
+  })
+
+  it('leaves the no-show kinds alone whatever their booking is', async () => {
+    const now = new Date()
+    const student = await seedUser()
+    // Long past its grace period and no longer booked: a reminder would be hidden, these must not be.
+    const missed = await seedBooking(student.id, { startTime: new Date(now.getTime() - 3 * HOUR_MS), status: 'no_show' })
+    const released = await seedBooking(student.id, { startTime: new Date(now.getTime() - 3 * HOUR_MS), status: 'released' })
+    const cancelled = await seedBooking(student.id, { startTime: new Date(now.getTime() - 3 * HOUR_MS), status: 'cancelled' })
+    await seedNotice(student.id, { kind: 'no_show', title: 'Missed booking', body: 'x', bookingId: missed.id })
+    await seedNotice(student.id, { kind: 'no_show_outcome', title: 'No-show removed', body: 'x', bookingId: released.id })
+    await seedNotice(student.id, { kind: 'no_show_outcome', title: 'No-show stands', body: 'x', bookingId: cancelled.id })
+
+    expect((await titles(student.id, now)).sort()).toEqual(['Missed booking', 'No-show removed', 'No-show stands'])
+  })
+
+  it('a hidden reminder never takes one of the 20 slots', async () => {
+    const now = new Date()
+    const student = await seedUser()
+    const at = (ageMs: number) => new Date(now.getTime() - ageMs)
+    const upcoming = await seedBooking(student.id, { startTime: new Date(now.getTime() + 20 * MINUTE_MS) })
+    const cancelled = await seedBooking(student.id, { startTime: new Date(now.getTime() + 20 * MINUTE_MS), status: 'cancelled' })
+
+    // Three hidden reminders, the newest notices of all; one reminder that can still be acted on;
+    // then 22 ordinary notices an hour old and more.
+    const base = { userId: student.id, body: 'x' }
+    await prisma.notice.createMany({
+      data: [
+        ...[1, 2, 3].map((i) => ({ ...base, kind: 'booking_reminder' as const, title: `Hidden ${i}`, bookingId: cancelled.id, createdAt: at(i * MINUTE_MS) })),
+        { ...base, kind: 'booking_reminder' as const, title: 'Visible reminder', bookingId: upcoming.id, createdAt: at(10 * MINUTE_MS) },
+        ...Array.from({ length: 22 }, (_, i) => ({ ...base, kind: 'overdue_reminder' as const, title: `Notice ${i}`, createdAt: at(HOUR_MS + i * MINUTE_MS) })),
+      ],
+    })
+
+    const listed = await titles(student.id, now)
+
+    // 20 shown: the visible reminder and the 19 newest ordinary notices; no hidden reminder, and not 17.
+    expect(listed).toEqual(['Visible reminder', ...Array.from({ length: 19 }, (_, i) => `Notice ${i}`)])
+  })
+
+  it('still answers id, kind, title, body and date for a reminder, and nothing of its booking', async () => {
+    const now = new Date()
+    const student = await seedUser()
+    const booking = await seedBooking(student.id, { startTime: new Date(now.getTime() + 20 * MINUTE_MS) })
+    const reminder = await reminderFor(student.id, booking.id)
+
+    const [listed] = await listMyNotices(student.id, now)
+
+    expect(listed).toEqual({
+      id: reminder.id,
+      kind: 'booking_reminder',
+      title: 'Your booking starts soon',
+      body: REMINDER_BODY,
+      createdAt: reminder.createdAt,
+    })
+  })
+
+  it("never shows another student's reminder, and still keeps the 7-day window", async () => {
+    const now = new Date()
+    const student = await seedUser()
+    const other = await seedUser()
+    const mine = await seedBooking(student.id, { startTime: new Date(now.getTime() + 20 * MINUTE_MS) })
+    const theirs = await seedBooking(other.id, { startTime: new Date(now.getTime() + 20 * MINUTE_MS) })
+    const old = await reminderFor(student.id, mine.id, 'Too old')
+    await prisma.notice.update({ where: { id: old.id }, data: { createdAt: new Date(now.getTime() - (REQUEST_OUTCOME_VISIBLE_DAYS * DAY_MS + HOUR_MS)) } })
+    await reminderFor(student.id, mine.id, 'Mine')
+    await reminderFor(other.id, theirs.id, 'Theirs')
+
+    expect(await titles(student.id, now)).toEqual(['Mine'])
+    expect(await titles(other.id, now)).toEqual(['Theirs'])
   })
 })

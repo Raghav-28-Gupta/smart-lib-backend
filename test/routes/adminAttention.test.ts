@@ -3,7 +3,17 @@ import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { app } from '../../src/app'
 import { JWT_SECRET } from '../../src/config/constants'
-import type { EmailStatus, FineReason, FineStatus, IssueCategory, LoanStatus, NoticeKind, Prisma, ReportStatus } from '../../src/generated/prisma/client'
+import type {
+  EmailStatus,
+  FineReason,
+  FineStatus,
+  IssueCategory,
+  LoanStatus,
+  NoShowDisputeStatus,
+  NoticeKind,
+  Prisma,
+  ReportStatus,
+} from '../../src/generated/prisma/client'
 import { subscribe } from '../../src/lib/events'
 import { setMailTransport, type MailTransport } from '../../src/lib/mailer'
 import { prisma } from '../../src/lib/prisma'
@@ -141,6 +151,30 @@ async function seedResourceReport(userId: string, name: string, o: ReportSeed = 
   return { resource, report }
 }
 
+interface NoShowDisputeSeed {
+  name?: string
+  type?: 'seat' | 'room'
+  reason?: string
+  /** When the student opened the dispute: what the queue says it has waited since. */
+  createdAt?: Date
+  /** How long before now the booking started (a one-hour booking). */
+  startedAgoMs?: number
+  status?: NoShowDisputeStatus
+}
+
+/** A recorded no-show on a resource of its own, with the student's dispute of it, the way the student's request leaves them. */
+async function seedNoShowDispute(userId: string, o: NoShowDisputeSeed = {}) {
+  const resource = await prisma.resource.create({ data: { type: o.type ?? 'seat', name: o.name ?? `Desk ${Math.random()}` } })
+  const startTime = new Date(Date.now() - (o.startedAgoMs ?? 3 * HOUR_MS))
+  const booking = await prisma.resourceBooking.create({
+    data: { userId, resourceId: resource.id, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status: 'no_show' },
+  })
+  const dispute = await prisma.noShowDispute.create({
+    data: { bookingId: booking.id, userId, reason: o.reason ?? 'I was there', createdAt: o.createdAt, status: o.status },
+  })
+  return { resource, booking, dispute }
+}
+
 /** Injects a fake mail transport (cleared in afterEach); email is then configured, and nothing leaves the process. */
 function fakeTransport(ok = true) {
   const send = vi.fn<MailTransport['send']>(async () => ({ ok }))
@@ -234,7 +268,7 @@ describe('GET /admin/attention', () => {
           },
         },
       ],
-      counts: { all: 1, overdue: 1, fine_dispute: 0, report: 0 },
+      counts: { all: 1, overdue: 1, fine_dispute: 0, report: 0, no_show_dispute: 0 },
       emailEnabled: false,
     })
   })
@@ -269,7 +303,7 @@ describe('GET /admin/attention', () => {
     const res = await queue(admin)
 
     expect((res.body.items as Array<{ id: string }>).map((i) => i.id)).toEqual([overdue.loan.id])
-    expect(res.body.counts).toEqual({ all: 1, overdue: 1, fine_dispute: 0, report: 0 })
+    expect(res.body.counts).toEqual({ all: 1, overdue: 1, fine_dispute: 0, report: 0, no_show_dispute: 0 })
   })
 
   it('oldest due first, and the kind filter and counts', async () => {
@@ -279,7 +313,7 @@ describe('GET /admin/attention', () => {
     const oldest = await seedOverdueLoan(student.id, { overdueBy: 9 * DAY_MS })
     const newest = await seedOverdueLoan(student.id, { overdueBy: 2 * DAY_MS })
     const order = [oldest.loan.id, middle.loan.id, newest.loan.id]
-    const counts = { all: 3, overdue: 3, fine_dispute: 0, report: 0 }
+    const counts = { all: 3, overdue: 3, fine_dispute: 0, report: 0, no_show_dispute: 0 }
     const ids = (res: request.Response) => (res.body.items as Array<{ id: string }>).map((i) => i.id)
 
     const all = await queue(admin)
@@ -339,9 +373,11 @@ describe('GET /admin/attention', () => {
     }
   })
 
-  // One query per kind of item (overdue loans, fine disputes, problem reports), so the cost does not
-  // grow with the number of items: no per-row reads of a notice, a student, a book, a fine or a resource.
-  it('reads the whole queue in one query per kind however many items are in it', async () => {
+  // One query per kind of item (overdue loans, fine disputes, problem reports, no-show disputes), so the cost
+  // does not grow with the number of items: no per-row reads of a notice, a student, a book, a fine, a booking
+  // or a resource.
+  // Its seeding is a hundred or so round trips to a remote database: past the 15 s default on a slow day.
+  it('reads the whole queue in one query per kind however many items are in it', { timeout: 60_000 }, async () => {
     const { user: student } = await seedUser()
     for (let i = 0; i < 5; i++) {
       const { loan } = await seedOverdueLoan(student.id, { overdueBy: (i + 2) * DAY_MS })
@@ -351,6 +387,7 @@ describe('GET /admin/attention', () => {
       await openDispute(fine.id, student.id, `Reason ${i}`, new Date(Date.now() - i * HOUR_MS))
       await seedCopyReport(student.id, `Reported ${i}`, { createdAt: new Date(Date.now() - i * HOUR_MS) })
       await seedResourceReport(student.id, `Desk ${i}`, { createdAt: new Date(Date.now() - i * HOUR_MS) })
+      await seedNoShowDispute(student.id, { name: `Missed ${i}`, createdAt: new Date(Date.now() - i * HOUR_MS) })
     }
     const queryRaw = vi.spyOn(prisma, '$queryRaw')
     const others = [
@@ -369,15 +406,20 @@ describe('GET /admin/attention', () => {
       vi.spyOn(prisma.fineDispute, 'findUnique'),
       vi.spyOn(prisma.issueReport, 'findMany'),
       vi.spyOn(prisma.issueReport, 'findUnique'),
+      vi.spyOn(prisma.noShowDispute, 'findMany'),
+      vi.spyOn(prisma.noShowDispute, 'findUnique'),
+      vi.spyOn(prisma.resourceBooking, 'findMany'),
+      vi.spyOn(prisma.resourceBooking, 'findUnique'),
     ]
 
     const result = await listAttention({}, new Date())
 
-    expect(result.items).toHaveLength(20)
+    expect(result.items).toHaveLength(25)
     expect(result.items.filter((i) => i.kind === 'overdue' && i.overdue.escalated)).toHaveLength(3)
     expect(result.items.filter((i) => i.kind === 'fine_dispute')).toHaveLength(5)
     expect(result.items.filter((i) => i.kind === 'report')).toHaveLength(10)
-    expect(queryRaw).toHaveBeenCalledTimes(3)
+    expect(result.items.filter((i) => i.kind === 'no_show_dispute')).toHaveLength(5)
+    expect(queryRaw).toHaveBeenCalledTimes(4)
     for (const spy of others) expect(spy).not.toHaveBeenCalled()
   })
 
@@ -438,7 +480,7 @@ describe('GET /admin/attention: fine disputes', () => {
     const older = await openDispute(olderFine.id, asha.id, 'I returned it on time', olderOpenedAt)
     const newer = await openDispute(newerFine.id, ben.id, 'Still too much for a late fee', newerOpenedAt)
     const ids = (res: request.Response) => (res.body.items as Array<{ id: string }>).map((i) => i.id)
-    const counts = { all: 4, overdue: 2, fine_dispute: 2, report: 0 }
+    const counts = { all: 4, overdue: 2, fine_dispute: 2, report: 0, no_show_dispute: 0 }
 
     const all = await queue(admin)
     const disputes = await queue(admin, '?kind=fine_dispute')
@@ -486,7 +528,7 @@ describe('GET /admin/attention: fine disputes', () => {
 
     const res = await queue(admin)
 
-    expect(res.body.counts).toEqual({ all: 1, overdue: 0, fine_dispute: 1, report: 0 })
+    expect(res.body.counts).toEqual({ all: 1, overdue: 0, fine_dispute: 1, report: 0, no_show_dispute: 0 })
     expect(res.body.items).toHaveLength(1)
     expect(res.body.items[0].dispute.disputeId).toBe(dispute.id)
     expect(res.body.items[0].dispute.fine.status).toBe('outstanding')
@@ -574,6 +616,139 @@ describe('GET /admin/attention: fine disputes', () => {
   })
 })
 
+describe('GET /admin/attention: no-show disputes', () => {
+  it("the queue lists no-show disputes oldest first with the student's words, and counts and the kind filter include them", async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: asha } = await seedUser('student', { name: 'Asha Rao', email: 'asha@example.org' })
+    const { user: ben } = await seedUser('student', { name: 'Ben Carter', email: 'ben@example.org' })
+    const t = Date.now()
+    // Waiting times, oldest first: a loan due 9 days ago, a no-show dispute opened 6 days ago, a fine dispute opened
+    // 3 days ago, a no-show dispute opened 2 hours ago. All kinds are ordered together.
+    const overdue = await seedOverdueLoan(ben.id, { title: 'Dune', overdueBy: 9 * DAY_MS })
+    const fine = await seedFineOnLoan(asha.id, { title: 'Refactoring' })
+    const fineDispute = await openDispute(fine.id, asha.id, 'I returned it on time', new Date(t - 3 * DAY_MS))
+    const olderOpenedAt = new Date(t - 6 * DAY_MS)
+    const newerOpenedAt = new Date(t - 2 * HOUR_MS)
+    // The student's words are shown as written: line breaks, markup and edges included (the console renders plain text).
+    const words = '  I was at the desk.\nThe <b>scanner</b> was down & "dead".  '
+    const older = await seedNoShowDispute(asha.id, { name: 'Study Room A', type: 'room', reason: words, createdAt: olderOpenedAt, startedAgoMs: 6 * DAY_MS + 3 * HOUR_MS })
+    const newer = await seedNoShowDispute(ben.id, { name: 'Desk 12', reason: 'Wrong person', createdAt: newerOpenedAt, startedAgoMs: 4 * HOUR_MS })
+    const ids = (res: request.Response) => (res.body.items as Array<{ id: string }>).map((i) => i.id)
+    const counts = { all: 4, overdue: 1, fine_dispute: 1, report: 0, no_show_dispute: 2 }
+
+    const all = await queue(admin)
+    const noShows = await queue(admin, '?kind=no_show_dispute')
+    const fines = await queue(admin, '?kind=fine_dispute')
+    const overdueOnly = await queue(admin, '?kind=overdue')
+    const reports = await queue(admin, '?kind=report')
+
+    expect(all.status).toBe(200)
+    expect(ids(all)).toEqual([overdue.loan.id, older.dispute.id, fineDispute.id, newer.dispute.id])
+    // `all` counts every kind, and the filter changes the list, never the counts.
+    for (const res of [all, noShows, fines, overdueOnly, reports]) expect(res.body.counts).toEqual(counts)
+    expect(counts.all).toBe(counts.overdue + counts.fine_dispute + counts.report + counts.no_show_dispute)
+    expect(ids(noShows)).toEqual([older.dispute.id, newer.dispute.id])
+    expect(ids(fines)).toEqual([fineDispute.id])
+    expect(ids(overdueOnly)).toEqual([overdue.loan.id])
+    expect(ids(reports)).toEqual([])
+    // The items in full: the dispute's id is the item's id, the booking's slot and resource, the student's own words.
+    expect(noShows.body.items).toEqual([
+      {
+        id: older.dispute.id,
+        kind: 'no_show_dispute',
+        student: { id: asha.id, name: 'Asha Rao', email: 'asha@example.org' },
+        waitingSince: olderOpenedAt.toISOString(),
+        noShow: {
+          disputeId: older.dispute.id,
+          bookingId: older.booking.id,
+          resource: { id: older.resource.id, name: 'Study Room A' },
+          startTime: older.booking.startTime.toISOString(),
+          endTime: older.booking.endTime.toISOString(),
+          studentReason: words,
+        },
+      },
+      {
+        id: newer.dispute.id,
+        kind: 'no_show_dispute',
+        student: { id: ben.id, name: 'Ben Carter', email: 'ben@example.org' },
+        waitingSince: newerOpenedAt.toISOString(),
+        noShow: {
+          disputeId: newer.dispute.id,
+          bookingId: newer.booking.id,
+          resource: { id: newer.resource.id, name: 'Desk 12' },
+          startTime: newer.booking.startTime.toISOString(),
+          endTime: newer.booking.endTime.toISOString(),
+          studentReason: 'Wrong person',
+        },
+      },
+    ])
+  })
+
+  it('a no-show dispute on its own is counted and listed', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const { dispute } = await seedNoShowDispute(student.id)
+
+    const res = await queue(admin)
+
+    expect(res.body.counts).toEqual({ all: 1, overdue: 0, fine_dispute: 0, report: 0, no_show_dispute: 1 })
+    expect((res.body.items as Array<{ id: string }>).map((i) => i.id)).toEqual([dispute.id])
+  })
+
+  it('only open disputes are queued: an overturned or upheld one is not listed or counted', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const open = await seedNoShowDispute(student.id)
+    await seedNoShowDispute(student.id, { status: 'overturned' })
+    await seedNoShowDispute(student.id, { status: 'upheld' })
+
+    const res = await queue(admin, '?kind=no_show_dispute')
+
+    expect((res.body.items as Array<{ id: string }>).map((i) => i.id)).toEqual([open.dispute.id])
+    expect(res.body.counts).toEqual({ all: 1, overdue: 0, fine_dispute: 0, report: 0, no_show_dispute: 1 })
+  })
+
+  it('disputes opened at the same moment keep a stable order', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const at = new Date(Date.now() - HOUR_MS)
+    for (let i = 0; i < 4; i++) await seedNoShowDispute(student.id, { createdAt: at })
+
+    const first = (await queue(admin, '?kind=no_show_dispute')).body.items.map((i: { id: string }) => i.id)
+    const second = (await queue(admin, '?kind=no_show_dispute')).body.items.map((i: { id: string }) => i.id)
+
+    expect(first).toHaveLength(4)
+    expect(second).toEqual(first)
+    expect(first).toEqual([...first].sort((a, b) => a.localeCompare(b)))
+  })
+
+  it("reads a dispute's waiting time and the booking's slot as the instants they are when the database session is not on UTC", async () => {
+    const { user: student } = await seedUser()
+    const openedAt = new Date(Date.now() - 5 * HOUR_MS)
+    const { dispute, booking } = await seedNoShowDispute(student.id, { createdAt: openedAt })
+
+    // Every query the service makes runs inside a transaction whose session is on Kolkata time (+5:30): a date that
+    // leaned on the session zone would move by hours (the waiting time is a plain timestamp, the slot a timestamptz).
+    const realQueryRaw = prisma.$queryRaw
+    vi.spyOn(prisma, '$queryRaw').mockImplementation(((sql: Prisma.Sql) =>
+      prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe(`SET LOCAL TIME ZONE 'Asia/Kolkata'`)
+        return realQueryRaw.call(tx, sql)
+      })) as never)
+
+    const result = await listAttention({}, new Date())
+
+    const item = result.items.find((i) => i.kind === 'no_show_dispute')
+    expect(item?.id).toBe(dispute.id)
+    expect(item?.waitingSince.getTime()).toBe(openedAt.getTime())
+    expect(item?.kind === 'no_show_dispute' && [item.noShow.startTime.getTime(), item.noShow.endTime.getTime()]).toEqual([
+      booking.startTime.getTime(),
+      booking.endTime.getTime(),
+    ])
+    expect(result.counts.no_show_dispute).toBe(1)
+  })
+})
+
 describe('GET /admin/attention: problem reports', () => {
   it('the queue lists reports oldest first with the target, category and note, and the counts and filter', async () => {
     const { token: admin } = await seedUser('admin')
@@ -596,7 +771,7 @@ describe('GET /admin/attention: problem reports', () => {
     await seedCopyReport(ben.id, 'Confirmed Book', { status: 'confirmed', createdAt: new Date(t - 9 * DAY_MS) })
     await seedResourceReport(ben.id, 'Dismissed Desk', { status: 'dismissed', createdAt: new Date(t - 8 * DAY_MS) })
     const ids = (res: request.Response) => (res.body.items as Array<{ id: string }>).map((i) => i.id)
-    const counts = { all: 5, overdue: 1, fine_dispute: 1, report: 3 }
+    const counts = { all: 5, overdue: 1, fine_dispute: 1, report: 3, no_show_dispute: 0 }
 
     const all = await queue(admin)
     const reports = await queue(admin, '?kind=report')
@@ -693,13 +868,13 @@ describe('GET /admin/attention: problem reports', () => {
     const dismissed = await seedResourceReport(student.id, 'Desk 1')
     const open = await seedCopyReport(student.id, 'Emma')
 
-    expect((await queue(admin)).body.counts).toEqual({ all: 3, overdue: 0, fine_dispute: 0, report: 3 })
+    expect((await queue(admin)).body.counts).toEqual({ all: 3, overdue: 0, fine_dispute: 0, report: 3, no_show_dispute: 0 })
     expect((await request(app).post(`/admin/reports/${confirmed.report.id}/confirm`).set(auth(admin)).send({ outcome: 'maintenance' })).status).toBe(200)
-    expect((await queue(admin)).body.counts).toEqual({ all: 2, overdue: 0, fine_dispute: 0, report: 2 })
+    expect((await queue(admin)).body.counts).toEqual({ all: 2, overdue: 0, fine_dispute: 0, report: 2, no_show_dispute: 0 })
     expect((await request(app).post(`/admin/reports/${dismissed.report.id}/dismiss`).set(auth(admin))).status).toBe(200)
 
     const res = await queue(admin, '?kind=report')
-    expect(res.body.counts).toEqual({ all: 1, overdue: 0, fine_dispute: 0, report: 1 })
+    expect(res.body.counts).toEqual({ all: 1, overdue: 0, fine_dispute: 0, report: 1, no_show_dispute: 0 })
     expect((res.body.items as Array<{ id: string }>).map((i) => i.id)).toEqual([open.report.id])
   })
 

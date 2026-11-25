@@ -16,8 +16,9 @@ import { ConflictError, NotFoundError, ValidationError } from '../lib/httpError'
 import { escapeLike } from '../lib/like'
 import { prisma } from '../lib/prisma'
 import { graceEnd, HOLDING_STATUSES, isExclusionViolation } from './bookingService'
+import { sweepIfDue } from './noShowService'
 
-export type AdminBookingStatus = 'booked' | 'released' | 'checked_in' | 'completed' | 'cancelled'
+export type AdminBookingStatus = 'booked' | 'released' | 'no_show' | 'checked_in' | 'completed' | 'cancelled'
 
 export interface AdminBookingDto {
   id: string
@@ -66,9 +67,10 @@ interface BookingRow {
   resourceType: 'seat' | 'room'
 }
 
-// Raw requested, declined, expired and no_show rows are never listed: a request
-// is not a booking yet, and the other three are not something to manage.
-const LISTED_STATUSES = Prisma.sql`('booked', 'checked_in', 'released', 'completed', 'cancelled')`
+// Raw requested, declined and expired rows are never listed: a request is not a
+// booking yet, and the other two are request outcomes. A recorded no_show is
+// listed (and filterable), but like a released booking it is not something to manage.
+const LISTED_STATUSES = Prisma.sql`('booked', 'checked_in', 'released', 'no_show', 'completed', 'cancelled')`
 
 // A room request the student withdrew is stored as cancelled with decidedAt set
 // and decidedById null (see cancelBooking). It never became a booking, so it is
@@ -86,8 +88,8 @@ export const NOT_WITHDRAWN_REQUEST = Prisma.sql`NOT (b.status = 'cancelled' AND 
  * (bookingService.computeWindow): a booking is released once its grace period
  * has passed (strictly: at the very end of the grace period it is still
  * booked), and a checked-in one is completed once its end time is reached.
- * Requested, declined, expired and no_show pass through as stored. Also used by
- * adminStudentService for a student's booking history.
+ * A stored no_show passes through as no_show, and so do requested, declined and
+ * expired. Also used by adminStudentService for a student's booking history.
  */
 export function derivedStatusSql(now: Date): Prisma.Sql {
   return Prisma.sql`CASE
@@ -153,6 +155,9 @@ function toDto(row: BookingRow): AdminBookingDto {
 
 /** One page of bookings, newest start time first, with the total behind the filters. */
 export async function listBookings(q: AdminBookingListQuery, now = new Date()): Promise<AdminBookingList> {
+  // In the background and never awaited (see sweepIfDue). Deliberately takes no `now`: a
+  // caller's clock only decides how this page is drawn, never what gets penalized.
+  sweepIfDue()
   const from = filteredBookings(q, now)
   const offset = (q.page - 1) * q.pageSize
 
@@ -217,9 +222,10 @@ async function findBookingToManage(client: PrismaClient | Prisma.TransactionClie
  * Throws the specific refusal for a booking the librarian can no longer manage.
  * Manageable means raw status booked and not past its grace end: the list's
  * canManage. The refusals follow the same derived rules the list shows (a
- * checked-in booking is finished once its end time is reached). Declined,
- * expired and no_show rows, and a room request the student withdrew, are not
- * bookings the console lists, so they are not found.
+ * checked-in booking is finished once its end time is reached). A recorded
+ * no_show is refused like a released booking: it is listed, but over. Declined
+ * and expired rows, and a room request the student withdrew, are not bookings
+ * the console lists, so they are not found.
  */
 function refuseUnlessManageable(
   booking: Pick<BookingToManage, 'status' | 'startTime' | 'endTime' | 'gracePeriodMinutes' | 'cancelledById' | 'decidedAt' | 'decidedById'>,
@@ -238,6 +244,7 @@ function refuseUnlessManageable(
     case 'completed':
       throw new ConflictError('This booking has already finished.')
     case 'released':
+    case 'no_show':
       throw new ConflictError('This booking has already been released.')
     case 'requested':
       throw new ConflictError('This is a room request. Decide it on the Requests page.')

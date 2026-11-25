@@ -87,11 +87,25 @@ describe('generateHistory', () => {
     const { bookings, loans } = run()
     expect(bookings.length).toBeGreaterThanOrEqual(600)
     expect(bookings.length).toBeLessThanOrEqual(900)
-    const missed = bookings.filter((b) => b.status === 'booked').length / bookings.length
+    const missed = bookings.filter((b) => b.status === 'no_show').length / bookings.length
     expect(missed).toBeGreaterThan(0.1)
     expect(missed).toBeLessThan(0.3)
     expect(loans.length).toBeGreaterThanOrEqual(40)
     expect(loans.length).toBeLessThanOrEqual(60)
+  })
+
+  it('writes every unattended booking as a no_show (none stays booked), each with an id and one plausible predicted probability', () => {
+    const { bookings, noShows } = run()
+    // Every history booking is over, so its final state is checked in or missed, never 'booked'.
+    expect(new Set(bookings.map((b) => b.status as string))).toEqual(new Set(['checked_in', 'no_show']))
+    expect(bookings.map((b) => b.id)).toEqual(bookings.map((_, i) => `hist-booking-${i + 1}`))
+    const missed = bookings.filter((b) => b.status === 'no_show')
+    // One record per no-show, in booking order, and a probability a model could have given a missed booking.
+    expect(noShows.map((n) => n.bookingId)).toEqual(missed.map((b) => b.id))
+    for (const n of noShows) {
+      expect(n.predictedProbability).toBeGreaterThanOrEqual(0.25)
+      expect(n.predictedProbability).toBeLessThanOrEqual(0.75)
+    }
   })
 
   it('gives each loan a deterministic id, hist-loan-<n>', () => {

@@ -23,7 +23,8 @@ import {
 } from '../schemas/adminCatalogue'
 import { adjustFineSchema, adminFineParamsSchema, adminFinesQuerySchema, markFinePaidSchema } from '../schemas/adminFines'
 import { adminDisputeParamsSchema, upholdDisputeSchema } from '../schemas/disputes'
-import { adminRequestParamsSchema, declineRequestSchema } from '../schemas/adminRequests'
+import { adminNoShowDisputeParamsSchema, overturnNoShowSchema, upholdNoShowSchema } from '../schemas/noShowDisputes'
+import { adminRequestParamsSchema, adminRequestsQuerySchema, declineRequestSchema } from '../schemas/adminRequests'
 import {
   adminResourceParamsSchema,
   adminResourcesQuerySchema,
@@ -44,7 +45,7 @@ import { addCopies, createBook, listBooks, updateBook, type AdminBookListQuery }
 import { markCopyLost, markCopyMaintenance, restoreCopy } from '../services/adminCopyService'
 import { adjustFine, listFines, markFinePaid, type AdminFineListQuery } from '../services/adminFineService'
 import { getCirculation, getDemand, getOverdue, getUtilization } from '../services/adminMetricsService'
-import { approveRequest, declineRequest, listPendingRequests, type RequestKind } from '../services/adminRequestService'
+import { approveRequest, declineRequest, listPendingRequests, type RequestKind, type RequestOrder } from '../services/adminRequestService'
 import {
   bringOnline,
   createResource,
@@ -55,6 +56,7 @@ import {
 } from '../services/adminResourceService'
 import { adjustReliability, getStudent } from '../services/adminStudentService'
 import { upholdDispute } from '../services/disputeService'
+import { overturnNoShow, upholdNoShow } from '../services/noShowDisputeService'
 import { confirmReport, dismissReport, type CopyOutcome } from '../services/reportService'
 
 export const adminRouter = Router()
@@ -79,8 +81,9 @@ adminRouter.get('/admin/metrics/demand', async (req, res) => {
   res.json(await getDemand())
 })
 
-adminRouter.get('/admin/requests', async (req, res) => {
-  res.json(await listPendingRequests())
+adminRouter.get('/admin/requests', validate({ query: adminRequestsQuerySchema }), async (req, res) => {
+  const { order } = req.validatedQuery as { order: RequestOrder }
+  res.json(await listPendingRequests(new Date(), order))
 })
 
 adminRouter.post('/admin/requests/:kind/:id/approve', validate({ params: adminRequestParamsSchema }), async (req, res) => {
@@ -183,6 +186,27 @@ adminRouter.post(
   async (req, res) => {
     const { note } = req.body as { note?: string }
     res.json(await upholdDispute(req.params.id as string, req.user!.sub, note ? note : null))
+  },
+)
+
+// The librarian removes a no-show the student disputed: the booking goes back to released and the points the
+// no-show took are restored. The reason is required (it is the note the student reads).
+adminRouter.post(
+  '/admin/no-show-disputes/:id/overturn',
+  validate({ params: adminNoShowDisputeParamsSchema, body: overturnNoShowSchema }),
+  async (req, res) => {
+    const { reason } = req.body as { reason: string }
+    res.json(await overturnNoShow(req.params.id as string, req.user!.sub, reason))
+  },
+)
+
+// The librarian keeps the no-show: the dispute closes and the booking stays a no-show. A bare POST (no body) is no note.
+adminRouter.post(
+  '/admin/no-show-disputes/:id/uphold',
+  validate({ params: adminNoShowDisputeParamsSchema, body: upholdNoShowSchema }),
+  async (req, res) => {
+    const { note } = req.body as { note?: string }
+    res.json(await upholdNoShow(req.params.id as string, req.user!.sub, note ? note : null))
   },
 )
 

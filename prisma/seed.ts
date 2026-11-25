@@ -25,6 +25,10 @@ async function main() {
   )
   // eslint-disable-next-line no-console
   console.log(`Opened ${summary.disputes} fine disputes and ${summary.reports} problem reports for Needs attention.`)
+  // eslint-disable-next-line no-console
+  console.log(
+    `Recorded ${summary.noShows} past no-shows (one disputable by ${summary.demoEmail}) and opened ${summary.noShowDisputes} no-show disputes for Needs attention.`,
+  )
 }
 
 main()

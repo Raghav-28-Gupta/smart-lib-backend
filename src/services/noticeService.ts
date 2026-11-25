@@ -13,7 +13,8 @@ import type { EmailStatus, Notice, NoticeKind, Prisma } from '../generated/prism
 import { sendEmail } from '../lib/mailer'
 import { prisma } from '../lib/prisma'
 
-const DAY_MS = 24 * 60 * 60 * 1000
+const MINUTE_MS = 60 * 1000
+const DAY_MS = 24 * 60 * MINUTE_MS
 
 /** How many notices the student sees, newest first. */
 export const MY_NOTICES_LIMIT = 20
@@ -29,6 +30,9 @@ export interface NoticeInput {
   body: string
   loanId?: string
   fineId?: string
+  // The booking a no-show or reminder notice is about (kinds booking_reminder,
+  // no_show and no_show_outcome).
+  bookingId?: string
   createdById?: string
 }
 
@@ -45,8 +49,8 @@ export interface NoticeDto {
  * `skipped` (nothing attempted); deliverNotice records the real outcome.
  */
 export function createNotice(tx: Prisma.TransactionClient, input: NoticeInput): Promise<Notice> {
-  const { userId, kind, title, body, loanId, fineId, createdById } = input
-  return tx.notice.create({ data: { userId, kind, title, body, loanId, fineId, createdById } })
+  const { userId, kind, title, body, loanId, fineId, bookingId, createdById } = input
+  return tx.notice.create({ data: { userId, kind, title, body, loanId, fineId, bookingId, createdById } })
 }
 
 // The email's outcome and when it was attempted. A failed write is logged by
@@ -89,16 +93,55 @@ export async function deliverNotice(notice: Notice): Promise<EmailStatus> {
 }
 
 /**
+ * How many of the student's notices are read before the moot reminders are dropped
+ * and MY_NOTICES_LIMIT applied. A reminder is at most one per booking, so a student
+ * would need far more than this in a week for a hidden one to cost a visible notice.
+ */
+const MY_NOTICES_FETCH_CAP = 200
+
+interface BookingLink {
+  status: string
+  startTime: Date
+  gracePeriodMinutes: number
+}
+
+/**
+ * A "your booking starts soon" reminder is moot once the booking can no longer be
+ * checked into: it is not `booked` any more (checked in, cancelled, released, a
+ * no-show...), its grace period has ended (strictly before `now`, like the sweep and
+ * the check-in), or the booking is gone (the link is cleared when it is deleted).
+ * Read through Notice.bookingId, so it needs no column of its own.
+ */
+function isMootReminder(kind: NoticeKind, booking: BookingLink | null, now: Date): boolean {
+  if (kind !== 'booking_reminder') return false
+  if (!booking || booking.status !== 'booked') return true
+  return booking.startTime.getTime() + booking.gracePeriodMinutes * MINUTE_MS < now.getTime()
+}
+
+/**
  * The student's own notices from the last REQUEST_OUTCOME_VISIBLE_DAYS, newest
- * first, at most MY_NOTICES_LIMIT. Never the email outcome or who wrote it.
+ * first, at most MY_NOTICES_LIMIT, without the reminders that are now moot (they
+ * are dropped BEFORE the limit, so one never takes the place of a notice the student
+ * can see). Never the email outcome, who wrote it, or the booking it is about.
  */
 export async function listMyNotices(userId: string, now = new Date()): Promise<NoticeDto[]> {
   const since = new Date(now.getTime() - REQUEST_OUTCOME_VISIBLE_DAYS * DAY_MS)
-  return prisma.notice.findMany({
+  const rows = await prisma.notice.findMany({
     where: { userId, createdAt: { gte: since } },
     // Same tiebreak as the fines lists, so a refetch never shuffles equal dates.
     orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
-    take: MY_NOTICES_LIMIT,
-    select: { id: true, kind: true, title: true, body: true, createdAt: true },
+    take: MY_NOTICES_FETCH_CAP,
+    select: {
+      id: true,
+      kind: true,
+      title: true,
+      body: true,
+      createdAt: true,
+      booking: { select: { status: true, startTime: true, gracePeriodMinutes: true } },
+    },
   })
+  return rows
+    .filter((row) => !isMootReminder(row.kind, row.booking, now))
+    .slice(0, MY_NOTICES_LIMIT)
+    .map(({ id, kind, title, body, createdAt }) => ({ id, kind, title, body, createdAt }))
 }

@@ -1,0 +1,54 @@
+# Runs the no-show sweep: records the seat and room bookings nobody checked into
+# and sends the "your booking starts soon" reminders. It calls POST /internal/sweep
+# on the deployed backend (src/routes/internal.ts), which does the work and answers
+# the counts. The sweep is idempotent, so a retry or an overlapping run is harmless.
+#
+# THE OWNER'S STEP, once, in the repository's Settings -> Secrets and variables -> Actions:
+#   SWEEP_TOKEN  a long random string. Set the SAME value as the SWEEP_TOKEN environment
+#                variable on Render (the endpoint answers 404 until it is set there).
+#                Generate one with:
+#                  node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+#   SWEEP_URL    the full address: https://<the backend host>/internal/sweep
+# The secret values are never echoed: they reach the step only as environment variables
+# (never written into the script text), GitHub masks them in the log, and curl is run
+# silently apart from errors. A missing secret fails the step with a message naming it.
+#
+# The run FAILS (and GitHub emails the owner) when the endpoint answers anything but 2xx:
+# a wrong token, an unreachable server, or a sweep step that could not run (the backend
+# answers 500 with the counts and the failed step in the body, which --fail-with-body
+# prints). Zero counts with a green run mean there was nothing to do.
+#
+# Runs every 10 minutes, and on demand from the Actions tab (workflow_dispatch), which
+# is the way to try the two secrets. GitHub's schedule can lag by 10 to 15 minutes, and
+# GitHub DISABLES scheduled workflows in a repository with no activity for 60 days: a
+# commit, or re-enabling the workflow under the Actions tab, turns it back on. Without
+# this workflow the sweep still runs whenever the server is awake (every minute) and
+# whenever anyone opens My Bookings or the console's Bookings page.
+name: Sweep bookings
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+# The job needs no access to the repository or to GitHub's API.
+permissions: {}
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the sweep endpoint
+        # The secrets come in through env, not by interpolation into the script text: a value
+        # with a quote or a dollar sign cannot change what the shell runs.
+        env:
+          SWEEP_TOKEN: ${{ secrets.SWEEP_TOKEN }}
+          SWEEP_URL: ${{ secrets.SWEEP_URL }}
+        run: |
+          # An unset secret is an empty string here; fail loudly, naming it, rather than send a blank request.
+          : "${SWEEP_TOKEN:?SWEEP_TOKEN secret is not set}"
+          : "${SWEEP_URL:?SWEEP_URL secret is not set}"
+          # --max-time 120: a cold Render instance can take about a minute to wake.
+          # --retry 2 also retries a transient 5xx; harmless, the sweep is idempotent.
+          curl --fail-with-body --silent --show-error --max-time 120 --retry 2 --retry-delay 15 \
+            -X POST -H "x-sweep-token: ${SWEEP_TOKEN}" "${SWEEP_URL}"

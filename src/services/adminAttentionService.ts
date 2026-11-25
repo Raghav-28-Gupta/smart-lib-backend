@@ -1,8 +1,9 @@
 // The librarian's "Needs attention" queue. This file holds its overdue-loan
 // items and the two follow-ups a librarian can send on one: a reminder and a
 // formal (escalation) notice, its open fine disputes (resolved in
-// disputeService and adminFineService) and its open problem reports (confirmed
-// or dismissed in reportService).
+// disputeService and adminFineService), its open problem reports (confirmed
+// or dismissed in reportService) and its open no-show disputes (overturned or
+// upheld in noShowDisputeService).
 //
 // An overdue item is not stored. It is an active loan that is a whole day or
 // more past due, valued by fineRules.accruingAmountSql, the rule the Fines page
@@ -35,7 +36,7 @@ import { createNotice, deliverNotice } from './noticeService'
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
 
-export type AttentionKind = 'overdue' | 'fine_dispute' | 'report'
+export type AttentionKind = 'overdue' | 'fine_dispute' | 'report' | 'no_show_dispute'
 
 export interface AttentionStudent {
   id: string
@@ -112,13 +113,33 @@ export type ReportAttentionItem = {
   }
 }
 
-export type AttentionItemDto = OverdueAttentionItem | FineDisputeAttentionItem | ReportAttentionItem
+export type NoShowDisputeAttentionItem = {
+  /** The dispute's id (also `noShow.disputeId`): the console overturns and upholds with it. */
+  id: string
+  kind: 'no_show_dispute'
+  student: AttentionStudent
+  /** When the student opened the dispute. */
+  waitingSince: Date
+  noShow: {
+    disputeId: string
+    bookingId: string
+    resource: { id: string; name: string }
+    /** The booking's slot (instants: the console writes them in the library's time zone). */
+    startTime: Date
+    endTime: Date
+    /** The student's own words, at most 300 characters, exactly as written (plain text). */
+    studentReason: string
+  }
+}
+
+export type AttentionItemDto = OverdueAttentionItem | FineDisputeAttentionItem | ReportAttentionItem | NoShowDisputeAttentionItem
 
 export interface AttentionCounts {
   all: number
   overdue: number
   fine_dispute: number
   report: number
+  no_show_dispute: number
 }
 
 export interface AttentionQueue {
@@ -311,6 +332,59 @@ function toReportItem(row: ReportRow): ReportAttentionItem {
   }
 }
 
+interface NoShowDisputeRow {
+  disputeId: string
+  studentReason: string
+  waitingSince: Date
+  studentId: string
+  studentName: string
+  studentEmail: string
+  bookingId: string
+  resourceId: string
+  resourceName: string
+  startTime: Date
+  endTime: Date
+}
+
+/**
+ * Every open no-show dispute with its student, the booking's slot and its resource, as one row
+ * each. `d."createdAt"` is a plain `timestamp(3)` holding UTC, read back as it is (no date is bound,
+ * so there is no cast to get wrong). The booking's times are `timestamptz`, which the driver adapter
+ * reads back as the session's wall clock taken for UTC, so a session that is not on UTC would move
+ * them by its offset: they are selected `AT TIME ZONE 'UTC'` (a plain timestamp holding UTC, read
+ * as the instant it is whatever the session's zone). The booking is the dispute's own (a unique
+ * foreign key), so it adds no rows.
+ */
+async function noShowDisputeRows(): Promise<NoShowDisputeRow[]> {
+  return prisma.$queryRaw<NoShowDisputeRow[]>(Prisma.sql`
+    SELECT d.id AS "disputeId", d.reason AS "studentReason", d."createdAt" AS "waitingSince",
+           u.id AS "studentId", u.name AS "studentName", u.email AS "studentEmail",
+           b.id AS "bookingId", b."startTime" AT TIME ZONE 'UTC' AS "startTime", b."endTime" AT TIME ZONE 'UTC' AS "endTime",
+           rs.id AS "resourceId", rs.name AS "resourceName"
+    FROM "NoShowDispute" d
+    JOIN "User" u ON u.id = d."userId"
+    JOIN "ResourceBooking" b ON b.id = d."bookingId"
+    JOIN "Resource" rs ON rs.id = b."resourceId"
+    WHERE d.status = 'open'`)
+}
+
+function toNoShowDisputeItem(row: NoShowDisputeRow): NoShowDisputeAttentionItem {
+  return {
+    id: row.disputeId,
+    kind: 'no_show_dispute',
+    student: { id: row.studentId, name: row.studentName, email: row.studentEmail },
+    waitingSince: row.waitingSince,
+    noShow: {
+      disputeId: row.disputeId,
+      bookingId: row.bookingId,
+      resource: { id: row.resourceId, name: row.resourceName },
+      startTime: row.startTime,
+      endTime: row.endTime,
+      studentReason: row.studentReason,
+    },
+  }
+}
+
 function toItem(row: OverdueRow): OverdueAttentionItem {
   return {
     id: row.loanId,
@@ -342,17 +416,24 @@ function toItem(row: OverdueRow): OverdueAttentionItem {
  */
 export async function listAttention(q: { kind?: AttentionKind }, now = new Date()): Promise<AttentionQueue> {
   // One query per kind, however many items it holds: nothing is read per row.
-  const [overdueFound, disputesFound, reportsFound] = await Promise.all([overdueRows(now), disputeRows(), reportRows()])
+  const [overdueFound, disputesFound, reportsFound, noShowsFound] = await Promise.all([
+    overdueRows(now),
+    disputeRows(),
+    reportRows(),
+    noShowDisputeRows(),
+  ])
   const overdue = overdueFound.map(toItem)
   const fine_dispute = disputesFound.map(toDisputeItem)
   const report = reportsFound.map(toReportItem)
-  const byKind: Record<AttentionKind, AttentionItemDto[]> = { overdue, fine_dispute, report }
+  const no_show_dispute = noShowsFound.map(toNoShowDisputeItem)
+  const byKind: Record<AttentionKind, AttentionItemDto[]> = { overdue, fine_dispute, report, no_show_dispute }
 
   const counts: AttentionCounts = {
-    all: byKind.overdue.length + byKind.fine_dispute.length + byKind.report.length,
+    all: byKind.overdue.length + byKind.fine_dispute.length + byKind.report.length + byKind.no_show_dispute.length,
     overdue: byKind.overdue.length,
     fine_dispute: byKind.fine_dispute.length,
     report: byKind.report.length,
+    no_show_dispute: byKind.no_show_dispute.length,
   }
   const shown = q.kind ? byKind[q.kind] : Object.values(byKind).flat()
   // The id breaks a tie on equal dates, so a refetch never reorders.

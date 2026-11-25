@@ -1,9 +1,9 @@
 import { z } from 'zod'
 import { reportNoteSchema } from './reports'
 
-// What a queue item is about. The same three words name the console's chips and
+// What a queue item is about. The same four words name the console's chips and
 // `?kind=` on the list; an unknown word is a 400, never a silently empty list.
-export const attentionKinds = ['overdue', 'fine_dispute', 'report'] as const
+export const attentionKinds = ['overdue', 'fine_dispute', 'report', 'no_show_dispute'] as const
 
 export const adminAttentionQuerySchema = z.object({ kind: z.enum(attentionKinds).optional() })
 

@@ -7,6 +7,7 @@ import { booksRouter } from './routes/books'
 import { borrowRequestsRouter } from './routes/borrowRequests'
 import { finesRouter } from './routes/fines'
 import { healthRouter } from './routes/health'
+import { internalRouter } from './routes/internal'
 import { loansRouter } from './routes/loans'
 import { noticesRouter } from './routes/notices'
 import { reservationsRouter } from './routes/reservations'
@@ -43,6 +44,8 @@ app.use(recommendationsRouter)
 app.use(finesRouter)
 app.use(noticesRouter)
 app.use(reportsRouter)
+// Token header only (no login): outside the /admin guard and requireAuth, see routes/internal.ts.
+app.use(internalRouter)
 app.use(adminRouter)
 
 // More route modules land here as later tasks add them — each router

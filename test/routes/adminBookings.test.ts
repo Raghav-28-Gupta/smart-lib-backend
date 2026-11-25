@@ -132,7 +132,7 @@ describe('admin bookings list', () => {
     const { user: student } = await seedUser()
     const now = Date.now()
     const shown = await seedBooking(now, { userId: student.id, start: HOUR_MS, end: 2 * HOUR_MS })
-    for (const status of ['requested', 'declined', 'expired', 'no_show'] as const) {
+    for (const status of ['requested', 'declined', 'expired'] as const) {
       await seedBooking(now, { userId: student.id, start: 3 * HOUR_MS, end: 4 * HOUR_MS, status })
     }
 
@@ -140,6 +140,39 @@ describe('admin bookings list', () => {
 
     expect(ids(res)).toEqual([shown.id])
     expect(res.body.total).toBe(1)
+  })
+
+  it('the unfiltered list now includes no-show rows', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser('student', { name: 'Meera Nair', email: 'meera@test.com' })
+    const now = Date.now()
+    const room = await seedResource('Group Room 301', 'room')
+    const booked = await seedBooking(now, { userId: student.id, start: HOUR_MS, end: 2 * HOUR_MS })
+    const missedSeat = await seedBooking(now, { userId: student.id, start: -3 * HOUR_MS, end: -2 * HOUR_MS, status: 'no_show' })
+    const missedRoom = await seedBooking(now, { userId: student.id, resourceId: room.id, start: -6 * HOUR_MS, end: -5 * HOUR_MS, status: 'no_show' })
+    // Still left out: a request and the two request outcomes.
+    for (const status of ['requested', 'declined', 'expired'] as const) {
+      await seedBooking(now, { userId: student.id, start: 3 * HOUR_MS, end: 4 * HOUR_MS, status })
+    }
+
+    const res = await list(admin)
+
+    expect(res.status).toBe(200)
+    // Newest start first.
+    expect(ids(res)).toEqual([booked.id, missedSeat.id, missedRoom.id])
+    expect(res.body.total).toBe(3)
+    const byId = new Map((res.body.bookings as ListedBooking[]).map((b) => [b.id, b]))
+    expect(byId.get(missedSeat.id)).toMatchObject({
+      status: 'no_show',
+      resource: { type: 'seat' },
+      student: { id: student.id, name: 'Meera Nair', email: 'meera@test.com' },
+      cancelledBy: null,
+      cancelReason: null,
+      canManage: false,
+    })
+    expect(byId.get(missedRoom.id)).toMatchObject({ status: 'no_show', resource: { id: room.id, name: 'Group Room 301', type: 'room' }, canManage: false })
+    // The search reaches a no-show row like any other.
+    expect(ids(await list(admin, '?search=group%20room%20301'))).toEqual([missedRoom.id])
   })
 
   it('derives booked, released, checked_in and completed', async () => {
@@ -233,6 +266,8 @@ describe('admin bookings list', () => {
     const finished = await seedBooking(now, { userId: student.id, start: -3 * HOUR_MS, end: -2 * HOUR_MS, status: 'checked_in' })
     const completed = await seedBooking(now, { userId: student.id, start: -5 * HOUR_MS, end: -4 * HOUR_MS, status: 'completed' })
     const cancelled = await seedBooking(now, { userId: student.id, start: 4 * HOUR_MS, end: 5 * HOUR_MS, status: 'cancelled' })
+    // A recorded no-show sits in the list too, and no other filter picks it up.
+    const noShow = await seedBooking(now, { userId: student.id, start: -4 * HOUR_MS, end: -3 * HOUR_MS, status: 'no_show' })
 
     const byStatus = async (status: string) => {
       const res = await list(admin, `?status=${status}`)
@@ -245,8 +280,55 @@ describe('admin bookings list', () => {
     expect(await byStatus('checked_in')).toEqual({ ids: [checkedIn.id], total: 1 })
     expect(await byStatus('completed')).toEqual({ ids: [finished.id, completed.id].sort(), total: 2 })
     expect(await byStatus('cancelled')).toEqual({ ids: [cancelled.id], total: 1 })
-    expect((await list(admin, '?status=no_show')).status).toBe(400)
+    expect(await byStatus('no_show')).toEqual({ ids: [noShow.id], total: 1 })
     expect((await list(admin, '?status=requested')).status).toBe(400)
+  })
+
+  it('?status=no_show lists only no-show rows with canManage false', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const { user: other } = await seedUser()
+    const now = Date.now()
+    const room = await seedResource('Group Room 101', 'room')
+    // What it must not list: a booking past its grace period is "released" (derived), a stored release
+    // is the same, and the rest of the statuses.
+    await seedBooking(now, { userId: student.id, start: HOUR_MS, end: 2 * HOUR_MS })
+    await seedBooking(now, { userId: student.id, start: -20 * MINUTE_MS, end: 40 * MINUTE_MS })
+    await seedBooking(now, { userId: student.id, start: -3 * HOUR_MS, end: -2 * HOUR_MS, status: 'released' })
+    await seedBooking(now, { userId: student.id, start: -10 * MINUTE_MS, end: 50 * MINUTE_MS, status: 'checked_in' })
+    await seedBooking(now, { userId: student.id, start: -5 * HOUR_MS, end: -4 * HOUR_MS, status: 'completed' })
+    await seedBooking(now, { userId: student.id, start: 4 * HOUR_MS, end: 5 * HOUR_MS, status: 'cancelled' })
+    // What it lists: no-shows of both resource types and of two students.
+    const seat = await seedBooking(now, { userId: student.id, start: -8 * HOUR_MS, end: -7 * HOUR_MS, status: 'no_show' })
+    const roomMiss = await seedBooking(now, { userId: other.id, resourceId: room.id, start: -9 * HOUR_MS, end: -8 * HOUR_MS, status: 'no_show' })
+
+    const res = await list(admin, '?status=no_show')
+
+    expect(res.status).toBe(200)
+    expect(ids(res)).toEqual([seat.id, roomMiss.id])
+    expect(res.body.total).toBe(2)
+    for (const row of res.body.bookings as ListedBooking[]) {
+      expect(row.status).toBe('no_show')
+      expect(row.canManage).toBe(false)
+    }
+    // Combined with the search, and paged like any filter.
+    expect(ids(await list(admin, `?status=no_show&search=${encodeURIComponent('Group Room')}`))).toEqual([roomMiss.id])
+    const second = await list(admin, '?status=no_show&pageSize=1&page=2')
+    expect(ids(second)).toEqual([roomMiss.id])
+    expect(second.body.total).toBe(2)
+  })
+
+  it('an unknown status is still 400', async () => {
+    const { token: admin } = await seedUser('admin')
+
+    // The request outcomes are not bookings and no_show-like words are not statuses: only the six are filters.
+    for (const status of ['requested', 'declined', 'expired', 'noshow', 'no-show', 'No_Show', 'unknown', '']) {
+      const res = await list(admin, `?status=${status}`)
+      expect(res.status, status).toBe(400)
+    }
+    for (const status of ['booked', 'released', 'checked_in', 'completed', 'cancelled', 'no_show']) {
+      expect((await list(admin, `?status=${status}`)).status, status).toBe(200)
+    }
   })
 
   it('search matches student, email and resource names, ignoring case', async () => {
@@ -430,11 +512,13 @@ describe('admin bookings list', () => {
     await seedBooking(now, { userId: student.id, start: -5 * HOUR_MS, end: -4 * HOUR_MS, status: 'completed' })
     await seedBooking(now, { userId: student.id, start: 4 * HOUR_MS, end: 5 * HOUR_MS, status: 'cancelled' })
     await seedBooking(now, { userId: student.id, start: -8 * HOUR_MS, end: -7 * HOUR_MS, status: 'released' })
+    await seedBooking(now, { userId: student.id, start: -9 * HOUR_MS, end: -8 * HOUR_MS, status: 'no_show' })
 
     const res = await list(admin)
 
     const rows = res.body.bookings as ListedBooking[]
-    expect(rows).toHaveLength(8)
+    expect(rows).toHaveLength(9)
+    expect(new Set(rows.map((r) => r.status))).toEqual(new Set(['booked', 'released', 'checked_in', 'completed', 'cancelled', 'no_show']))
     for (const row of rows) expect(row.canManage).toBe(row.status === 'booked')
     expect(rows.filter((r) => r.canManage)).toHaveLength(2)
   })
@@ -650,16 +734,58 @@ describe('admin booking cancel', () => {
     expect((await storedBooking(pendingRequest.id)).status).toBe('requested')
   })
 
-  it('declined, expired and no_show rows are not found, as the list never shows them', async () => {
+  it('declined and expired rows are not found, as the list never shows them', async () => {
     const { token: admin } = await seedUser('admin')
     const { user: student } = await seedUser()
     const now = Date.now()
 
-    for (const status of ['declined', 'expired', 'no_show'] as const) {
+    for (const status of ['declined', 'expired'] as const) {
       const booking = await seedBooking(now, { userId: student.id, start: HOUR_MS, end: 2 * HOUR_MS, status })
       expect((await cancel(admin, booking.id)).status).toBe(404)
       expect((await reassignOptions(admin, booking.id)).status).toBe(404)
     }
+  })
+
+  // A no-show is listed now, so it is no longer "not found": it gets the refusal a released booking
+  // gets, from cancel, from reassign and from the reassign options alike (they share one check).
+  it('cancel and reassign of a no-show are 409', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const now = Date.now()
+    const target = await seedResource('Target desk')
+    const noShow = await seedBooking(now, { userId: student.id, start: -3 * HOUR_MS, end: -2 * HOUR_MS, status: 'no_show' })
+    // One whose times are still ahead, so nothing but its stored status can be what refuses it.
+    const recent = await seedBooking(now, { userId: student.id, start: HOUR_MS, end: 2 * HOUR_MS, status: 'no_show' })
+    recorder = recordEvents()
+
+    for (const { id } of [noShow, recent]) {
+      for (const res of [await cancel(admin, id, { reason: 'Closed' }), await reassign(admin, id, target.id), await reassignOptions(admin, id)]) {
+        expect(res.status).toBe(409)
+        expect(res.body.error).toBe('This booking has already been released.')
+      }
+      expect(await storedBooking(id)).toMatchObject({ status: 'no_show', cancelledById: null, cancelledAt: null, cancelReason: null, movedFromName: null, movedAt: null })
+    }
+    // A refusal changes nothing and publishes nothing; the service says the same when called directly.
+    expect(recorder.events).toEqual([])
+    await expect(cancelBookingAsLibrary(noShow.id, 'a-librarian', null)).rejects.toMatchObject({
+      status: 409,
+      message: 'This booking has already been released.',
+    })
+    expect(await prisma.noShowEvent.count()).toBe(0)
+    expect(await prisma.reliabilityScoreLog.count({ where: { userId: student.id } })).toBe(0)
+  })
+
+  it('reassign and its options refuse a stored release too, with the same message', async () => {
+    const { token: admin } = await seedUser('admin')
+    const { user: student } = await seedUser()
+    const target = await seedResource('Target desk')
+    const stored = await seedBooking(Date.now(), { userId: student.id, start: -3 * HOUR_MS, end: -2 * HOUR_MS, status: 'released' })
+
+    for (const res of [await reassign(admin, stored.id, target.id), await reassignOptions(admin, stored.id)]) {
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe('This booking has already been released.')
+    }
+    expect(await storedBooking(stored.id)).toMatchObject({ status: 'released', movedAt: null })
   })
 
   it('a booking can still be cancelled exactly at the end of its grace period, but not one millisecond later', async () => {

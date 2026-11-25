@@ -4,6 +4,7 @@
 // 'requested'.
 import { publish } from '../lib/events'
 import { prisma } from '../lib/prisma'
+import { logSweepFailure, logSweepResult, sweepUnlessRunning } from './noShowService'
 import { onBookReturned } from './reservationService'
 
 /**
@@ -67,6 +68,32 @@ export async function expireStaleRequests(now = new Date()): Promise<number> {
 }
 
 export const SWEEP_INTERVAL_MS = 60_000
+
+/**
+ * What the 60-second timer runs (src/index.ts passes it to startExpirySweep): the expiry
+ * sweep above and the no-show sweep, at the same time. Neither waits for the other or loses
+ * its work to the other's failure, and each failure is logged by its own message. Never
+ * rejects, so startExpirySweep's own catch is not the only thing standing between a failing
+ * sweep and a crashed server.
+ *
+ * The two touch different rows (requests that are still `requested` or `pending`, and
+ * bookings that are `booked`), and the booking sweep is safe to run at the same instant
+ * as itself (the route), so they need no ordering. Don't lengthen SWEEP_INTERVAL_MS: a
+ * reminder has a 30-minute window and a no-show is about a minute behind only while this
+ * beat runs.
+ *
+ * The booking sweep goes through the in-process guard it shares with `sweepIfDue`
+ * (`sweepUnlessRunning`): when a sweep started by either is still running (a slow
+ * database), this beat skips the booking sweep, logs nothing for the skip (except one error
+ * line, once, when that sweep is over 10 minutes old: it is hung), and still runs the expiry
+ * sweep.
+ */
+export async function runScheduledSweeps(): Promise<void> {
+  const [expiry, bookings] = await Promise.allSettled([expireStaleRequests(), sweepUnlessRunning()])
+  if (expiry.status === 'rejected') console.error('Expiry sweep failed:', expiry.reason)
+  if (bookings.status === 'rejected') logSweepFailure(bookings.reason)
+  else if (bookings.value) logSweepResult(bookings.value) // null: a sweep was already running, nothing to say
+}
 
 /**
  * Runs `sweep` now and then every SWEEP_INTERVAL_MS until the returned

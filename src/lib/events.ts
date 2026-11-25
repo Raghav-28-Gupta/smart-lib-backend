@@ -11,6 +11,7 @@ export type LiveEventType =
   | 'request.decided'
   | 'request.expired'
   | 'request.cancelled'
+  | 'request.scored'
   | 'activity'
   | 'booking.changed'
   | 'resource.changed'

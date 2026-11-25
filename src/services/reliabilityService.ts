@@ -30,6 +30,15 @@ export function tierFor(score: number): string {
 // What adminStudentService.adjustReliability prefixes a librarian's reason with.
 const LIBRARY_ADJUSTMENT_PREFIX = 'Library adjustment: '
 
+// What the no-show sweep (noShowService) writes in front of the resource's name. The sweep logs its
+// row even when the student was already at 0 and nothing could be taken (a delta of 0, the audit
+// trail), so the history counts a row that starts with this as a miss whatever its delta. The
+// restore an overturn writes says "No-show overturned: <resource>", which does not start with it
+// (the colon comes right after "No-show"), so a restore stays an ok row.
+export const NO_SHOW_REASON_PREFIX = 'No-show: '
+
+const isMiss = (log: { delta: number; reason: string }) => log.delta < 0 || log.reason.startsWith(NO_SHOW_REASON_PREFIX)
+
 // `latestIsMiss` is whether the newest log entry overall is that miss, so a later
 // check-in or positive adjustment stops the note repeating it.
 function buildNote(score: number, mostRecentMiss: { reason: string } | undefined, latestIsMiss: boolean): string {
@@ -54,19 +63,20 @@ export async function getReliability(userId: string): Promise<ReliabilityDto> {
     orderBy: { computedAt: 'desc' },
     take: HISTORY_LIMIT,
   })
-  const mostRecentMiss = logs.find((l) => l.delta < 0)
+  const mostRecentMiss = logs.find(isMiss)
 
   return {
     score: user.reliabilityScore,
     tier: tierFor(user.reliabilityScore),
     ringFraction: Math.max(0, Math.min(1, user.reliabilityScore / 100)),
     note: buildNote(user.reliabilityScore, mostRecentMiss, mostRecentMiss !== undefined && mostRecentMiss === logs[0]),
-    history: [...logs].reverse().map((l) => (l.delta < 0 ? 'miss' : 'ok')),
+    history: [...logs].reverse().map((l) => (isMiss(l) ? 'miss' : 'ok')),
   }
 }
 
 // Shared by every flow that changes a score (an on-time booking check-in, a
-// librarian's manual adjustment): clamps to [0, 100] and records the log entry
+// librarian's manual adjustment, the no-show sweep's penalty and a dispute
+// overturn's give-back): clamps to [0, 100] and records the log entry
 // that getReliability's history/note read back, with the librarian's id for a
 // manual one. Takes a transaction client so the update lands atomically with
 // whatever triggered it, and locks the student's row FIRST: the score is read

@@ -3,7 +3,7 @@ import { app } from './app'
 import { timeZoneWarning } from './config/timezone'
 import { closeAllLiveStreams } from './lib/liveStream'
 import { prisma } from './lib/prisma'
-import { startExpirySweep } from './services/requestHolds'
+import { runScheduledSweeps, startExpirySweep } from './services/requestHolds'
 
 const tzWarning = timeZoneWarning(process.env)
 if (tzWarning) console.warn(tzWarning)
@@ -11,9 +11,9 @@ if (tzWarning) console.warn(tzWarning)
 const PORT = process.env.PORT ?? 3000
 const server = app.listen(PORT, () => console.log(`Node backend running on port ${PORT}`))
 
-// Lapses stale requests now (a sleeping Render instance can wake with some
-// overdue) and then every minute.
-const stopExpirySweep = startExpirySweep()
+// Lapses stale requests and records missed bookings now (a sleeping Render
+// instance can wake with some overdue) and then every minute.
+const stopExpirySweep = startExpirySweep(runScheduledSweeps)
 
 // Render (like Docker) stops the old instance with SIGTERM on every deploy.
 // Finish in-flight requests and release the database connections, rather

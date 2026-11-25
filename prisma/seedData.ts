@@ -19,10 +19,21 @@
 // students (prisma/history.ts), ending yesterday, so the admin Dashboard has
 // history to show, and an overdue fine for each late return, some paid, some
 // adjusted or waived (naming no librarian), so the Fines page has every state
-// to show. The demo student's account gets none of it.
+// to show. The demo student's account gets none of it, apart from the one missed
+// booking below.
+//
+// Every booking whose grace period has already ended at seed time is written in its
+// final state, so the first sweep after a seed finds nothing old to record: the
+// history's unattended bookings and today's "taken" slots that are over are `no_show`
+// with their NoShowEvent (backstory, not events: no reliability log, notice or email,
+// and nobody's score moves); a "taken" slot that has started but is inside its grace
+// period is `checked_in`; one still to come stays `booked`. The demo student has one
+// recent no-show (grace ended within the last 6 days, no dispute yet) so she can try
+// disputing it in the app.
 //
 // So that Needs attention has data on a fresh seed it opens two fine disputes (on
-// the two newest fines, which the history always leaves outstanding), one problem
+// the two newest fines, which the history always leaves outstanding), two no-show
+// disputes (on the newest no-shows of two different seed students), one problem
 // report on a copy of a demo book and one on a seed resource, all by seed students
 // and naming no librarian. They are written directly, so the booking and time-window
 // rules of POST /reports do not apply to them. The seed creates no notices and sends
@@ -30,13 +41,14 @@
 //
 // Deliberately NOT reproduced: the booking mock's own pre-seeded bookings for
 // its demo user reference a resource ("Desk 4") that doesn't exist among the
-// seeded seats, and any personal bookings for Aditi would risk colliding with
-// the "taken slots today" bookings seeded below for the same resources.
+// seeded seats, and any other personal bookings for Aditi would risk colliding
+// with the "taken slots today" bookings seeded below for the same resources
+// (her one missed booking is in the past, in a slot the history left free).
 // Booking a resource is easy enough to demo live instead.
 import bcrypt from 'bcrypt'
-import { TIME_SLOTS } from '../src/config/constants'
+import { GRACE_PERIOD_MINUTES, TIME_SLOTS } from '../src/config/constants'
 import type { Prisma, PrismaClient } from '../src/generated/prisma/client'
-import { generateHistory, HISTORY_SEED, mulberry32, OUTSTANDING_NEWEST } from './history'
+import { generateHistory, HISTORY_SEED, mulberry32, OUTSTANDING_NEWEST, type HistoryBooking } from './history'
 
 export const DEMO_PASSWORD = 'password123'
 
@@ -100,6 +112,46 @@ if (SEED_DISPUTES.length > OUTSTANDING_NEWEST) {
 }
 // The copy reported is one on the shelf, so a librarian can send it to maintenance at once;
 // the resource is reported by a different student.
+// The no-show disputes go on the newest recent no-shows of two different seed students, newest first
+// (so they are inside the 7-day window), and are dated hours before the seed's clock. The history ends
+// at midnight and its last grace period ends at 19:15 the day before, so a dispute three hours old is
+// always newer than the booking it disputes; a later change to the slots or ages has to keep that
+// (the seed test checks it).
+const SEED_NO_SHOW_DISPUTES = [
+  { hoursAgo: 1, reason: 'I was at the desk the whole hour. The check-in button would not load on my phone, so it never registered. Please check the desk log for that slot.' },
+  { hoursAgo: 3, reason: 'My earlier class ran over and I reached the library a few minutes after the grace period ended, but I did sit at the desk and study for the rest of the hour.' },
+] as const
+// The demo student's one missed booking: Group Room 201, the room her reliability backstory below names.
+// It is the first slot two to five days back that the history left free on that room, so its grace period
+// ended within the last 6 days and the 7-day dispute window is still open.
+const DEMO_NO_SHOW = { resourceId: 'r1', firstDaysBack: 2, lastDaysBack: 5, predictedProbability: 0.62 }
+// What the model could have said before a "taken" slot that was then missed.
+const TAKEN_NO_SHOW_PROBABILITY = 0.42
+const GRACE_MS = GRACE_PERIOD_MINUTES * 60_000
+const graceEnd = (startTime: Date) => new Date(startTime.getTime() + GRACE_MS)
+
+/** The NoShowEvent of a seeded no-show: backstory, so recorded when its grace period ended and with no points taken. */
+const noShowRecord = (booking: { id: string; userId: string; startTime: Date }, predictedProbability: number) => ({
+  resourceBookingId: booking.id,
+  userId: booking.userId,
+  predictedProbability,
+  actualNoShow: true,
+  reliabilityDelta: null,
+  recordedAt: graceEnd(booking.startTime),
+})
+
+/** The first slot (days back from `today`, then by hour) on `resourceId` that no history booking uses. */
+function freeHistorySlot(today: Date, resourceId: string, history: HistoryBooking[]): { startTime: Date; endTime: Date } {
+  const used = new Set(history.filter((b) => b.resourceId === resourceId).map((b) => b.startTime.getTime()))
+  for (let back = DEMO_NO_SHOW.firstDaysBack; back <= DEMO_NO_SHOW.lastDaysBack; back++) {
+    for (const slot of TIME_SLOTS) {
+      const startTime = new Date(today.getFullYear(), today.getMonth(), today.getDate() - back, slot.hour)
+      if (!used.has(startTime.getTime())) return { startTime, endTime: new Date(startTime.getTime() + HOUR_MS) }
+    }
+  }
+  throw new Error(`no free slot on ${resourceId} between ${DEMO_NO_SHOW.firstDaysBack} and ${DEMO_NO_SHOW.lastDaysBack} days back for the demo student's no-show`)
+}
+
 const SEED_COPY_REPORT = { bookId: 'b3', studentIndex: 0, hoursAgo: 4, category: 'damaged' as const, note: 'The back cover is torn and a few pages near the end are coming loose.' }
 const SEED_RESOURCE_REPORT = { resourceId: 's2', studentIndex: 1, hoursAgo: 1, category: 'not_working' as const, note: 'The desk lamp does not switch on.' }
 
@@ -114,6 +166,10 @@ export interface SeedSummary {
   finesByStatus: { pending: number; paid: number; adjusted: number; waived: number }
   /** Open fine disputes the seed opened. */
   disputes: number
+  /** Past bookings written as recorded no-shows (the history's, today's slots that are over, and the demo student's). */
+  noShows: number
+  /** Open no-show disputes the seed opened. */
+  noShowDisputes: number
   /** Open problem reports the seed opened (a copy and a resource). */
   reports: number
   demoEmail: string
@@ -131,6 +187,7 @@ export interface SeedSummary {
  * request, fine, waitlist entry, booking, recommendation and no-show record
  * that belongs to a seed account or sits on a demo book or resource, other
  * students' included, every fine dispute on a fine that goes (or by a seed
+ * account), every no-show dispute on a booking that goes (or by a seed
  * account), every notice left for a seed account, and every problem report by a
  * seed account or on a demo book's copy or a demo resource.
  *
@@ -140,9 +197,10 @@ export interface SeedSummary {
  * back to 'available' before the request or loan is deleted, so the book does
  * not keep a copy marked held or on loan with nobody behind it. A copy that is
  * lost or in maintenance stays as the librarian left it. Another student's
- * notice also stays; one about a demo loan or fine only loses that link. A
- * dispute on a fine that stays (a librarian's book) stays with it, and so does
- * another student's report on a librarian's copy or resource.
+ * notice also stays; one about a demo loan, fine or booking only loses that
+ * link. A dispute on a fine that stays (a librarian's book) stays with it, so
+ * does another student's no-show dispute on a booking of a librarian's resource,
+ * and so does another student's report on a librarian's copy or resource.
  */
 async function resetSeedData(db: Prisma.TransactionClient) {
   const seedUsers = await db.user.findMany({ where: { email: { in: SEED_USER_EMAILS } }, select: { id: true } })
@@ -181,6 +239,19 @@ async function resetSeedData(db: Prisma.TransactionClient) {
     },
   })
 
+  // 3b. A no-show dispute restricts the delete of its booking and of its student, so the
+  // disputes of exactly the bookings about to go (step 5's: on a demo resource, or a seed
+  // account's own) and those of seed accounts are deleted first. Another student's dispute
+  // on a booking that stays (a librarian's resource) stays with it, answered or not.
+  await db.noShowDispute.deleteMany({
+    where: {
+      OR: [
+        { userId: ownedBySeed },
+        { booking: { OR: [{ resourceId: { in: SEED_RESOURCE_IDS } }, { userId: ownedBySeed }] } },
+      ],
+    },
+  })
+
   // 4. Fines point at loans and bookings: every fine on a loan or booking about to
   // go is deleted first, so none is left without its item. A dispute restricts the
   // delete of its fine (and of its student), so the disputes of exactly the fines
@@ -208,8 +279,8 @@ async function resetSeedData(db: Prisma.TransactionClient) {
   await db.loan.deleteMany({ where: { OR: [{ bookCopy: { bookId: onDemoBook } }, { userId: ownedBySeed }] } })
 
   // 7. Notices point at users (Notice.userId restricts the user delete), and at
-  // loans and fines. The seed accounts' own go; another student's stays, and a link
-  // from it to a loan or fine that has just gone is cleared by the foreign key.
+  // loans, fines and bookings. The seed accounts' own go; another student's stays, and a
+  // link from it to a loan, fine or booking that has just gone is cleared by the foreign key.
   await db.notice.deleteMany({ where: { userId: ownedBySeed } })
 
   // 8. Problem reports restrict the delete of their student, their copy and their
@@ -291,6 +362,7 @@ export async function runSeed(prisma: PrismaClient, today: Date = new Date()): P
     data: { userId: demoUser.id, score: 50, delta: -50, reason: 'Missed check-in window for a Group Room 201 booking' },
   })
 
+  let noShows = 0
   for (const r of RESOURCES) {
     await prisma.resource.create({ data: { id: r.id, type: r.type, name: r.name, location: r.location, capacity: r.capacity } })
     for (const label of r.taken) {
@@ -298,7 +370,24 @@ export async function runSeed(prisma: PrismaClient, today: Date = new Date()): P
       if (!slot) continue
       const startTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), slot.hour, 0, 0)
       const endTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), slot.hour + 1, 0, 0)
-      await prisma.resourceBooking.create({ data: { userId: nextStudent().id, resourceId: r.id, startTime, endTime } })
+      // The slot's final state by the seed's clock: over (the sweep's own test: grace ended strictly
+      // before now) is a recorded no-show, started but inside its grace period is checked in, and one
+      // still to come stays booked.
+      const status = graceEnd(startTime) < today ? 'no_show' : startTime <= today ? 'checked_in' : 'booked'
+      const booking = await prisma.resourceBooking.create({
+        data: {
+          userId: nextStudent().id,
+          resourceId: r.id,
+          startTime,
+          endTime,
+          status,
+          checkedInAt: status === 'checked_in' ? new Date(Math.min(startTime.getTime() + 2 * 60_000, today.getTime())) : null,
+        },
+      })
+      if (status === 'no_show') {
+        await prisma.noShowEvent.create({ data: noShowRecord(booking, TAKEN_NO_SHOW_PROBABILITY) })
+        noShows++
+      }
     }
   }
 
@@ -309,6 +398,12 @@ export async function runSeed(prisma: PrismaClient, today: Date = new Date()): P
     popularity: BOOK_POPULARITY,
   })
   await prisma.resourceBooking.createMany({ data: history.bookings })
+  // After the bookings: every no-show record points at one. Backstory, so no log, notice or email.
+  const historyBookings = new Map(history.bookings.map((b) => [b.id, b]))
+  await prisma.noShowEvent.createMany({
+    data: history.noShows.map((n) => noShowRecord(historyBookings.get(n.bookingId)!, n.predictedProbability)),
+  })
+  noShows += history.noShows.length
   await prisma.loan.createMany({ data: history.loans })
   // After the loans: every fine points at one of them.
   await prisma.fine.createMany({ data: history.fines })
@@ -343,6 +438,30 @@ export async function runSeed(prisma: PrismaClient, today: Date = new Date()): P
       },
     })
     disputes++
+  }
+
+  // The demo student's one recent no-show, with no dispute: she can still dispute it in the app.
+  const demoSlot = freeHistorySlot(today, DEMO_NO_SHOW.resourceId, history.bookings)
+  const demoMissed = await prisma.resourceBooking.create({
+    data: { userId: demoUser.id, resourceId: DEMO_NO_SHOW.resourceId, ...demoSlot, status: 'no_show' },
+  })
+  await prisma.noShowEvent.create({ data: noShowRecord(demoMissed, DEMO_NO_SHOW.predictedProbability) })
+  noShows++
+
+  // An open dispute on each of the newest history no-shows of two different seed students.
+  const newestMissed = history.bookings.filter((b) => b.status === 'no_show').sort((a, b) => b.startTime.getTime() - a.startTime.getTime())
+  const toDisputeNoShow: HistoryBooking[] = []
+  for (const missed of newestMissed) {
+    if (toDisputeNoShow.length === SEED_NO_SHOW_DISPUTES.length) break
+    if (!toDisputeNoShow.some((d) => d.userId === missed.userId)) toDisputeNoShow.push(missed)
+  }
+  if (toDisputeNoShow.length < SEED_NO_SHOW_DISPUTES.length) {
+    throw new Error(`the history has no-shows by only ${toDisputeNoShow.length} seed students, for ${SEED_NO_SHOW_DISPUTES.length} no-show disputes`)
+  }
+  for (const [i, booking] of toDisputeNoShow.entries()) {
+    await prisma.noShowDispute.create({
+      data: { bookingId: booking.id, userId: booking.userId, reason: SEED_NO_SHOW_DISPUTES[i].reason, createdAt: hoursBefore(SEED_NO_SHOW_DISPUTES[i].hoursAgo) },
+    })
   }
 
   const reportedCopy = await prisma.bookCopy.findFirstOrThrow({
@@ -380,6 +499,8 @@ export async function runSeed(prisma: PrismaClient, today: Date = new Date()): P
     fines: history.fines.length,
     finesByStatus,
     disputes,
+    noShows,
+    noShowDisputes: toDisputeNoShow.length,
     reports,
     demoEmail: DEMO_EMAIL,
     demoPassword: DEMO_PASSWORD,

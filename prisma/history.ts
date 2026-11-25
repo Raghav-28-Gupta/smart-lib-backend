@@ -8,6 +8,11 @@
 // Each late return also gets its overdue fine, so the admin Fines page has
 // every state to show. Seeded fines name no librarian: nobody recorded the
 // payments or made the adjustments.
+//
+// Every booking here is over and its grace period with it, so each is in its
+// final state: checked in, or a recorded no-show (status 'no_show', with the
+// NoShowEvent in `noShows`). The seed writes them as backstory: no reliability
+// log, notice or email, so the first sweep after a seed finds nothing to record.
 import { LOAN_PERIOD_DAYS, TIME_SLOTS } from '../src/config/constants'
 import { overdueFineAmount } from '../src/services/fineRules'
 
@@ -25,12 +30,21 @@ export interface HistoryInputs {
 }
 
 export interface HistoryBooking {
+  /** `hist-booking-<n>`, so the no-show records can point at it (like `hist-loan-<n>` for the fines). */
+  id: string
   userId: string
   resourceId: string
   startTime: Date
   endTime: Date
-  status: 'booked' | 'checked_in'
+  status: 'checked_in' | 'no_show'
   checkedInAt: Date | null
+}
+
+/** The record the sweep would have left for a history no-show. The student is the booking's. */
+export interface HistoryNoShow {
+  bookingId: string
+  /** What the model could plausibly have said before a booking that was then missed. */
+  predictedProbability: number
 }
 
 export interface HistoryLoan {
@@ -98,7 +112,7 @@ export function generateHistory(
   today: Date,
   random: () => number,
   inputs: HistoryInputs,
-): { bookings: HistoryBooking[]; loans: HistoryLoan[]; fines: HistoryFine[] } {
+): { bookings: HistoryBooking[]; noShows: HistoryNoShow[]; loans: HistoryLoan[]; fines: HistoryFine[] } {
   const midnight = new Date(today.getFullYear(), today.getMonth(), today.getDate())
   const pick = <T,>(items: T[]): T => items[Math.floor(random() * items.length)]
 
@@ -157,11 +171,12 @@ export function generateHistory(
         const endTime = new Date(day.getFullYear(), day.getMonth(), day.getDate(), slot.hour + 1)
         const checkedIn = random() < CHECK_IN_RATE
         bookings.push({
+          id: `hist-booking-${bookings.length + 1}`,
           userId,
           resourceId: resource.id,
           startTime,
           endTime,
-          status: checkedIn ? 'checked_in' : 'booked',
+          status: checkedIn ? 'checked_in' : 'no_show',
           checkedInAt: checkedIn ? new Date(startTime.getTime() + Math.floor(random() * 11) * 60_000) : null,
         })
       }
@@ -170,7 +185,19 @@ export function generateHistory(
     const borrows = weekend ? (random() < 0.4 ? 1 : 0) : 2 + Math.floor(random() * 2)
     for (let i = 0; i < borrows; i++) loans.push(makeLoan(day, `hist-loan-${loans.length + 1}`))
   }
-  return { bookings, loans, fines: generateFines(loans, midnight, random) }
+  const fines = generateFines(loans, midnight, random)
+  // Drawn last, from the end of the same random stream, so they never move the rows generated before them.
+  return { bookings, noShows: generateNoShows(bookings, random), loans, fines }
+}
+
+/**
+ * One record per no-show, in booking order. The probability is what a model could plausibly have
+ * said before a booking that was then missed: above the base rate, never near certainty.
+ */
+export function generateNoShows(bookings: HistoryBooking[], random: () => number): HistoryNoShow[] {
+  return bookings
+    .filter((b) => b.status === 'no_show')
+    .map((b) => ({ bookingId: b.id, predictedProbability: Math.round((0.25 + random() * 0.5) * 100) / 100 }))
 }
 
 /**

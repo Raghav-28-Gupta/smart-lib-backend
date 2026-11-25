@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { app } from '../../src/app'
 import { JWT_SECRET, RELIABILITY_ONTIME_BOOKING_BONUS } from '../../src/config/constants'
 import { prisma } from '../../src/lib/prisma'
+import { sweepBookings } from '../../src/services/noShowService'
+import { NO_SHOW_REASON_PREFIX } from '../../src/services/reliabilityService'
 import { resetDb } from '../helpers/db'
 
 async function seedUser(reliabilityScore = 100) {
@@ -203,5 +205,67 @@ describe('reliability adjustment on booking check-in', () => {
 
     const updated = await prisma.user.findUniqueOrThrow({ where: { id: user.id } })
     expect(updated.reliabilityScore).toBe(100)
+  })
+})
+
+describe('a recorded no-show in the reliability history', { timeout: 60_000 }, () => {
+  beforeEach(resetDb)
+
+  const MINUTE_MS = 60 * 1000
+  const history = async (token: string) => (await request(app).get('/profile/reliability').set('Authorization', `Bearer ${token}`)).body
+
+  it('a student already at 0 who is swept shows the no-show as a miss, not as an ok dot and not as "No missed bookings yet"', async () => {
+    const { user, token } = await seedUser(0)
+    const resource = await prisma.resource.create({ data: { type: 'seat', name: 'Desk 1' } })
+    const now = new Date()
+    const startTime = new Date(now.getTime() - 20 * MINUTE_MS)
+    await prisma.resourceBooking.create({
+      data: { userId: user.id, resourceId: resource.id, startTime, endTime: new Date(startTime.getTime() + 60 * MINUTE_MS), status: 'booked' },
+    })
+
+    expect(await sweepBookings(now)).toMatchObject({ noShows: 1 })
+
+    // The sweep still writes its row (the audit trail) with nothing taken: a delta of 0.
+    const logs = await prisma.reliabilityScoreLog.findMany({ where: { userId: user.id } })
+    expect(logs).toEqual([expect.objectContaining({ delta: 0, score: 0, reason: 'No-show: Desk 1' })])
+    const body = await history(token)
+    expect(body).toMatchObject({ score: 0, tier: 'At risk', ringFraction: 0, history: ['miss'] })
+    expect(body.note).not.toMatch(/No missed bookings yet/)
+    expect(body.note).toBe('Your reliability score recently dropped: No-show: Desk 1. Complete 40 more on-time bookings to return to Good standing.')
+    expect(logs[0].reason).toBe(`${NO_SHOW_REASON_PREFIX}Desk 1`)
+  })
+
+  it('the prefix is exactly "No-show: ", and a row that starts with it is a miss however little it took', async () => {
+    const { user, token } = await seedUser(30)
+    const base = Date.now()
+    await prisma.reliabilityScoreLog.create({ data: { userId: user.id, score: 30, delta: 0, reason: 'No-show: Desk 3', computedAt: new Date(base) } })
+    await prisma.reliabilityScoreLog.create({ data: { userId: user.id, score: 32, delta: 2, reason: 'On-time check-in for a resource booking', computedAt: new Date(base + 1000) } })
+    // A row with no delta that is not a no-show stays ok, as before.
+    await prisma.reliabilityScoreLog.create({ data: { userId: user.id, score: 32, delta: 0, reason: 'Library adjustment: Nothing to change', computedAt: new Date(base + 2000) } })
+
+    expect((await history(token)).history).toEqual(['miss', 'ok', 'ok'])
+    expect(NO_SHOW_REASON_PREFIX).toBe('No-show: ')
+  })
+
+  it('an overturned no-show: the original row stays a miss and the restore row follows as ok', async () => {
+    const { user, token } = await seedUser(100)
+    const base = Date.now()
+    await prisma.reliabilityScoreLog.create({ data: { userId: user.id, score: 90, delta: -10, reason: 'No-show: Desk 3', computedAt: new Date(base) } })
+    // What an overturn writes: the colon comes right after "No-show", so it does not start with the no-show prefix.
+    await prisma.reliabilityScoreLog.create({ data: { userId: user.id, score: 100, delta: 10, reason: 'No-show overturned: Desk 3', computedAt: new Date(base + 1000) } })
+
+    const body = await history(token)
+
+    expect(body.history).toEqual(['miss', 'ok'])
+    expect(body.note).toMatch(/^No missed bookings yet\./)
+    expect('No-show overturned: Desk 3'.startsWith(NO_SHOW_REASON_PREFIX)).toBe(false)
+  })
+
+  it('a restore row is ok even with a zero delta (the score was already at 100)', async () => {
+    const { user, token } = await seedUser(100)
+    const base = Date.now()
+    await prisma.reliabilityScoreLog.create({ data: { userId: user.id, score: 100, delta: 0, reason: 'No-show overturned: Desk 3', computedAt: new Date(base) } })
+
+    expect((await history(token)).history).toEqual(['ok'])
   })
 })

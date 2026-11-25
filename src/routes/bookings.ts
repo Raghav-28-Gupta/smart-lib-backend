@@ -2,7 +2,9 @@ import { Router } from 'express'
 import { requireAuth } from '../middleware/requireAuth'
 import { validate } from '../middleware/validate'
 import { bookingIdParamsSchema, createBookingSchema } from '../schemas/bookings'
+import { createNoShowDisputeSchema, noShowDisputeParamsSchema } from '../schemas/noShowDisputes'
 import { cancelBooking, checkInBooking, createBooking, listMyBookings } from '../services/bookingService'
+import { createNoShowDispute } from '../services/noShowDisputeService'
 
 export const bookingsRouter = Router()
 
@@ -25,3 +27,17 @@ bookingsRouter.post('/bookings/:id/cancel', requireAuth, validate({ params: book
   const { id } = req.params as { id: string }
   res.json(await cancelBooking(req.user!.sub, id))
 })
+
+// The student disputes one of their own recorded no-shows, once. Another student's booking answers 404
+// like an unknown id (not the 403 that check-in and cancel use). The student then sees the dispute as
+// `noShow.dispute` on the booking in GET /bookings/me.
+bookingsRouter.post(
+  '/bookings/:id/dispute',
+  requireAuth,
+  validate({ params: noShowDisputeParamsSchema, body: createNoShowDisputeSchema }),
+  async (req, res) => {
+    const { id } = req.params as { id: string }
+    const { reason } = req.body as { reason: string }
+    res.status(201).json(await createNoShowDispute(req.user!.sub, id, reason))
+  },
+)

@@ -164,7 +164,8 @@ describe('POST /reports', () => {
     const { user: other } = await seedUser()
     // Every case is a booking of the student's own on a resource of its own. The two edge cases are
     // a minute outside the limits; the rest are statuses the rule leaves out (a request, a refused
-    // or lapsed request, a cancel, a no-show and a release).
+    // or lapsed request, a cancel). A no-show and a release are NOT among them: they entitle (see
+    // the two tests below), and so does a booking that was never checked into.
     const cases: Array<[string, number, BookingStatus]> = [
       ['started 8 days ago', -8 * DAY_MS, 'completed'],
       ['started a minute outside 7 days ago', -(7 * DAY_MS + MINUTE_MS), 'booked'],
@@ -174,8 +175,6 @@ describe('POST /reports', () => {
       ['a room request waiting for a librarian', 2 * HOUR_MS, 'requested'],
       ['a declined request', -HOUR_MS, 'declined'],
       ['an expired request', -HOUR_MS, 'expired'],
-      ['a no-show', -HOUR_MS, 'no_show'],
-      ['released', -HOUR_MS, 'released'],
     ]
     const targets: Array<[string, string]> = []
     for (const [what, offset, status] of cases) {
@@ -197,6 +196,73 @@ describe('POST /reports', () => {
 
     expect(await prisma.issueReport.count()).toBe(0)
     expect(recorder.events).toEqual([])
+  })
+
+  // The sweep turns a booking that was never checked into from `booked` into `no_show` within
+  // minutes, so the student who found the seat broken and left must still be able to report it.
+  it('a student with a no-show booking can still report its seat', async () => {
+    const { user, token } = await seedUser()
+    const seat = await seedResource('seat', 'Reading Room A · Desk 3')
+    const booking = await seedBooking(user.id, seat.id, -2 * HOUR_MS, 'no_show')
+    await prisma.user.update({ where: { id: user.id }, data: { reliabilityScore: 60 } })
+    recorder = recordEvents()
+
+    const res = await report(token, { resourceId: seat.id, category: 'not_working', note: 'The lamp is dead' })
+
+    expect(res.status).toBe(201)
+    expect(res.body).toEqual({ id: expect.any(String) })
+    expect(await prisma.issueReport.findUniqueOrThrow({ where: { id: res.body.id } })).toMatchObject({
+      userId: user.id,
+      resourceId: seat.id,
+      category: 'not_working',
+      note: 'The lamp is dead',
+      status: 'open',
+    })
+    expect(recorder.events).toEqual([ATTENTION_CHANGED])
+    // A report never charges or penalizes anyone: the miss stands as it was, and nothing was taken.
+    expect((await prisma.resourceBooking.findUniqueOrThrow({ where: { id: booking.id } })).status).toBe('no_show')
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).reliabilityScore).toBe(60)
+    expect(await prisma.reliabilityScoreLog.count({ where: { userId: user.id } })).toBe(0)
+    expect(await prisma.fine.count()).toBe(0)
+    expect(await prisma.noShowEvent.count()).toBe(0)
+  })
+
+  it('a released booking can still be reported', async () => {
+    const { user, token } = await seedUser()
+    const room = await seedResource('room', 'Group Room 201')
+    const booking = await seedBooking(user.id, room.id, -2 * HOUR_MS, 'released')
+    recorder = recordEvents()
+
+    const res = await report(token, { resourceId: room.id, category: 'dirty' })
+
+    expect(res.status).toBe(201)
+    expect(await prisma.issueReport.count({ where: { userId: user.id, resourceId: room.id, status: 'open' } })).toBe(1)
+    expect(recorder.events).toEqual([ATTENTION_CHANGED])
+    expect((await prisma.resourceBooking.findUniqueOrThrow({ where: { id: booking.id } })).status).toBe('released')
+  })
+
+  it('a no-show or released booking entitles only inside the same time window as any other', async () => {
+    const { user, token } = await seedUser()
+    const cases: Array<[string, number, BookingStatus, number]> = [
+      ['a no-show a minute inside 7 days ago', -(7 * DAY_MS - MINUTE_MS), 'no_show', 201],
+      ['a release a minute inside 7 days ago', -(7 * DAY_MS - MINUTE_MS), 'released', 201],
+      ['a no-show a minute outside 7 days ago', -(7 * DAY_MS + MINUTE_MS), 'no_show', 403],
+      ['a release a minute outside 7 days ago', -(7 * DAY_MS + MINUTE_MS), 'released', 403],
+      ['a no-show 8 days ago', -8 * DAY_MS, 'no_show', 403],
+    ]
+    const targets: Array<[string, string, number]> = []
+    for (const [what, offset, status, expected] of cases) {
+      const resource = await seedResource()
+      await seedBooking(user.id, resource.id, offset, status)
+      targets.push([what, resource.id, expected])
+    }
+
+    for (const [what, resourceId, expected] of targets) {
+      const res = await report(token, { resourceId, category: 'dirty' })
+      expect(res.status, what).toBe(expected)
+      if (expected === 403) expect(res.body.error, what).toBe(NOT_BOOKED)
+    }
+    expect(await prisma.issueReport.count({ where: { userId: user.id } })).toBe(2)
   })
 
   it('an open report on the same resource is 409, also under two simultaneous requests', async () => {

@@ -26,11 +26,13 @@ const DAY_MS = 24 * HOUR_MS
 
 /**
  * The bookings that entitle a student to report their resource: a raw status of
- * `booked`, `checked_in` or `completed`. A booking never checked into stays `booked`
- * and counts (a student who finds the seat broken and leaves is the likely case); a
- * cancelled booking, a request and the other endings do not.
+ * `booked`, `checked_in`, `completed`, `no_show` or `released`. A booking never checked
+ * into counts whatever it has become (a student who finds the seat broken and leaves is
+ * the likely case): it stays `booked` until the sweep records the miss as `no_show`
+ * within minutes, and an overturned no-show is `released`. A cancelled booking, a
+ * request and the other endings do not. Reporting never charges or penalizes anyone.
  */
-export const REPORTABLE_BOOKING_STATUSES: BookingStatus[] = ['booked', 'checked_in', 'completed']
+export const REPORTABLE_BOOKING_STATUSES: BookingStatus[] = ['booked', 'checked_in', 'completed', 'no_show', 'released']
 
 /** The start times that qualify, both limits included: from 7 days ago to 24 hours from now. */
 export function reportableStartWindow(now: Date): { from: Date; to: Date } {
