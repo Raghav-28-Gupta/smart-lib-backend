@@ -280,7 +280,7 @@ TypeScript, a dev dependency. Node 22 comes from `engines` in `package.json`.
 | `MAIL_ALLOWED_DOMAINS` | Optional, comma-separated, for example `thapar.edu`: only addresses at exactly these domains get email (the whole part after the `@`: `thapar.edu` does not match `mail.thapar.edu`) and every other address is skipped. Unset: every address except the seed's demo accounts |
 | `PORT` | Set by Render |
 | `SWEEP_TOKEN` | Optional, and a secret: a long random string (generator command in `.env.example`). `POST /internal/sweep` answers 404 until it is set; the scheduled workflow sends the same value (see *Owner steps for the no-show slice* below). Set it only here and as a repo secret, never in a file you commit |
-| `AI_BACKEND_URL` | Unset or blank: the AI service isn't deployed, so **no booking is scored** (every room request keeps priority 1.0, see *No-shows*) and **the recommendation cache is never refreshed** (students see what's popular, see *Recommendations*). Set it to the AI service's own address only when that service is deployed. It gates both calls; the refresh needs `AI_TOKEN` as well |
+| `AI_BACKEND_URL` | Unset or blank: the AI service is not used, so **no booking is scored** (every room request keeps priority 1.0, see *No-shows*) and **the recommendation cache is never refreshed** (students see what's popular, see *Recommendations*). Set it to the AI service's own address only when that service is deployed. It gates both calls; the refresh needs `AI_TOKEN` as well |
 | `AI_TOKEN` | Optional, and a secret: a long random string, **the same value as on the AI service** (which reads it from its process environment only). Sent in the `x-ai-token` header of the recommendation call, and only there. Unset or blank: recommendations are not refreshed (no request is made), whatever `AI_BACKEND_URL` says. Surrounding whitespace is trimmed. Set it only here, never in a file you commit; it is never logged (see *Recommendations*) |
 
 ### First-time setup
@@ -352,8 +352,8 @@ that the rest of the code does not handle yet.
    under the Actions tab, turns it back on). The workflow is the only loud failure
    channel (GitHub emails a failed run); the timer and the lazy sweep log to
    Render's logs only.
-5. **The AI service is not deployed in production** (`AI_BACKEND_URL` unset), so
-   every booking keeps priority 1.0 and everything else in this slice works. To get
+5. **The AI service is optional.** With `AI_BACKEND_URL` unset every booking keeps
+   priority 1.0 and everything else in this slice works. To get
    predictions deploy `ai-backend/` as a second Render web service with its pinned
    requirements (numpy 2.5.2, scikit-learn 1.9.0, xgboost 3.4.1 and joblib 1.5.3
    among them: the committed model artifact fails to load on other versions and the

@@ -67,7 +67,7 @@ export class NoShowPredictionError extends Error {
 /**
  * Whether the prediction service is set up. Read from the environment on every call, unlike
  * AI_BACKEND_URL above (read once at import, with a localhost default): a blank or missing value
- * means "not deployed" (production today), and `scoreBooking` then does nothing at all.
+ * means "no AI service is set up here", and `scoreBooking` then does nothing at all.
  */
 export function isAiBackendConfigured(): boolean {
   return (process.env.AI_BACKEND_URL ?? '').trim() !== ''
