@@ -5,6 +5,7 @@
 import { publish } from '../lib/events'
 import { prisma } from '../lib/prisma'
 import { logSweepFailure, logSweepResult, sweepUnlessRunning } from './noShowService'
+import { describeRefreshFailure, logRecommendationRefresh, refreshRecommendationsIfDue } from './recommendationRefresh'
 import { onBookReturned } from './reservationService'
 
 /**
@@ -71,14 +72,15 @@ export const SWEEP_INTERVAL_MS = 60_000
 
 /**
  * What the 60-second timer runs (src/index.ts passes it to startExpirySweep): the expiry
- * sweep above and the no-show sweep, at the same time. Neither waits for the other or loses
- * its work to the other's failure, and each failure is logged by its own message. Never
- * rejects, so startExpirySweep's own catch is not the only thing standing between a failing
- * sweep and a crashed server.
+ * sweep above, the no-show sweep and the recommendation refresh, at the same time. None
+ * waits for another or loses its work to another's failure, and each failure is logged by
+ * its own message. Never rejects, so startExpirySweep's own catch is not the only thing
+ * standing between a failing sweep and a crashed server.
  *
- * The two touch different rows (requests that are still `requested` or `pending`, and
- * bookings that are `booked`), and the booking sweep is safe to run at the same instant
- * as itself (the route), so they need no ordering. Don't lengthen SWEEP_INTERVAL_MS: a
+ * The first two touch different rows (requests that are still `requested` or `pending`, and
+ * bookings that are `booked`) and the refresh writes only RecommendationCache, and the
+ * booking sweep is safe to run at the same instant as itself (the route), so none of the
+ * three needs ordering. Don't lengthen SWEEP_INTERVAL_MS: a
  * reminder has a 30-minute window and a no-show is about a minute behind only while this
  * beat runs.
  *
@@ -87,12 +89,23 @@ export const SWEEP_INTERVAL_MS = 60_000
  * database), this beat skips the booking sweep, logs nothing for the skip (except one error
  * line, once, when that sweep is over 10 minutes old: it is hung), and still runs the expiry
  * sweep.
+ *
+ * The refresh (`refreshRecommendationsIfDue`, recommendationRefresh.ts) fills RecommendationCache from the
+ * AI service. It asks at most once a day and not at all unless AI_BACKEND_URL and AI_TOKEN are both set,
+ * so almost every beat it answers `null` at once; when it does ask, it can run for up to 90 seconds, and
+ * until it ends this beat's promise stays pending (the timer does not wait for it: the next beat starts on
+ * time, finds the refresh running and skips it). A failure is logged as
+ * `Recommendation refresh failed: <text>` where the text is `describeRefreshFailure`'s and nothing else:
+ * never the error object, its `cause` or another error's message, because an unreachable service's error
+ * carries its address and a malformed AI_BACKEND_URL makes `fetch` quote the URL, credentials included.
  */
 export async function runScheduledSweeps(): Promise<void> {
-  const [expiry, bookings] = await Promise.allSettled([expireStaleRequests(), sweepUnlessRunning()])
+  const [expiry, bookings, recommendations] = await Promise.allSettled([expireStaleRequests(), sweepUnlessRunning(), refreshRecommendationsIfDue()])
   if (expiry.status === 'rejected') console.error('Expiry sweep failed:', expiry.reason)
   if (bookings.status === 'rejected') logSweepFailure(bookings.reason)
   else if (bookings.value) logSweepResult(bookings.value) // null: a sweep was already running, nothing to say
+  if (recommendations.status === 'rejected') console.error(`Recommendation refresh failed: ${describeRefreshFailure(recommendations.reason)}`)
+  else if (recommendations.value) logRecommendationRefresh(recommendations.value) // null: it did nothing, nothing to say
 }
 
 /**

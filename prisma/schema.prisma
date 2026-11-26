@@ -526,4 +526,7 @@ model RecommendationCache {
   score       Float
   method      RecommendationMethod
   generatedAt DateTime             @default(now())
+
+  // One row per student and book. Also the index the read by userId uses.
+  @@unique([userId, bookId])
 }

@@ -61,7 +61,7 @@ PORT=3000
 
 Optional email settings (all commented out in `.env.example`; email is off unless the first two are set, and nothing else depends on them): `BREVO_API_KEY` (a secret), `MAIL_FROM`, `MAIL_FROM_NAME` (default "SmartLib") and `MAIL_ALLOWED_DOMAINS` (comma-separated). Never put a real key in a committed file. The rules are under *Notices, Disputes and Reports*.
 
-`SWEEP_TOKEN` (optional, a secret, commented out in `.env.example`): the credential of `POST /internal/sweep`, which answers 404 while it is unset or blank. Environment only, never committed, printed or logged. `AI_BACKEND_URL` unset or blank means **no no-show scoring at all** (production today: the AI service is not deployed); recommendations and `/health/ai` still read it with the localhost default. The rules are under *No-shows, the Sweep and Scoring*.
+`SWEEP_TOKEN` (optional, a secret, commented out in `.env.example`): the credential of `POST /internal/sweep`, which answers 404 while it is unset or blank. Environment only, never committed, printed or logged. `AI_BACKEND_URL` unset or blank means **no no-show scoring at all and no recommendation refresh** (production today: the AI service is not deployed); only `/health/ai` still reads it with the localhost default (the no-show and recommendation calls read it on every call and have no default). The refresh needs BOTH `AI_BACKEND_URL` and `AI_TOKEN`; `AI_TOKEN` (optional, a secret, commented out in `.env.example`) is the shared secret of the AI service's recommender, sent only in the `x-ai-token` header of `POST /recommend/batch`, the same value as on the AI service, trimmed, environment only, never committed, printed or logged. The rules are under *No-shows, the Sweep and Scoring* and *Book Recommendations*.
 
 ---
 
@@ -383,6 +383,58 @@ rules to keep when changing the code.
 
 ---
 
+## Book Recommendations
+
+The behaviour and the owner's deploy steps are in README *Recommendations*; these are the
+rules to keep when changing the code.
+
+- **The read path only reads the cache.** `getRecommendations` (`recommendationService.ts`)
+  reads the student's `RecommendationCache` rows newer than `RECOMMEND_MAX_AGE_MS` (14 days),
+  drops the books the student holds now, takes the best `RECOMMEND_LIMIT` and answers ONE
+  section; with nothing left it answers the popularity list, wording unchanged. It never calls
+  the AI service, so it can never be slow or empty because of it (fail open).
+- **The refresh is a background job, never a request's work.** `refreshRecommendationsIfDue(now)`
+  (`recommendationRefresh.ts`) is the third arm of `runScheduledSweeps` (`requestHolds.ts`,
+  `Promise.allSettled` beside the expiry and no-show sweeps; `POST /internal/sweep` does not run
+  it). It answers `null` for "did nothing" (not configured: `isRecommenderConfigured()` needs
+  `AI_BACKEND_URL` and `AI_TOKEN`; not due; inside the retry window; already running; nothing to
+  send) and REJECTS when the call or the store failed. Due = no row, or the newest `generatedAt`
+  older than `RECOMMEND_REFRESH_MS`; one attempt per `RECOMMEND_RETRY_MS` per process, stamped for
+  every attempt (a failure and "nothing to send" included, a "not due" check not); one at a time
+  (`refreshRunning`, taken before the first await and cleared in a `finally`, the shape of the
+  sweep guard); `resetRecommendationRefreshForTests()` clears both. Tests inject `now`, stub
+  `fetch` and never sleep.
+- **The cache is replaced in ONE transaction** (`deleteMany`, then `createMany` in chunks of 1,000,
+  `SWEEP_TX_OPTIONS`), only after the client has validated the whole answer against what was sent
+  (`fetchRecommendationBatch`: known users and books, scores in [0, 1], a known method, no
+  repeated pair, at most `limit` per user). A failure leaves the old rows. `generatedAt` is a
+  plain `timestamp` column: always pass it from JavaScript and use the Prisma API, never raw SQL
+  and never the column default (the database session's clock). `(userId, bookId)` is unique.
+- **The payload is ids only** (`buildRecommendationPayload`): books with a copy that is not lost
+  (`id`, `title`, `author`, `genre`, `description`) and the STUDENTS' interactions (loan 1, +0.5
+  renewed, reservation 0.5, summed per pair, capped at `RECOMMEND_MAX_PAIR_WEIGHT`); the caps
+  truncate to the most recent rather than 422. No name, email or other user field, ever.
+- **LOGGING RULE (security).** `fetchRecommendationBatch` rejects with `RecommendationBatchError`
+  (fixed, safe messages) for its own refusals, but an unreachable service rejects with fetch's own
+  `TypeError('fetch failed')` whose `cause` carries the address, a malformed `AI_BACKEND_URL` makes
+  fetch throw a message that QUOTES THE URL (credentials included), and a timeout rejects with the
+  signal's reason. So the timer logs `Recommendation refresh failed: <text>` through
+  `describeRefreshFailure` ONLY: a `RecommendationBatchError`'s message; `timed out` for an
+  AbortError or TimeoutError; for a `TypeError('fetch failed')` the cause's `code` when it matches
+  `/^[A-Z][A-Z0-9_]{1,39}$/` (`ECONNREFUSED`), else `AI service unreachable`; for any other error its
+  `name` plus its `code` when that is a string (`PrismaClientKnownRequestError P2028`; a TypeError with
+  any other message logs only `TypeError`). Never the error object, never a cause's message or address,
+  never another error's message, never the token. A success is one `console.log` line of counts and the model
+  version (`logRecommendationRefresh`). A new log line in this area follows the same rule.
+- **Files.** `src/services/recommendationRefresh.ts` (the refresh, `describeRefreshFailure`,
+  `logRecommendationRefresh`), `recommendationPayload.ts` (the payload), `recommendationService.ts`
+  (the read path), `src/lib/aiClient.ts` (`fetchRecommendationBatch`, `isRecommenderConfigured`,
+  `RecommendationBatchError`); the shared contract is `test/fixtures/recommend-batch-example.json`, a
+  byte-identical copy of `ai-backend/tests/fixtures/recommend_batch_example.json` (`.gitattributes` keeps
+  it LF).
+
+---
+
 ## Code Organization
 
 ```
@@ -397,7 +449,7 @@ backend/
 │   ├── middleware/       # JWT auth, role validation (student/admin), error handlers
 │   └── lib/
 │       ├── prisma.ts     # PrismaClient singleton with @prisma/adapter-pg
-│       ├── aiClient.ts   # Isolated Axios/fetch client calling FastAPI AI backend
+│       ├── aiClient.ts   # Isolated fetch client calling the FastAPI AI backend (no-show prediction, recommendation batch)
 │       └── mailer.ts     # Optional Brevo email sender; never throws, never logs a body or the key
 ├── prisma/
 │   ├── schema.prisma     # Prisma data model

@@ -99,6 +99,36 @@ export const PREDICT_TIMEOUT_MS = 2000
 // prediction's features are built (the simulator uses the same prior).
 export const NO_SHOW_PRIOR_ATTENDANCE = 0.85
 
+// The book recommender (slice 8; spec 2026-11-25-book-recommender-design.md). A background refresh fills
+// RecommendationCache from the AI service; GET /recommendations/me only ever reads the cache.
+
+// How many personal picks a student sees.
+export const RECOMMEND_LIMIT = 10
+
+// The cache is refreshed when its newest row is older than this; after any attempt (success or failure) the
+// process waits RECOMMEND_RETRY_MS before trying again; the AI call gets RECOMMEND_TIMEOUT_MS (a cold start on a
+// free host can take most of it).
+export const RECOMMEND_REFRESH_MS = 24 * 60 * 60 * 1000
+export const RECOMMEND_RETRY_MS = 15 * 60 * 1000
+export const RECOMMEND_TIMEOUT_MS = 90_000
+
+// Cache rows older than this are not served, so a long-dead AI service never shows month-old picks.
+export const RECOMMEND_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
+
+// The most the refresh sends: the backend truncates first, keeping the most recent interactions. Books: the AI service
+// answers 422 beyond 5,000, so this is its own limit. Interactions: the AI service accepts up to 200,000, but fitting
+// that many (with the 36-character ids the backend really sends) peaked at about 510 to 530 MB (Windows; ai-backend/README.md), at or over a free 512 MB
+// instance, so the backend sends 50,000 at most. The AI service's own cap stays as it is (it is the contract's limit).
+export const RECOMMEND_MAX_BOOKS = 5000
+export const RECOMMEND_MAX_INTERACTIONS = 50_000
+
+// How much each kind of history counts, summed per (student, book) and capped at RECOMMEND_MAX_PAIR_WEIGHT (the
+// AI service accepts a weight above 0 up to 3). [ARBITRARY — flagged, not a team decision] like the other placeholders.
+export const RECOMMEND_LOAN_WEIGHT = 1
+export const RECOMMEND_RENEWAL_BONUS = 0.5
+export const RECOMMEND_RESERVATION_WEIGHT = 0.5
+export const RECOMMEND_MAX_PAIR_WEIGHT = 3
+
 // Same validate-at-startup pattern as lib/prisma.ts's DATABASE_URL check —
 // fail loudly at boot rather than the first time a route tries to sign a token.
 const secret = process.env.JWT_SECRET

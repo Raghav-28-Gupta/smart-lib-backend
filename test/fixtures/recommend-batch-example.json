@@ -1,0 +1,213 @@
+{
+  "request": {
+    "books": [
+      {
+        "id": "b01",
+        "title": "Introduction to Algorithms",
+        "author": "Rivera",
+        "genre": "Algorithms",
+        "description": "Sorting, graphs and dynamic programming, with proofs of correctness."
+      },
+      {
+        "id": "b02",
+        "title": "Data Structures and Algorithms in Java",
+        "author": "Okafor",
+        "genre": "Data Structures",
+        "description": "Trees, graphs, hash tables and the algorithms that use them."
+      },
+      {
+        "id": "b03",
+        "title": "Graph Algorithms in Practice",
+        "author": "Lindqvist",
+        "genre": "Algorithms",
+        "description": "Shortest paths, spanning trees and network flow on real graphs."
+      },
+      {
+        "id": "b04",
+        "title": "Computer Networks",
+        "author": "Hale",
+        "genre": "Networks",
+        "description": "Layers, protocols and routing from the wire up to the application."
+      },
+      {
+        "id": "b05",
+        "title": "Network Security Essentials",
+        "author": "Park",
+        "genre": "Networks",
+        "description": "Cryptography, firewalls and secure protocols for modern networks."
+      },
+      {
+        "id": "b06",
+        "title": "Database System Concepts",
+        "author": "Nakamura",
+        "genre": "Databases",
+        "description": "Relational model, SQL, transactions and storage structures."
+      },
+      {
+        "id": "b07",
+        "title": "SQL Performance Tuning",
+        "author": "Ferreira",
+        "genre": "Databases",
+        "description": "Indexes, query plans and transactions for fast relational queries."
+      },
+      {
+        "id": "b08",
+        "title": "Distributed Systems",
+        "author": "Haddad",
+        "genre": "Systems",
+        "description": "Replication, consensus and transactions across networks of machines."
+      },
+      {
+        "id": "b09",
+        "title": "Operating System Concepts",
+        "author": "Silva",
+        "genre": "Systems",
+        "description": "Processes, memory, file systems and the concepts behind them."
+      },
+      {
+        "id": "b10",
+        "title": "The Silent Garden",
+        "author": "Moreau",
+        "genre": "Fiction",
+        "description": "A quiet novel about a family and the garden they inherit."
+      },
+      {
+        "id": "b11",
+        "title": "Ocean Stories",
+        "author": "Adeyemi",
+        "genre": null,
+        "description": null
+      },
+      {
+        "id": "b12",
+        "title": "Winter Verses",
+        "author": "Kowalski",
+        "genre": "Poetry",
+        "description": "Short poems about snow, stillness and the sea."
+      }
+    ],
+    "interactions": [
+      {
+        "user_id": "s3",
+        "book_id": "b06",
+        "weight": 1
+      },
+      {
+        "user_id": "s1",
+        "book_id": "b01",
+        "weight": 1
+      },
+      {
+        "user_id": "s2",
+        "book_id": "b04",
+        "weight": 1
+      },
+      {
+        "user_id": "s4",
+        "book_id": "b10",
+        "weight": 1
+      },
+      {
+        "user_id": "s1",
+        "book_id": "b02",
+        "weight": 1.5
+      },
+      {
+        "user_id": "s3",
+        "book_id": "b07",
+        "weight": 1
+      },
+      {
+        "user_id": "s2",
+        "book_id": "b05",
+        "weight": 1
+      },
+      {
+        "user_id": "s4",
+        "book_id": "b11",
+        "weight": 1
+      },
+      {
+        "user_id": "s1",
+        "book_id": "b09",
+        "weight": 0.5
+      },
+      {
+        "user_id": "s2",
+        "book_id": "b07",
+        "weight": 0.5
+      },
+      {
+        "user_id": "s3",
+        "book_id": "b09",
+        "weight": 0.5
+      },
+      {
+        "user_id": "s4",
+        "book_id": "b12",
+        "weight": 0.5
+      }
+    ],
+    "limit": 10
+  },
+  "response": {
+    "model_version": "tfidf-1",
+    "users": [
+      {
+        "user_id": "s1",
+        "results": [
+          {
+            "book_id": "b03",
+            "score": 1.0,
+            "method": "content"
+          },
+          {
+            "book_id": "b06",
+            "score": 0.3963603503886736,
+            "method": "content"
+          },
+          {
+            "book_id": "b08",
+            "score": 0.25914374554320263,
+            "method": "content"
+          }
+        ]
+      },
+      {
+        "user_id": "s2",
+        "results": [
+          {
+            "book_id": "b08",
+            "score": 1.0,
+            "method": "content"
+          },
+          {
+            "book_id": "b06",
+            "score": 0.6992450376978258,
+            "method": "content"
+          },
+          {
+            "book_id": "b03",
+            "score": 0.22783020336380524,
+            "method": "content"
+          }
+        ]
+      },
+      {
+        "user_id": "s3",
+        "results": [
+          {
+            "book_id": "b08",
+            "score": 1.0,
+            "method": "content"
+          },
+          {
+            "book_id": "b02",
+            "score": 0.45241476149256066,
+            "method": "content"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -280,7 +280,8 @@ TypeScript, a dev dependency. Node 22 comes from `engines` in `package.json`.
 | `MAIL_ALLOWED_DOMAINS` | Optional, comma-separated, for example `thapar.edu`: only addresses at exactly these domains get email (the whole part after the `@`: `thapar.edu` does not match `mail.thapar.edu`) and every other address is skipped. Unset: every address except the seed's demo accounts |
 | `PORT` | Set by Render |
 | `SWEEP_TOKEN` | Optional, and a secret: a long random string (generator command in `.env.example`). `POST /internal/sweep` answers 404 until it is set; the scheduled workflow sends the same value (see *Owner steps for the no-show slice* below). Set it only here and as a repo secret, never in a file you commit |
-| `AI_BACKEND_URL` | Unset: the AI service isn't deployed, so recommendations fall back to what's popular and **no booking is scored**, so every room request keeps priority 1.0 (see *No-shows*). Set it to the AI service's own address only when that service is deployed |
+| `AI_BACKEND_URL` | Unset or blank: the AI service isn't deployed, so **no booking is scored** (every room request keeps priority 1.0, see *No-shows*) and **the recommendation cache is never refreshed** (students see what's popular, see *Recommendations*). Set it to the AI service's own address only when that service is deployed. It gates both calls; the refresh needs `AI_TOKEN` as well |
+| `AI_TOKEN` | Optional, and a secret: a long random string, **the same value as on the AI service** (which reads it from its process environment only). Sent in the `x-ai-token` header of the recommendation call, and only there. Unset or blank: recommendations are not refreshed (no request is made), whatever `AI_BACKEND_URL` says. Surrounding whitespace is trimmed. Set it only here, never in a file you commit; it is never logged (see *Recommendations*) |
 
 ### First-time setup
 
@@ -357,7 +358,8 @@ that the rest of the code does not handle yet.
    requirements (numpy 2.5.2, scikit-learn 1.9.0, xgboost 3.4.1 and joblib 1.5.3
    among them: the committed model artifact fails to load on other versions and the
    service then answers 503, which the backend treats as "no nudge"), then set
-   `AI_BACKEND_URL` on the backend to its address. The start command, the Python
+   `AI_BACKEND_URL` on the backend to its address (personal book recommendations
+   need `AI_TOKEN` as well: see *Owner steps for the recommender slice*). The start command, the Python
    version (3.13), the cold-start behaviour and why its address must not be shared
    are in `ai-backend/README.md` under Deploy.
 6. **The Dashboard moves once.** After the backfill, past unattended bookings no
@@ -369,6 +371,94 @@ that the rest of the code does not handle yet.
    a dispute outcome and a room's reminder use it; a seat's reminder is in-app only.
 8. **The database session's time zone should be GMT/UTC** (Neon's default); see
    *Time zones in raw SQL* under *No-shows*.
+
+### Owner steps for the recommender slice
+
+Nothing here is needed to build or test, and nothing breaks without it: until every
+step is done students see the popularity list, as before. In this order.
+
+1. **Deploy the backend first.** If the no-show slice is not live in production
+   yet, its owner steps above come first, starting with the database backup:
+   Render ships every pushed slice in one deploy. Its migration
+   (`20261125175339_recommendation_cache_unique`) is one additive `CREATE UNIQUE
+   INDEX` on `RecommendationCache`, a table that is empty everywhere today, so it
+   cannot fail on existing data. With `AI_BACKEND_URL` and `AI_TOKEN` unset the
+   backend makes no recommendation call at all.
+2. **Deploy the AI service** as a second Render web service (`ai-backend/README.md`,
+   *Deploy*; the same one that serves no-show scoring, if you already did step 5
+   of the no-show slice above).
+3. **Set the SAME long random `AI_TOKEN` on both services**
+   (`node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"`).
+   The AI service reads it from its process environment only (its `.env` is not
+   used); whitespace around the value is trimmed on both sides, so a stray space
+   or newline pasted into a dashboard does not matter. Never put it in a file you
+   commit. If `AI_BACKEND_URL` is already set because no-show scoring is live, set
+   the token on the AI service BEFORE the backend: until both match, the log shows
+   `failed: 404` (harmless, it retries).
+4. **Then set `AI_BACKEND_URL` on the backend** to the AI service's address, with
+   `https://` (the token and every student's borrowing history, by id, travel to a
+   publicly reachable host). It is the last of the three, because it is what turns
+   the refresh on, and no-show scoring with it.
+5. **The first refresh runs within about a minute** of the backend starting with
+   `AI_BACKEND_URL` and `AI_TOKEN` both set (the 60-second timer picks it up). A
+   cold or sleeping AI service on Render's free plan can take longer than the
+   backend's 90-second timeout: that attempt fails, nothing changes, and the
+   backend tries again every 15 minutes until one succeeds, then once a day.
+   Students see the popularity list until the first success, and whenever
+   anything fails.
+6. **Memory.** The AI service fits its models from the payload on every call, and
+   the payload grows with every loan ever made. Measured on Windows with real-length
+   ids and 8,000 students (`ai-backend/README.md`; Linux and Render were not
+   measured): the service idles at about 166 MB and peaks at about 395 MB for 50,000
+   interactions, 440 MB for 100,000 and 510 to 530 MB for 200,000, so a free 512 MB
+   instance is NOT enough at the AI contract's 200,000. The backend therefore sends
+   at most 50,000 (the most recent; `RECOMMEND_MAX_INTERACTIONS`). A seeded demo is a
+   tiny fraction of that; a live campus grows towards it. An out-of-memory restart
+   fails open (the backend keeps the old cache and students keep their picks) but it
+   also interrupts no-show scoring on a shared instance (those bookings stay
+   unscored): if it happens, give the AI service a larger instance.
+7. **Check it** with the backend's own log: one line,
+   `recommendation refresh: students=<n> rows=<n> model=<version>`, after each
+   successful refresh, or `Recommendation refresh failed: <reason>` after a failed
+   one. Reading the reason:
+   - `timed out`: the AI service did not answer in 90 seconds, usually a cold
+     start on Render's free plan. Open `https://<the AI service>/health` once to
+     wake it, then wait for the next 15-minute retry.
+   - `AI backend recommendation batch failed: 401`: the two `AI_TOKEN`s differ.
+     `...: 404`: the AI service has no `AI_TOKEN` (its recommender is off) or the
+     address points at something else. `...: 5xx`: it failed, look at its log.
+   - `ECONNREFUSED`, `ENOTFOUND` or another upper-case code, or `AI service
+     unreachable`: the address is wrong or the service is not running (a TLS problem
+     shows its own code). Plain `TypeError`: `AI_BACKEND_URL` is malformed (rarely, a
+     connection cut while the answer was being read). An AI service killed for lack
+     of memory (step 6) shows up as one of these too: `...: 5xx`, `...answered with
+     invalid JSON`, `AI service unreachable` or a socket code such as
+     `UND_ERR_SOCKET`; look at its memory.
+   - `AI backend recommendation batch answered ...`: the service answered
+     something that does not match what the backend sent (an older or newer AI
+     service version).
+   - `PrismaClientKnownRequestError P2028`: the write outlasted its 15-second
+     transaction limit (a very large cache on a slow link), or the transaction could
+     not start in time: it repeats every 15 minutes until the data or the link
+     changes.
+8. **Undo and reset.** Switching the feature off is not instant, and there is
+   no button to force a refresh:
+   - *Stop recommending:* unsetting `AI_TOKEN` (or `AI_BACKEND_URL`) stops the
+     refresh, but students keep seeing the last picks for up to 14 days. To clear
+     them at once, run `DELETE FROM "RecommendationCache";` in Neon's SQL editor:
+     the next read falls back to the popularity list. Run it only AFTER the new
+     configuration is live: an old instance that still has both variables set
+     refills the table within about a minute. Unsetting `AI_BACKEND_URL` also turns
+     off no-show scoring (priority goes back to 1.0); unset `AI_TOKEN` alone to stop
+     only the recommendations.
+   - *Force a refresh* (for example after re-seeding, which removes only the seed
+     accounts' rows, or to test): the same `DELETE`; the next 60-second beat that is
+     at least 15 minutes after this process's last attempt asks the AI service again
+     (a restart makes it immediate).
+   - *Roll the backend back to the previous slice:* unset `AI_BACKEND_URL` FIRST.
+     The previous code called the AI service on every `/recommendations/me` with no
+     timeout, so a sleeping AI service would stall every home-screen open. The new
+     unique index can stay: the old code never writes that table.
 
 ## Endpoints
 
@@ -400,7 +490,7 @@ that the rest of the code does not handle yet.
 | POST | `/fines/:id/dispute` | ✓ | Dispute one of your own fines, once: `{ reason }` (trimmed, 1-300 characters); answers 201 `{ id, status: 'open' }`. 404 for an unknown fine or another student's; 409 once it is paid or waived, or when you already disputed it (see *Fine disputes*) |
 | GET | `/notices/me` | ✓ | Your library notices (overdue reminders, dispute and report outcomes, booking reminders, no-shows and their outcomes) from the last 7 days, newest first, at most 20: an array of `{ id, kind, title, body, createdAt }` (see *Notices and email*) |
 | POST | `/reports` | ✓ | Report a seat or room you booked: `{ resourceId, category, note? }` (`category` is `not_working`, `dirty` or `other`; a note of up to 300 characters, required for `other`); answers 201 `{ id }`. 403 unless one of your bookings of it qualifies, 409 if you already have an open report on it (see *Problem reports*) |
-| GET | `/recommendations/me` | ✓ | AI-backend recommendations, falling back to "popular right now" |
+| GET | `/recommendations/me` | ✓ | Personal picks from a cache the backend refreshes from the AI service in the background; the popularity list ("popular right now") when there are none (see *Recommendations*) |
 | GET | `/admin/metrics/utilization` | admin | Booked share of open hours: today, the same weekday last week, and seats/rooms for the last 7 days |
 | GET | `/admin/metrics/circulation` | admin | Borrows, returns and top 5 titles over the last 7 days |
 | GET | `/admin/metrics/overdue` | admin | Loans overdue now and 24 hours ago |
@@ -458,9 +548,10 @@ curl localhost:3000/health/db   # {"status":"ok","service":"postgres"}
 curl localhost:3000/health/ai   # {"status":"ok","service":"ai-backend"}
 ```
 
-`/health/ai` (and the real path behind `/recommendations/me`) requires the AI
-backend to be running — see `../ai-backend/README.md`. `/recommendations/me`
-degrades gracefully to its fallback when it isn't.
+`/health/ai` requires the AI backend to be running — see
+`../ai-backend/README.md`. `/recommendations/me` does not: it never calls the AI
+service, it reads the cache the background refresh fills (see
+*Recommendations*), and shows the popularity list when there is nothing to show.
 
 ## Request approvals
 
@@ -1320,6 +1411,87 @@ Email is optional; do this only when the library wants students emailed.
 Never put the key in a file you commit. For a local run, set the same variables in
 your own untracked `backend/.env` (see `.env.example`).
 
+## Recommendations
+
+`GET /recommendations/me` shows a student personal picks: books similar to ones
+they borrowed (content, TF-IDF) and to what similar students borrow (implicit ALS),
+blended in the AI service. The backend never waits for it: the picks come from a
+cache table (`RecommendationCache`) that a background refresh fills, so the home
+screen is as fast as a database read and works while the AI service is asleep, down
+or not deployed. The model and the endpoints are in `../ai-backend/README.md`; the
+design is `docs/superpowers/specs/2026-11-25-book-recommender-design.md` in the
+project's root `docs/` folder (outside this repository).
+
+**What a student sees** (`recommendationService.getRecommendations`, which calls
+nothing but the database):
+
+- The student's cache rows from the last 14 days (`RECOMMEND_MAX_AGE_MS`: a
+  long-dead AI service never serves month-old picks), minus the books they hold
+  now (an open loan, meaning a status other than `returned` or `lost`, a
+  reservation that is `waiting` or `fulfilled`, or a `pending` borrow request),
+  best score first, at most 10, and minus any book that no longer exists.
+- With at least one book left: the note `Based on your recent activity.` and ONE
+  section titled `Recommended for you`, captioned `Similar to books you've
+  borrowed` when every pick is `content`, else `Similar to books you've borrowed,
+  and what similar students borrow`.
+- Otherwise (no rows, all stale, all held, or a student with no history) the
+  popularity list, with its own titles, captions and notes unchanged. **It fails
+  open**: it reads only the database, so a failing or hung refresh, an empty or
+  stale cache or an AI service that is down changes what is shown, never whether
+  it is shown (it is as fast and as available as any other database read).
+
+**The refresh** (`src/services/recommendationRefresh.ts`) is the third arm of
+`runScheduledSweeps`, the 60-second timer, beside the request-lapse sweep and the
+no-show sweep (`POST /internal/sweep` is not changed and does not run it). It
+does nothing unless `AI_BACKEND_URL` **and** `AI_TOKEN` are both set and not blank.
+
+- **Due** when the cache is empty or its newest row is older than 24 hours
+  (`RECOMMEND_REFRESH_MS`). After any attempt, a failed one and a "nothing to
+  send" one included, this process waits 15 minutes (`RECOMMEND_RETRY_MS`) before
+  it tries again, so a down AI service is asked four times an hour, not once a
+  minute. One refresh runs at a time per process: a beat that finds one still
+  running does nothing, so a slow call never stacks.
+- **What it sends** (`POST /recommend/batch`, header `x-ai-token`, 90 seconds
+  to answer: `RECOMMEND_TIMEOUT_MS`, which allows for a cold start): the catalog
+  (every book with at least one copy that is not lost: `id`, `title`, `author`,
+  `genre`, `description`) and the **students'** interactions only (a loan counts
+  1, plus 0.5 when it was renewed; a reservation of any status counts 0.5; summed
+  per student and book and capped at 3). Beyond 5,000 books or 50,000 interactions
+  it sends the most recent ones: 5,000 books is the AI service's own limit (beyond
+  it, a 422 that would fail every refresh), and 50,000 interactions is held below
+  the 200,000 it accepts so that it stays inside a free 512 MB instance's memory
+  in the Windows measurements (about 395 MB; Linux and Render were not measured)
+  (`RECOMMEND_MAX_INTERACTIONS`). User ids and book ids are the only handle on a
+  student: **no name, no email, no other user field** leaves the backend. When nobody has borrowed or
+  reserved anything there is nothing to send and no request is made.
+- **What it keeps.** The answer is checked against what was sent (shape, scores
+  in [0, 1], a known method, only books and students that were sent) before the
+  table is touched; then ONE transaction deletes every row and inserts the answer
+  (`generatedAt` = the refresh's time, passed from JavaScript: the column is a plain
+  `timestamp`). An invalid, failed or timed-out answer, or a failing write, changes
+  nothing: the old rows stay and the 15-minute rule applies. An answer with no
+  students empties the table.
+- **What it logs** (counts and the model version only; never an id, name, email,
+  title or the token): after a refresh that wrote, `recommendation refresh:
+  students=<n> rows=<n> model=<tfidf-1 or tfidf-als-1>`; after one that failed,
+  `Recommendation refresh failed: <reason>`, where the reason is only the fixed
+  message of the client's own refusal (a bad status such as `AI backend
+  recommendation batch failed: 503`, an answer that does not match what was sent),
+  `timed out`, for a service that cannot be reached the cause's code (`ECONNREFUSED`,
+  `ENOTFOUND`, ...) or `AI service unreachable`, or the error's class name with its
+  `code` when it has one (`PrismaClientKnownRequestError P2028`). Never the error
+  itself or its cause: an unreachable service's cause carries its address, and a
+  malformed `AI_BACKEND_URL` makes `fetch` quote it, credentials included (that
+  case logs just `TypeError`). A skipped beat logs nothing. On the one beat a day
+  that does refresh, the other sweeps' log lines of that beat can appear up to 90
+  seconds late (the timer logs after all three have settled); the next beat is not
+  delayed.
+
+The weights, limits and timings are the `RECOMMEND_*` constants in
+`src/config/constants.ts`; the interaction weights are flagged placeholders, like
+the other tunables there. Nothing here is tuned or retrained: every refresh fits
+from its own payload.
+
 ## Live events
 
 `GET /admin/events` streams Server-Sent Events to the admin console: `ready` on
@@ -1383,7 +1555,8 @@ its `availableCopies`/`heldCopies`/`waitlistCount` are all counted from rows
 which only that student may borrow); a loan
 carries the raw Prisma `status` next to the frontend-facing `frontendStatus`
 (`normal`/`overdue`). Apart from the request-lapse sweep (see *Request
-approvals*) and the no-show sweep (see *No-shows*), nothing here runs on a
+approvals*), the no-show sweep (see *No-shows*) and the recommendation refresh
+(see *Recommendations*), nothing here runs on a
 schedule — overdue status and waitlist-claim expiry are computed lazily, at read
 time or when an adjacent write happens (a return, a renewal), not by a background
 job, and a booking's `released` status is computed at read time until the sweep
@@ -1438,6 +1611,6 @@ src/
     └── mailer.ts          # the optional email sender (Brevo) — see *Notices and email*
 test/
 ├── routes/                 # integration tests, one file per resource
-├── fixtures/               # noshow-features.json: the feature contract shared with ai-backend
+├── fixtures/               # noshow-features.json, recommend-batch-example.json: the contracts shared with ai-backend
 └── helpers/db.ts           # resetDb() — truncates between test files
 ```

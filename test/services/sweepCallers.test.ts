@@ -22,6 +22,7 @@ import {
   sweepIfDue,
   sweepUnlessRunning,
 } from '../../src/services/noShowService'
+import { resetRecommendationRefreshForTests } from '../../src/services/recommendationRefresh'
 import { runScheduledSweeps, startExpirySweep, SWEEP_INTERVAL_MS } from '../../src/services/requestHolds'
 import { resetDb } from '../helpers/db'
 
@@ -112,12 +113,22 @@ const printedText = (calls: unknown[][]) =>
 // A background sweep on a remote database takes a few seconds; vi.waitFor's 1 s default is too tight.
 const eventually = (assertion: () => void) => vi.waitFor(assertion, { timeout: 30_000, interval: 50 })
 
-beforeEach(resetDb)
+beforeEach(async () => {
+  // The timer also runs the recommendation refresh, which asks the AI service whenever AI_BACKEND_URL and AI_TOKEN are
+  // both set. This machine's .env or shell may set them: every test starts with the refresh off, and the tests about it
+  // switch it on (see "the 60-second timer").
+  vi.stubEnv('AI_TOKEN', '')
+  resetRecommendationRefreshForTests()
+  await resetDb()
+})
 afterEach(async () => {
   // Waits for any background sweep a test started, so none runs into the next test's reset.
   await resetLazySweepForTests()
+  resetRecommendationRefreshForTests()
   vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
 })
 
 describe('sweepIfDue', () => {
@@ -732,6 +743,126 @@ describe('the 60-second timer', () => {
 
     expect(log).not.toHaveBeenCalled()
     expect(error).not.toHaveBeenCalled()
+  })
+
+  describe('the recommendation refresh', () => {
+    const AI_URL = 'http://ai.test:8000'
+    const TOKEN = 'tok-7c41aa-not-a-real-secret'
+    // What a failed fetch carries: the address (with credentials) and the token, in the message AND in the cause.
+    const LEAKY = `http://svc-user:p4ssw0rd@10.9.8.7:8000/recommend/batch ${TOKEN}`
+
+    /** A student with one returned loan and one other book to recommend: enough for the refresh to have something to ask. */
+    async function seedReadingHistory(userId: string) {
+      const book = (title: string) =>
+        prisma.book.create({ data: { isbn: `isbn-${Math.random()}`, title, author: `Author of ${title}`, publishedYear: 1999, copies: { create: [{ status: 'available' }] } } })
+      const [read, next] = [await book('Read'), await book('Next')]
+      const borrowedAt = new Date(Date.now() - 30 * 24 * HOUR_MS)
+      await prisma.loan.create({
+        data: {
+          user: { connect: { id: userId } },
+          borrowedAt,
+          dueAt: new Date(borrowedAt.getTime() + 14 * 24 * HOUR_MS),
+          returnedAt: new Date(borrowedAt.getTime() + 2 * 24 * HOUR_MS),
+          status: 'returned',
+          bookCopy: { create: { book: { connect: { id: read.id } }, status: 'available' } },
+        },
+      })
+      return { read, next }
+    }
+
+    const configure = () => {
+      vi.stubEnv('AI_BACKEND_URL', AI_URL)
+      vi.stubEnv('AI_TOKEN', TOKEN)
+    }
+
+    it('runScheduledSweeps runs the recommendation refresh beside the other sweeps', async () => {
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const student = await seedStudent()
+      const missed = await seedMissedBooking(student.id)
+      const stale = await seedStaleRoomRequest(student.id)
+      const { next } = await seedReadingHistory(student.id)
+      configure()
+      const fetchStub = vi.fn<typeof fetch>(async (_url, init) => {
+        const sent = JSON.parse(String(init?.body)) as { interactions: Array<{ user_id: string }> }
+        const body = { model_version: 'tfidf-1', users: [{ user_id: sent.interactions[0].user_id, results: [{ book_id: next.id, score: 0.5, method: 'content' }] }] }
+        return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      })
+      vi.stubGlobal('fetch', fetchStub)
+      const before = Date.now()
+
+      await runScheduledSweeps()
+
+      // The two existing sweeps did their work ...
+      expect(await statusOf(missed.id)).toBe('no_show')
+      expect(await statusOf(stale.id)).toBe('expired')
+      // ... and so did the refresh: one call, the cache filled, stamped with this beat's clock (the default `now`).
+      expect(fetchStub).toHaveBeenCalledTimes(1)
+      expect(fetchStub.mock.calls[0][0]).toBe(`${AI_URL}/recommend/batch`)
+      const rows = await prisma.recommendationCache.findMany()
+      expect(rows.map((r) => ({ userId: r.userId, bookId: r.bookId, score: r.score, method: r.method }))).toEqual([
+        { userId: student.id, bookId: next.id, score: 0.5, method: 'content' },
+      ])
+      expect(rows[0].generatedAt.getTime()).toBeGreaterThanOrEqual(before)
+      expect(rows[0].generatedAt.getTime()).toBeLessThanOrEqual(Date.now())
+      // Its result is logged with counts and the model version; the no-show sweep's line is still there.
+      const lines = log.mock.calls.map((call) => String(call[0]))
+      expect(lines).toContain('recommendation refresh: students=1 rows=1 model=tfidf-1')
+      expect(lines.some((line) => /1 no-show/.test(line))).toBe(true)
+      expect(error).not.toHaveBeenCalled()
+
+      // The next beat finds the cache fresh: nothing is asked and nothing is logged about it.
+      log.mockClear()
+      await runScheduledSweeps()
+      expect(fetchStub).toHaveBeenCalledTimes(1)
+      expect(log).not.toHaveBeenCalled()
+    })
+
+    it('a failing refresh is logged and runScheduledSweeps still resolves', async () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const student = await seedStudent()
+      const missed = await seedMissedBooking(student.id)
+      await seedReadingHistory(student.id)
+      configure()
+      // fetch's own failure for an unreachable service: a generic message, with the address in its cause. A malformed
+      // AI_BACKEND_URL makes it quote the URL, and a bad header value quotes the token: all of it is in play here.
+      vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new TypeError(`fetch failed ${LEAKY}`, { cause: new Error(`connect ECONNREFUSED ${LEAKY}`) })))
+
+      await expect(runScheduledSweeps()).resolves.toBeUndefined()
+
+      // The other sweeps were not lost to it.
+      expect(await statusOf(missed.id)).toBe('no_show')
+      // One line, the error's class and nothing else of it.
+      expect(error.mock.calls.filter((call) => /Recommendation refresh failed/.test(String(call[0])))).toEqual([['Recommendation refresh failed: TypeError']])
+      const printed = printedText([...error.mock.calls, ...log.mock.calls])
+      for (const secret of [TOKEN, 'p4ssw0rd', 'svc-user', '10.9.8.7', 'ECONNREFUSED', 'fetch failed', AI_URL]) expect(printed).not.toContain(secret)
+      expect(await prisma.recommendationCache.count()).toBe(0)
+    })
+
+    it("logs the service's refusal by its fixed message and a timeout as \"timed out\", and the next beats do not retry inside 15 minutes", async () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      vi.spyOn(console, 'log').mockImplementation(() => {})
+      const student = await seedStudent()
+      await seedReadingHistory(student.id)
+      configure()
+      const fetchStub = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(`<html>${LEAKY}</html>`, { status: 503 }))
+      vi.stubGlobal('fetch', fetchStub)
+
+      await runScheduledSweeps()
+      expect(error).toHaveBeenLastCalledWith('Recommendation refresh failed: AI backend recommendation batch failed: 503')
+
+      // The next beat is inside the retry window: no second request, no second line.
+      await runScheduledSweeps()
+      expect(fetchStub).toHaveBeenCalledTimes(1)
+      expect(error.mock.calls.filter((call) => /Recommendation refresh failed/.test(String(call[0])))).toHaveLength(1)
+
+      resetRecommendationRefreshForTests()
+      fetchStub.mockRejectedValueOnce(new DOMException(`The operation was aborted due to timeout ${LEAKY}`, 'TimeoutError'))
+      await runScheduledSweeps()
+      expect(error).toHaveBeenLastCalledWith('Recommendation refresh failed: timed out')
+      expect(printedText(error.mock.calls)).not.toContain(TOKEN)
+    })
   })
 
   it('survives the expiry sweep failing: the bookings are still swept, and the failure is logged on its own', async () => {
