@@ -342,12 +342,16 @@ that the rest of the code does not handle yet.
    and the endpoint agree. Until then the sweep still runs whenever the server is
    awake and whenever anyone opens My Bookings or the console's Bookings page, but
    nothing records a missed booking on a sleeping instance.
-4. **Check the repository's visibility before relying on the 10-minute cron.**
+4. **The cron is best-effort; check the repository's visibility before relying on it.**
    It is about 4,320 Actions minutes a month: free for a public repository, over
    the 2,000 free minutes of a private one on the free plan (CI stops when they run
    out). For a private repository change the cron to `*/30 * * * *` (about 1,440).
-   A call every 10 minutes also keeps a free Render instance awake, which uses most
-   of its monthly instance hours. GitHub pauses scheduled workflows in a
+   GitHub delays scheduled runs under load: on 25 and 26 Nov 2026 this workflow
+   ran only about every 6 to 9 hours, not every 10 minutes, so it does **not** keep a
+   free Render instance awake. A sleeping instance runs no 60-second timer, so the
+   sweeps and the daily recommendation refresh wait for anything that wakes it (a
+   student opening the app, the console, a manual run) and happen on the first beat
+   after that. GitHub pauses scheduled workflows in a
    repository with no activity for 60 days (a commit, or re-enabling the workflow
    under the Actions tab, turns it back on). The workflow is the only loud failure
    channel (GitHub emails a failed run); the timer and the lazy sweep log to
@@ -688,7 +692,7 @@ do"). When both candidate queries fail the sweep throws.
 **Three callers**, all running the same function:
 
 - `POST /internal/sweep`, for the scheduled workflow
-  (`.github/workflows/sweep.yml`: every 10 minutes and on demand, `curl
+  (`.github/workflows/sweep.yml`: scheduled every 10 minutes, though GitHub runs it far less often, and on demand, `curl
   --fail-with-body --max-time 120 --retry 2` with the repo secrets `SWEEP_URL`
   and `SWEEP_TOKEN`). The credential is the `x-sweep-token` header, compared as
   SHA-256 digests in constant time; there is no login, and an admin's token is no
@@ -1592,7 +1596,7 @@ prisma/
 └── history.ts           # the generated four-week history, fines included
 .github/workflows/
 ├── ci.yml               # tests, build and start check on every push
-└── sweep.yml            # calls POST /internal/sweep every 10 minutes (see *No-shows*)
+└── sweep.yml            # calls POST /internal/sweep on a best-effort 10-minute cron (see *No-shows*)
 src/
 ├── index.ts              # app bootstrap (listen())
 ├── app.ts                # Express app factory — supertest mounts this directly

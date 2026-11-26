@@ -18,8 +18,10 @@
 # answers 500 with the counts and the failed step in the body, which --fail-with-body
 # prints). Zero counts with a green run mean there was nothing to do.
 #
-# Runs every 10 minutes, and on demand from the Actions tab (workflow_dispatch), which
-# is the way to try the two secrets. GitHub's schedule can lag by 10 to 15 minutes, and
+# Is scheduled every 10 minutes, and runs on demand from the Actions tab (workflow_dispatch),
+# which is the way to try the two secrets. GitHub's schedule is best-effort: it can lag by
+# 10 to 15 minutes or far more (on 25-26 Nov 2026 it ran every 6 to 9 hours), so it does NOT
+# keep a free Render instance awake. And
 # GitHub DISABLES scheduled workflows in a repository with no activity for 60 days: a
 # commit, or re-enabling the workflow under the Actions tab, turns it back on. Without
 # this workflow the sweep still runs whenever the server is awake (every minute) and
