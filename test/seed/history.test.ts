@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { generateFines, generateHistory, HISTORY_SEED, mulberry32, type HistoryInputs, type HistoryLoan } from '../../prisma/history'
+import {
+  generateFines,
+  generateHistory,
+  HISTORY_DAYS,
+  HISTORY_SEED,
+  mulberry32,
+  type HistoryBooking,
+  type HistoryInputs,
+  type HistoryLoan,
+} from '../../prisma/history'
+import { seedSeats } from '../../prisma/seatLayout'
+import { SEED_STUDENT_COUNT } from '../../prisma/seedData'
+import { TIME_SLOTS } from '../../src/config/constants'
 import { overdueFineAmount } from '../../src/services/fineRules'
 
 const TODAY = new Date(2026, 9, 15, 13, 0)
@@ -219,6 +231,41 @@ describe('generateHistory', () => {
         for (const at of [f.paidAt, f.adjustedAt]) if (at) expect(at.getTime()).toBeLessThan(midnight.getTime())
       }
     }
+  })
+
+  it('with 81 students and the 128-seat layout plus the rooms, seats stay about as busy as with the old 4 seats and 6 students', () => {
+    expect(SEED_STUDENT_COUNT).toBe(81)
+    // The seed's inputs: every seed student, and the rooms ahead of the 128 desks, the order seedData passes them in.
+    const layout: HistoryInputs = {
+      ...INPUTS,
+      studentIds: Array.from({ length: SEED_STUDENT_COUNT }, (_, i) => `st${i + 1}`),
+      resources: [...INPUTS.resources.filter((r) => r.type === 'room'), ...seedSeats([]).map((s) => ({ id: s.id, type: 'seat' as const }))],
+    }
+    const before = run().bookings
+    const after = generateHistory(TODAY, mulberry32(HISTORY_SEED), layout).bookings
+
+    // Every slot of the 28 days, as the history walks them.
+    const slotStarts = Array.from({ length: HISTORY_DAYS }, (_, i) =>
+      TIME_SLOTS.map((s) => new Date(MIDNIGHT.getFullYear(), MIDNIGHT.getMonth(), MIDNIGHT.getDate() - HISTORY_DAYS + i, s.hour)),
+    ).flat()
+    /** The share of the seats' slots (those `inSlot` keeps) that the history booked. */
+    const seatShare = (inputs: HistoryInputs, bookings: HistoryBooking[], inSlot: (start: Date) => boolean = () => true) => {
+      const seats = new Set(inputs.resources.filter((r) => r.type === 'seat').map((r) => r.id))
+      const booked = bookings.filter((b) => seats.has(b.resourceId) && inSlot(b.startTime)).length
+      return booked / (seats.size * slotStarts.filter(inSlot).length)
+    }
+
+    // One booking per student per slot does not starve the 128 desks: they are about as busy as the 4 were.
+    const ratio = seatShare(layout, after) / seatShare(INPUTS, before)
+    expect(ratio).toBeGreaterThanOrEqual(0.75)
+    expect(ratio).toBeLessThanOrEqual(1.25)
+    // The busiest-hour shape survives: weekday afternoons are busier than weekends.
+    const weekend = (d: Date) => d.getDay() === 0 || d.getDay() === 6
+    const weekdayAfternoon = (d: Date) => !weekend(d) && d.getHours() >= 13 && d.getHours() <= 17
+    expect(seatShare(layout, after, weekdayAfternoon)).toBeGreaterThan(seatShare(layout, after, weekend))
+    // And still no student holds two bookings in one slot.
+    const studentSlots = new Set(after.map((b) => `${b.userId}@${b.startTime.getTime()}`))
+    expect(studentSlots.size).toBe(after.length)
   })
 })
 

@@ -94,9 +94,9 @@ describe('admin resources', () => {
     // A bare array, not an object wrapper.
     expect(Array.isArray(res.body)).toBe(true)
     expect(res.body).toEqual([
-      { id: desk1.id, type: 'seat', name: 'Desk 1', location: 'Silent Zone', capacity: 1, status: 'available', statusNote: null, upcomingBookings: 2 },
-      { id: desk2.id, type: 'seat', name: 'Desk 2', location: 'Silent Zone', capacity: 1, status: 'offline', statusNote: 'Broken lamp', upcomingBookings: 0 },
-      { id: room.id, type: 'room', name: 'Group Room 201', location: 'Group study rooms', capacity: 6, status: 'available', statusNote: null, upcomingBookings: 1 },
+      { id: desk1.id, type: 'seat', name: 'Desk 1', location: 'Silent Zone', capacity: 1, status: 'available', statusNote: null, row: null, column: null, upcomingBookings: 2 },
+      { id: desk2.id, type: 'seat', name: 'Desk 2', location: 'Silent Zone', capacity: 1, status: 'offline', statusNote: 'Broken lamp', row: null, column: null, upcomingBookings: 0 },
+      { id: room.id, type: 'room', name: 'Group Room 201', location: 'Group study rooms', capacity: 6, status: 'available', statusNote: null, row: null, column: null, upcomingBookings: 1 },
     ])
   })
 
@@ -128,6 +128,8 @@ describe('admin resources', () => {
       capacity: 8,
       status: 'available',
       statusNote: null,
+      row: null,
+      column: null,
       upcomingBookings: 0,
     })
     expect(await prisma.resource.findUnique({ where: { id: res.body.id } })).toMatchObject({ name: 'Group Room 305', status: 'available' })
@@ -386,6 +388,225 @@ describe('admin resources', () => {
     await bringOnline(admin, 'does-not-exist')
     // Only the one successful takeOffline above published.
     expect(recorder.events).toHaveLength(5)
+  })
+
+  describe('seat positions', () => {
+    const SET_BOTH = 'Set both row and column, or neither.'
+    const SEATS_ONLY = 'Only seats can have a position on the seat map.'
+    const NEEDS_LOCATION = 'A seat on the map needs a location: its zone.'
+    const desk9 = { type: 'seat', name: 'Reading Room A · Desk 9', location: 'Reading Room A', capacity: 1, row: 2, column: 5 }
+
+    it('a seat can be created with a row and column, and the answer and the list carry them', async () => {
+      const { token: admin } = await seedUser('admin')
+
+      const res = await create(admin, desk9)
+
+      expect(res.status).toBe(201)
+      expect(res.body).toMatchObject({ type: 'seat', name: 'Reading Room A · Desk 9', location: 'Reading Room A', row: 2, column: 5 })
+      expect(await prisma.resource.findUniqueOrThrow({ where: { id: res.body.id } })).toMatchObject({ row: 2, column: 5 })
+      const listed = await list(admin)
+      expect(listed.body).toEqual([expect.objectContaining({ id: res.body.id, row: 2, column: 5 })])
+    })
+
+    it('a seat with no position carries null row and column', async () => {
+      const { token: admin } = await seedUser('admin')
+
+      const res = await create(admin, { type: 'seat', name: 'Desk 1', location: 'Silent Zone', capacity: 1 })
+
+      expect(res.status).toBe(201)
+      expect(res.body).toMatchObject({ row: null, column: null })
+    })
+
+    it('row without column is a 400', async () => {
+      const { token: admin } = await seedUser('admin')
+
+      const rowOnly = await create(admin, { type: 'seat', name: desk9.name, location: desk9.location, capacity: 1, row: 2 })
+      const columnOnly = await create(admin, { type: 'seat', name: desk9.name, location: desk9.location, capacity: 1, column: 5 })
+      const rowAndNull = await create(admin, { ...desk9, column: null })
+
+      for (const res of [rowOnly, columnOnly, rowAndNull]) {
+        expect(res.status).toBe(400)
+        expect(res.body.error).toBe(SET_BOTH)
+      }
+      expect(await prisma.resource.count()).toBe(0)
+    })
+
+    it('a position outside 1-50 is a 400', async () => {
+      const { token: admin } = await seedUser('admin')
+
+      const rejected = [
+        await create(admin, { ...desk9, row: 0 }),
+        await create(admin, { ...desk9, column: 51 }),
+        await create(admin, { ...desk9, row: 51 }),
+        await create(admin, { ...desk9, column: 0 }),
+        await create(admin, { ...desk9, row: 2.5 }),
+      ]
+      const edge = await create(admin, { ...desk9, row: 50, column: 1 })
+
+      expect(rejected.map((r) => r.status)).toEqual([400, 400, 400, 400, 400])
+      expect(edge.status).toBe(201)
+      expect(await prisma.resource.count()).toBe(1)
+    })
+
+    it('a room cannot have a position', async () => {
+      const { token: admin } = await seedUser('admin')
+
+      const res = await create(admin, { type: 'room', name: 'Group Room 1', location: 'Level 3', capacity: 6, row: 1, column: 1 })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe(SEATS_ONLY)
+      // A half position is refused first, whatever the type.
+      const half = await create(admin, { type: 'room', name: 'Group Room 2', location: 'Level 3', capacity: 6, row: 1 })
+      expect(half.body.error).toBe(SET_BOTH)
+      // And the seats-only rule comes before the location rule.
+      const noLocation = await create(admin, { type: 'room', name: 'Group Room 3', capacity: 6, row: 1, column: 1 })
+      expect(noLocation.body.error).toBe(SEATS_ONLY)
+      expect(await prisma.resource.count()).toBe(0)
+    })
+
+    it('a placed seat needs a location', async () => {
+      const { token: admin } = await seedUser('admin')
+
+      const blank = await create(admin, { ...desk9, location: '' })
+      const omitted = await create(admin, { type: 'seat', name: desk9.name, capacity: 1, row: 2, column: 5 })
+
+      for (const res of [blank, omitted]) {
+        expect(res.status).toBe(400)
+        expect(res.body.error).toBe(NEEDS_LOCATION)
+      }
+      expect(await prisma.resource.count()).toBe(0)
+    })
+
+    it('clearing the location of a placed seat is a 400', async () => {
+      const { token: admin } = await seedUser('admin')
+      const placed = await create(admin, desk9)
+
+      const blank = await edit(admin, placed.body.id, { location: '' })
+      const cleared = await edit(admin, placed.body.id, { location: null })
+
+      for (const res of [blank, cleared]) {
+        expect(res.status).toBe(400)
+        expect(res.body.error).toBe(NEEDS_LOCATION)
+      }
+      expect((await prisma.resource.findUniqueOrThrow({ where: { id: placed.body.id } })).location).toBe('Reading Room A')
+    })
+
+    it('a second seat at the same row and column in the same zone is a 409 naming the seat already there, and publishes nothing', async () => {
+      const { token: admin } = await seedUser('admin')
+      await create(admin, desk9)
+      recorder = recordEvents()
+
+      const res = await create(admin, { ...desk9, name: 'Reading Room A · Desk 10' })
+
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe('Row 2, column 5 in Reading Room A is already taken by Reading Room A · Desk 9.')
+      expect(recorder.events).toEqual([])
+      expect(await prisma.resource.count()).toBe(1)
+    })
+
+    it('the same row and column in another zone is fine', async () => {
+      const { token: admin } = await seedUser('admin')
+      await create(admin, desk9)
+
+      const res = await create(admin, { ...desk9, name: 'Silent Zone · Desk 9', location: 'Silent Zone' })
+
+      expect(res.status).toBe(201)
+      expect(res.body).toMatchObject({ location: 'Silent Zone', row: 2, column: 5 })
+    })
+
+    it('an offline seat still holds its spot', async () => {
+      const { token: admin } = await seedUser('admin')
+      const first = await create(admin, desk9)
+      expect((await takeOffline(admin, first.body.id, { note: 'Broken lamp' })).status).toBe(200)
+
+      const res = await create(admin, { ...desk9, name: 'Reading Room A · Desk 10' })
+
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe('Row 2, column 5 in Reading Room A is already taken by Reading Room A · Desk 9.')
+    })
+
+    it('PATCH with only row keeps the stored column', async () => {
+      const { token: admin } = await seedUser('admin')
+      const placed = await create(admin, desk9)
+
+      const res = await edit(admin, placed.body.id, { row: 3 })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toMatchObject({ row: 3, column: 5, location: 'Reading Room A' })
+      expect(await prisma.resource.findUniqueOrThrow({ where: { id: placed.body.id } })).toMatchObject({ row: 3, column: 5 })
+    })
+
+    it('PATCH with row and column null takes a seat off the map', async () => {
+      const { token: admin } = await seedUser('admin')
+      const placed = await create(admin, desk9)
+
+      const res = await edit(admin, placed.body.id, { row: null, column: null })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toMatchObject({ row: null, column: null, location: 'Reading Room A' })
+      expect(await prisma.resource.findUniqueOrThrow({ where: { id: placed.body.id } })).toMatchObject({ row: null, column: null })
+      // A seat off the map no longer needs a location.
+      expect((await edit(admin, placed.body.id, { location: null })).status).toBe(200)
+    })
+
+    it('PATCH with only one of row and column set null leaves a half position, a 400', async () => {
+      const { token: admin } = await seedUser('admin')
+      const placed = await create(admin, desk9)
+
+      const res = await edit(admin, placed.body.id, { column: null })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe(SET_BOTH)
+      expect(await prisma.resource.findUniqueOrThrow({ where: { id: placed.body.id } })).toMatchObject({ row: 2, column: 5 })
+    })
+
+    it('editing another field of a placed seat keeps its spot and is not a conflict with itself', async () => {
+      const { token: admin } = await seedUser('admin')
+      const placed = await create(admin, desk9)
+
+      const res = await edit(admin, placed.body.id, { name: 'Reading Room A · Desk 9B', row: 2, column: 5 })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toMatchObject({ name: 'Reading Room A · Desk 9B', row: 2, column: 5 })
+    })
+
+    it('moving a placed seat to a zone where its spot is taken is a 409', async () => {
+      const { token: admin } = await seedUser('admin')
+      const mover = await create(admin, desk9)
+      await create(admin, { ...desk9, name: 'Silent Zone · Desk 2', location: 'Silent Zone' })
+      recorder = recordEvents()
+
+      const res = await edit(admin, mover.body.id, { location: 'Silent Zone' })
+
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe('Row 2, column 5 in Silent Zone is already taken by Silent Zone · Desk 2.')
+      expect(recorder.events).toEqual([])
+      expect((await prisma.resource.findUniqueOrThrow({ where: { id: mover.body.id } })).location).toBe('Reading Room A')
+    })
+
+    it('moving a seat onto a taken spot in its own zone is a 409 naming the other seat', async () => {
+      const { token: admin } = await seedUser('admin')
+      await create(admin, desk9)
+      const other = await create(admin, { ...desk9, name: 'Reading Room A · Desk 10', row: 2, column: 6 })
+
+      const res = await edit(admin, other.body.id, { column: 5 })
+
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe('Row 2, column 5 in Reading Room A is already taken by Reading Room A · Desk 9.')
+    })
+
+    it('PATCH a room with a row is a 400', async () => {
+      const { token: admin } = await seedUser('admin')
+      const room = await seedResource('Group Room 1', 'room', { location: 'Level 3', capacity: 6 })
+
+      const rowOnly = await edit(admin, room.id, { row: 1 })
+      const both = await edit(admin, room.id, { row: 1, column: 1 })
+
+      expect(rowOnly.status).toBe(400)
+      expect(both.status).toBe(400)
+      expect(both.body.error).toBe(SEATS_ONLY)
+      expect(await prisma.resource.findUniqueOrThrow({ where: { id: room.id } })).toMatchObject({ row: null, column: null })
+    })
   })
 })
 

@@ -33,6 +33,7 @@ import {
   updateResourceSchema,
 } from '../schemas/adminResources'
 import { adjustReliabilitySchema, adminStudentParamsSchema } from '../schemas/adminStudents'
+import { adminZoneParamsSchema, setZoneFrontLabelSchema } from '../schemas/adminZones'
 import { escalateOverdueLoan, listAttention, remindOverdueLoan, type AttentionKind } from '../services/adminAttentionService'
 import {
   cancelBookingAsLibrary,
@@ -58,6 +59,7 @@ import { adjustReliability, getStudent } from '../services/adminStudentService'
 import { upholdDispute } from '../services/disputeService'
 import { overturnNoShow, upholdNoShow } from '../services/noShowDisputeService'
 import { confirmReport, dismissReport, type CopyOutcome } from '../services/reportService'
+import { listSeatZones, setZoneFrontLabel } from '../services/seatZoneService'
 
 export const adminRouter = Router()
 
@@ -129,6 +131,17 @@ adminRouter.post(
 
 adminRouter.post('/admin/resources/:id/online', validate({ params: adminResourceParamsSchema }), async (req, res) => {
   res.json(await bringOnline(req.params.id as string))
+})
+
+// Seat zones: the distinct seat locations, and the "front of the room" label the
+// seat map draws for each. The console URL-encodes the name; Express decodes it.
+adminRouter.get('/admin/zones', async (req, res) => {
+  res.json(await listSeatZones())
+})
+
+adminRouter.put('/admin/zones/:name', validate({ params: adminZoneParamsSchema, body: setZoneFrontLabelSchema }), async (req, res) => {
+  const { frontLabel } = req.body as { frontLabel: string }
+  res.json(await setZoneFrontLabel(req.params.name as string, frontLabel))
 })
 
 adminRouter.get('/admin/bookings', validate({ query: adminBookingsQuerySchema }), async (req, res) => {

@@ -152,3 +152,112 @@ describe('GET /resources/availability', () => {
     expect(res.body.map((r: { name: string }) => r.name)).toEqual(['Desk 1'])
   })
 })
+
+describe('seat map fields', () => {
+  beforeEach(resetDb)
+
+  const DATE = '2026-09-01'
+
+  it('each seat carries its row, column, status and its zone\'s front label', async () => {
+    await prisma.seatZone.create({ data: { name: 'Reading Room A', frontLabel: 'Windows' } })
+    await prisma.resource.create({
+      data: { type: 'seat', name: 'Desk 14', location: 'Reading Room A', row: 2, column: 5 },
+    })
+
+    const res = await request(app).get(`/resources/availability?type=seat&date=${DATE}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveLength(1)
+    expect(res.body[0]).toMatchObject({
+      name: 'Desk 14',
+      location: 'Reading Room A',
+      row: 2,
+      column: 5,
+      status: 'available',
+      zoneFront: 'Windows',
+    })
+  })
+
+  it('an unplaced seat and a room have null row and column, and zoneFront is null when the zone has no label', async () => {
+    await prisma.seatZone.create({ data: { name: 'Silent Zone', frontLabel: null } })
+    await prisma.resource.create({ data: { type: 'seat', name: 'Desk 1', location: 'Silent Zone' } })
+    await prisma.resource.create({ data: { type: 'room', name: 'Room 201', location: 'Second floor' } })
+
+    const seats = await request(app).get(`/resources/availability?type=seat&date=${DATE}`)
+    expect(seats.body).toHaveLength(1)
+    expect(seats.body[0]).toMatchObject({ row: null, column: null, status: 'available', zoneFront: null })
+
+    const rooms = await request(app).get(`/resources/availability?type=room&date=${DATE}`)
+    expect(rooms.body).toHaveLength(1)
+    expect(rooms.body[0]).toMatchObject({ row: null, column: null, status: 'available', zoneFront: null })
+  })
+
+  it('without includeOffline an offline seat is left out, and each item has exactly the old keys plus the four new ones', async () => {
+    await prisma.resource.create({ data: { type: 'seat', name: 'Desk 1', location: 'Reading Room A', row: 1, column: 1 } })
+    await prisma.resource.create({
+      data: { type: 'seat', name: 'Desk 2', location: 'Reading Room A', row: 1, column: 2, status: 'offline' },
+    })
+
+    const res = await request(app).get(`/resources/availability?type=seat&date=${DATE}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body.map((r: { name: string }) => r.name)).toEqual(['Desk 1'])
+    expect(Object.keys(res.body[0]).sort()).toEqual([
+      'capacity',
+      'column',
+      'id',
+      'location',
+      'name',
+      'row',
+      'status',
+      'takenSlotsToday',
+      'type',
+      'zoneFront',
+    ])
+
+    const explicitFalse = await request(app).get(`/resources/availability?type=seat&date=${DATE}&includeOffline=false`)
+    expect(explicitFalse.status).toBe(200)
+    expect(explicitFalse.body.map((r: { name: string }) => r.name)).toEqual(['Desk 1'])
+  })
+
+  it('includeOffline=true returns the offline seat with status offline and no taken slots, even when it has a booking that day', async () => {
+    const user = await seedUser()
+    await prisma.resource.create({ data: { type: 'seat', name: 'Desk 1', location: 'Reading Room A', row: 1, column: 1 } })
+    const offline = await prisma.resource.create({
+      data: { type: 'seat', name: 'Desk 2', location: 'Reading Room A', row: 1, column: 2, status: 'offline' },
+    })
+    await prisma.resourceBooking.create({
+      data: {
+        userId: user.id,
+        resourceId: offline.id,
+        startTime: atLocalHour(DATE, 11),
+        endTime: atLocalHour(DATE, 12),
+        status: 'booked',
+      },
+    })
+
+    const res = await request(app).get(`/resources/availability?type=seat&date=${DATE}&includeOffline=true`)
+
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveLength(2)
+    const byName = Object.fromEntries(res.body.map((r: { name: string }) => [r.name, r]))
+    expect(byName['Desk 1']).toMatchObject({ status: 'available', row: 1, column: 1 })
+    expect(byName['Desk 2']).toMatchObject({ status: 'offline', row: 1, column: 2, takenSlotsToday: [] })
+  })
+
+  it('includeOffline=yes is a 400', async () => {
+    const res = await request(app).get(`/resources/availability?type=seat&date=${DATE}&includeOffline=yes`)
+    expect(res.status).toBe(400)
+  })
+
+  it('items stay in name order with includeOffline=true', async () => {
+    await prisma.resource.create({ data: { type: 'seat', name: 'Desk 3' } })
+    await prisma.resource.create({ data: { type: 'seat', name: 'Desk 1', status: 'offline' } })
+    await prisma.resource.create({ data: { type: 'seat', name: 'Desk 2' } })
+
+    const res = await request(app).get(`/resources/availability?type=seat&date=${DATE}&includeOffline=true`)
+
+    expect(res.status).toBe(200)
+    expect(res.body.map((r: { name: string }) => r.name)).toEqual(['Desk 1', 'Desk 2', 'Desk 3'])
+  })
+})

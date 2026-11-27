@@ -109,11 +109,18 @@ hand-written CHECK, `IssueReport_exactly_one_target`
 resource, never both or neither), and two partial unique indexes,
 `IssueReport_one_open_per_copy` (`"userId", "bookCopyId"`) and
 `IssueReport_one_open_per_resource` (`"userId", "resourceId"`), both
-`WHERE status = 'open'`: one open report per student and target. Prisma models
-none of these, and no later migration or generator may drop them. Check every
+`WHERE status = 'open'`: one open report per student and target. `Resource` (migration
+`20261127090000_seat_map`) carries a hand-written CHECK,
+`Resource_position_pair` (a seat's `seatRow` and `seatColumn`, the database names
+of Prisma's `row` and `column`, are both set or both null), and a partial unique
+index, `Resource_seat_position_unique` (`location`, `seatRow`, `seatColumn`
+`WHERE "seatRow" IS NOT NULL`: one seat per place in a zone, offline seats
+included). Prisma models none of these, and no later migration or generator may
+drop them. Check every
 generated migration for a `DROP` of `no_overlapping_bookings`,
 `BorrowRequest_one_pending_per_title`, `IssueReport_exactly_one_target`,
-`IssueReport_one_open_per_copy` or `IssueReport_one_open_per_resource` before
+`IssueReport_one_open_per_copy`, `IssueReport_one_open_per_resource`,
+`Resource_position_pair` or `Resource_seat_position_unique` before
 applying it.
 
 ---

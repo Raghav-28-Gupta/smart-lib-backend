@@ -1,7 +1,10 @@
 // Seeds the database so a live demo matches the frontend's mock UI exactly:
-// the same 12 books, 4 seats, 3 rooms, and demo user the frontend was built
-// and screenshotted against (see book_repository.dart, booking_repository.dart,
-// auth_repository.dart, loan_repository.dart, profile_repository.dart).
+// the same 12 books, 3 rooms, and demo user the frontend was built and
+// screenshotted against (see book_repository.dart, booking_repository.dart,
+// auth_repository.dart, loan_repository.dart, profile_repository.dart), and the
+// seat map's 128 desks in two zones with their front labels (prisma/seatLayout.ts;
+// the four desks the mock always had, s1 to s4, keep their ids, names and
+// scripted "taken" slots, and the other 124 have no booking today or later).
 //
 // This file is the seed's work, as runSeed(); prisma/seed.ts is the thin CLI
 // around it, and test/seed/reseed.test.ts calls it against the test database.
@@ -13,14 +16,18 @@
 // console, and the seed accounts' own rows on any other book or resource.
 // Books, copies and resources a librarian added, and other students' rows on
 // them, are left alone, so a re-seed after console use succeeds; see
-// resetSeedData() for the order. It assumes a migrated database.
+// resetSeedData() for the order. The one exception: while a seat the seed did
+// not make stands where the layout puts a demo desk, the seed refuses before
+// deleting anything and names the seat (seatsInTheWay). It assumes a migrated
+// database.
 //
-// It also generates four weeks of past bookings and loans for the six seed
+// It also generates four weeks of past bookings and loans for the 81 seed
 // students (prisma/history.ts), ending yesterday, so the admin Dashboard has
-// history to show, and an overdue fine for each late return, some paid, some
-// adjusted or waived (naming no librarian), so the Fines page has every state
-// to show. The demo student's account gets none of it, apart from the one missed
-// booking below.
+// history to show (a student holds one booking per slot, so it takes about 81
+// to keep 128 desks about as busy as the old 4 were), and an overdue fine for
+// each late return, some paid, some adjusted or waived (naming no librarian),
+// so the Fines page has every state to show. The demo student's account gets
+// none of it, apart from the one missed booking below.
 //
 // Every booking whose grace period has already ended at seed time is written in its
 // final state, so the first sweep after a seed finds nothing old to record: the
@@ -40,21 +47,24 @@
 // no email.
 //
 // Deliberately NOT reproduced: the booking mock's own pre-seeded bookings for
-// its demo user reference a resource ("Desk 4") that doesn't exist among the
-// seeded seats, and any other personal bookings for Aditi would risk colliding
-// with the "taken slots today" bookings seeded below for the same resources
-// (her one missed booking is in the past, in a slot the history left free).
-// Booking a resource is easy enough to demo live instead.
+// its demo user name a desk ("Reading Room A · Desk 4") under s1's id, which
+// the seed gives to Desk 12, and any other personal bookings for Aditi would
+// risk colliding with the "taken slots today" bookings seeded below for the
+// same resources (her one missed booking is in the past, in a slot the history
+// left free). Booking a resource is easy enough to demo live instead.
 import bcrypt from 'bcrypt'
 import { GRACE_PERIOD_MINUTES, TIME_SLOTS } from '../src/config/constants'
 import type { Prisma, PrismaClient } from '../src/generated/prisma/client'
 import { generateHistory, HISTORY_SEED, mulberry32, OUTSTANDING_NEWEST, type HistoryBooking } from './history'
+import { SEAT_ZONES, seedSeats } from './seatLayout'
 
 export const DEMO_PASSWORD = 'password123'
 
 export const SEED_BOOK_IDS = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b9', 'b10', 'b11', 'b12']
-export const SEED_RESOURCE_IDS = ['s1', 's2', 's3', 's4', 'r1', 'r2', 'r3']
-export const SEED_STUDENT_EMAILS = Array.from({ length: 6 }, (_, i) => `seed.student${i + 1}@thapar.edu`)
+// "Seed Student 1" to "Seed Student 81". DEMO_EMAIL_PATTERN (src/config/constants.ts) covers every
+// one of them, so the mailer never emails a seed account.
+export const SEED_STUDENT_COUNT = 81
+export const SEED_STUDENT_EMAILS = Array.from({ length: SEED_STUDENT_COUNT }, (_, i) => `seed.student${i + 1}@thapar.edu`)
 export const DEMO_EMAIL = 'aditi.sharma@thapar.edu'
 const SEED_USER_EMAILS = [DEMO_EMAIL, ...SEED_STUDENT_EMAILS]
 
@@ -73,15 +83,38 @@ const BOOKS = [
   { id: 'b12', title: 'Atomic Habits', author: 'James Clear', genre: 'Non-fiction', description: 'A practical framework for building good habits and breaking bad ones.', totalCopies: 3, availableCopies: 2 },
 ] as const
 
-const RESOURCES = [
-  { id: 's1', type: 'seat' as const, name: 'Reading Room A · Desk 12', location: 'Reading Room A', capacity: 1, taken: ['11:00 AM', '12:00 PM'] },
-  { id: 's2', type: 'seat' as const, name: 'Reading Room A · Desk 14', location: 'Reading Room A', capacity: 1, taken: ['9:00 AM', '10:00 AM', '3:00 PM', '4:00 PM'] },
-  { id: 's3', type: 'seat' as const, name: 'Silent Zone · Desk 3', location: 'Silent Zone', capacity: 1, taken: [] as string[] },
-  { id: 's4', type: 'seat' as const, name: 'Silent Zone · Desk 7', location: 'Silent Zone', capacity: 1, taken: ['1:00 PM', '2:00 PM', '6:00 PM'] },
-  { id: 'r1', type: 'room' as const, name: 'Group Room 201 · 4 seats', location: 'Group study rooms', capacity: 4, taken: ['2:00 PM', '3:00 PM'] },
-  { id: 'r2', type: 'room' as const, name: 'Group Room 202 · 6 seats', location: 'Group study rooms', capacity: 6, taken: TIME_SLOTS.map((s) => s.label) },
-  { id: 'r3', type: 'room' as const, name: 'Discussion Pod 1 · 2 seats', location: 'Discussion pods', capacity: 2, taken: ['10:00 AM', '11:00 AM'] },
+interface SeedResource {
+  id: string
+  type: 'seat' | 'room'
+  name: string
+  location: string
+  capacity: number
+  /** The place on the seat map; null for the rooms. */
+  row: number | null
+  column: number | null
+  /** Today's slots the seed books (TIME_SLOTS labels). */
+  taken: string[]
+}
+
+// The desks the mock always had keep their ids, names and scripted "taken" slots (the app's mock
+// repository and tests depend on them) and get their place in the layout; every other desk of the
+// layout is `s-rra-<N>` or `s-sz-<N>` with nothing taken.
+const SEATS: SeedResource[] = seedSeats([
+  { id: 's1', location: 'Reading Room A', desk: 12, taken: ['11:00 AM', '12:00 PM'] },
+  { id: 's2', location: 'Reading Room A', desk: 14, taken: ['9:00 AM', '10:00 AM', '3:00 PM', '4:00 PM'] },
+  { id: 's3', location: 'Silent Zone', desk: 3, taken: [] },
+  { id: 's4', location: 'Silent Zone', desk: 7, taken: ['1:00 PM', '2:00 PM', '6:00 PM'] },
+]).map((seat) => ({ ...seat, type: 'seat' as const, capacity: 1 }))
+
+const ROOMS: SeedResource[] = [
+  { id: 'r1', type: 'room', name: 'Group Room 201 · 4 seats', location: 'Group study rooms', capacity: 4, row: null, column: null, taken: ['2:00 PM', '3:00 PM'] },
+  { id: 'r2', type: 'room', name: 'Group Room 202 · 6 seats', location: 'Group study rooms', capacity: 6, row: null, column: null, taken: TIME_SLOTS.map((s) => s.label) },
+  { id: 'r3', type: 'room', name: 'Discussion Pod 1 · 2 seats', location: 'Discussion pods', capacity: 2, row: null, column: null, taken: ['10:00 AM', '11:00 AM'] },
 ]
+
+const RESOURCES = [...SEATS, ...ROOMS]
+// Every seed resource, so resetSeedData removes each of them (and everything on them) before a re-seed.
+export const SEED_RESOURCE_IDS = RESOURCES.map((r) => r.id)
 
 // Mirrors loan_repository.dart's MockLoanRepository exactly, including
 // loan3's fineAmount (3 days × ₹10/day) and loan4's waitlist-blocked renewal.
@@ -152,6 +185,31 @@ function freeHistorySlot(today: Date, resourceId: string, history: HistoryBookin
   throw new Error(`no free slot on ${resourceId} between ${DEMO_NO_SHOW.firstDaysBack} and ${DEMO_NO_SHOW.lastDaysBack} days back for the demo student's no-show`)
 }
 
+/**
+ * The resources the seed did not make that stand where the layout puts a demo desk, in zone, row and
+ * column order. The seed could not recreate a demo desk there (one seat per place, the partial unique
+ * index Resource_seat_position_unique), and finding that out only after the reset had deleted
+ * everything would leave the demo half-made on every run, so resetSeedData refuses first. A librarian
+ * can put a seat there whenever the demo desk is not in its place: before the first seed with the
+ * layout, or after moving the demo desk.
+ */
+async function seatsInTheWay(db: Prisma.TransactionClient) {
+  const places = new Set(SEATS.map((s) => `${s.location}|${s.row}|${s.column}`))
+  const placed = await db.resource.findMany({
+    where: { id: { notIn: SEED_RESOURCE_IDS }, location: { in: SEAT_ZONES.map((z) => z.name) }, row: { not: null } },
+    select: { name: true, location: true, row: true, column: true },
+    orderBy: [{ location: 'asc' }, { row: 'asc' }, { column: 'asc' }],
+  })
+  return placed.filter((r) => places.has(`${r.location}|${r.row}|${r.column}`))
+}
+
+/** Rows in chunks of `size`, for createMany calls that stay well inside the bound-value limit of one statement. */
+function chunks<T>(rows: T[], size = 2_000): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size))
+  return out
+}
+
 const SEED_COPY_REPORT = { bookId: 'b3', studentIndex: 0, hoursAgo: 4, category: 'damaged' as const, note: 'The back cover is torn and a few pages near the end are coming loose.' }
 const SEED_RESOURCE_REPORT = { resourceId: 's2', studentIndex: 1, hoursAgo: 1, category: 'not_working' as const, note: 'The desk lamp does not switch on.' }
 
@@ -201,8 +259,20 @@ export interface SeedSummary {
  * link. A dispute on a fine that stays (a librarian's book) stays with it, so
  * does another student's no-show dispute on a booking of a librarian's resource,
  * and so does another student's report on a librarian's copy or resource.
+ *
+ * Refused, deleting nothing: a re-seed while a resource that is not the seed's
+ * stands where the layout puts a demo desk (see seatsInTheWay).
  */
 async function resetSeedData(db: Prisma.TransactionClient) {
+  const inTheWay = await seatsInTheWay(db)
+  if (inTheWay.length > 0) {
+    const list = inTheWay.map((r) => `"${r.name}" (${r.location}, row ${r.row}, column ${r.column})`).join('; ')
+    throw new Error(
+      `The seed stopped before deleting anything: the demo desks need their places on the seat map, and some are taken by seats the seed did not make: ${list}. ` +
+        'Move each one to another place, or clear its position, in the console, then run the seed again.',
+    )
+  }
+
   const seedUsers = await db.user.findMany({ where: { email: { in: SEED_USER_EMAILS } }, select: { id: true } })
   const userIds = seedUsers.map((u) => u.id)
   const onDemoBook = { in: SEED_BOOK_IDS }
@@ -312,11 +382,19 @@ export async function runSeed(prisma: PrismaClient, today: Date = new Date()): P
   const demoUser = await prisma.user.create({
     data: { id: 'u1', name: 'Aditi Sharma', email: DEMO_EMAIL, passwordHash, roll: '1024160143' },
   })
-  const seedStudents = await Promise.all(
-    SEED_STUDENT_EMAILS.map((email, i) =>
-      prisma.user.create({ data: { name: `Seed Student ${i + 1}`, email, passwordHash } }),
-    ),
+  await prisma.user.createMany({
+    data: SEED_STUDENT_EMAILS.map((email, i) => ({ name: `Seed Student ${i + 1}`, email, passwordHash })),
+  })
+  // Read back in N order (Seed Student 1 first): the waitlists, today's taken slots, the history and
+  // the reports pick students by position, so the same student gets the same rows on every run.
+  const byEmail = new Map(
+    (await prisma.user.findMany({ where: { email: { in: SEED_STUDENT_EMAILS } } })).map((u) => [u.email, u]),
   )
+  const seedStudents = SEED_STUDENT_EMAILS.map((email) => {
+    const student = byEmail.get(email)
+    if (!student) throw new Error(`seed student ${email} was not created`)
+    return student
+  })
   const nextStudent = (() => {
     let i = 0
     return () => seedStudents[i++ % seedStudents.length]
@@ -362,9 +440,21 @@ export async function runSeed(prisma: PrismaClient, today: Date = new Date()): P
     data: { userId: demoUser.id, score: 50, delta: -50, reason: 'Missed check-in window for a Group Room 201 booking' },
   })
 
+  await prisma.resource.createMany({
+    data: RESOURCES.map((r) => ({ id: r.id, type: r.type, name: r.name, location: r.location, capacity: r.capacity, row: r.row, column: r.column })),
+  })
+  // The zones' front labels. resetSeedData leaves SeatZone alone (a librarian's label for a zone of
+  // their own stays); this puts the demo zones' labels back.
+  for (const zone of SEAT_ZONES) {
+    await prisma.seatZone.upsert({
+      where: { name: zone.name },
+      create: { name: zone.name, frontLabel: zone.frontLabel },
+      update: { frontLabel: zone.frontLabel },
+    })
+  }
+
   let noShows = 0
-  for (const r of RESOURCES) {
-    await prisma.resource.create({ data: { id: r.id, type: r.type, name: r.name, location: r.location, capacity: r.capacity } })
+  for (const r of RESOURCES.filter((resource) => resource.taken.length > 0)) {
     for (const label of r.taken) {
       const slot = TIME_SLOTS.find((s) => s.label === label)
       if (!slot) continue
@@ -393,16 +483,20 @@ export async function runSeed(prisma: PrismaClient, today: Date = new Date()): P
 
   const history = generateHistory(today, mulberry32(HISTORY_SEED), {
     studentIds: seedStudents.map((s) => s.id),
-    resources: RESOURCES.map((r) => ({ id: r.id, type: r.type })),
+    // The rooms go ahead of the desks. A student holds one booking per slot, so in a busy weekday slot
+    // the students can run out before the end of the list; the booking lost then is better one of the
+    // 128 desks than one of the three rooms at their 2-4 PM peak (the Dashboard charts rooms on their own).
+    resources: [...ROOMS, ...SEATS].map((r) => ({ id: r.id, type: r.type })),
     books: copiesByBook,
     popularity: BOOK_POPULARITY,
   })
-  await prisma.resourceBooking.createMany({ data: history.bookings })
+  // About 15,000 bookings and 3,000 no-show records: written in chunks, each one INSERT well inside
+  // Postgres's limit of 65,535 bound values per statement.
+  for (const data of chunks(history.bookings)) await prisma.resourceBooking.createMany({ data })
   // After the bookings: every no-show record points at one. Backstory, so no log, notice or email.
   const historyBookings = new Map(history.bookings.map((b) => [b.id, b]))
-  await prisma.noShowEvent.createMany({
-    data: history.noShows.map((n) => noShowRecord(historyBookings.get(n.bookingId)!, n.predictedProbability)),
-  })
+  const noShowRecords = history.noShows.map((n) => noShowRecord(historyBookings.get(n.bookingId)!, n.predictedProbability))
+  for (const data of chunks(noShowRecords)) await prisma.noShowEvent.createMany({ data })
   noShows += history.noShows.length
   await prisma.loan.createMany({ data: history.loans })
   // After the loans: every fine points at one of them.

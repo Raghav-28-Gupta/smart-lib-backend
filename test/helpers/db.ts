@@ -8,7 +8,7 @@ export async function resetDb() {
     TRUNCATE TABLE
       "BorrowRequest", "NoShowEvent", "NoShowDispute", "Notice", "FineDispute", "IssueReport", "Fine", "ReliabilityScoreLog", "RecommendationCache",
       "ResourceBooking", "Resource", "Reservation", "Loan", "BookCopy",
-      "Book", "User"
+      "Book", "User", "SeatZone"
     RESTART IDENTITY CASCADE
   `)
 }

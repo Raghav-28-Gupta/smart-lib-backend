@@ -46,7 +46,10 @@ express: the `EXCLUDE` constraint below (rewritten in
 a partial unique index allowing one pending borrow request per student and
 title, and, in `20261122164800_attention_reports`, a CHECK that a problem report
 names exactly one target plus two partial unique indexes allowing one open
-report per student and target (see *Problem reports*). Create new migrations
+report per student and target (see *Problem reports*), and, in
+`20261127090000_seat_map`, a CHECK that a seat's row and column are both set or
+both null plus a partial unique index allowing one seat per place in a zone
+(see *Seat map*). Create new migrations
 with `npx prisma migrate dev --create-only` and read the SQL before applying
 it. Prisma doesn't model any of these, so a generated migration may try to drop
 them. (`20261121215218_console_catalogue` also hand-writes the barcode sequence
@@ -87,19 +90,41 @@ loser, instead of the clean `23P01`.
 npm run seed
 ```
 
-Populates the database with the same 12 books, 4 seats, 3 rooms, and demo
-user (`aditi.sharma@thapar.edu` / `password123`) that the Flutter frontend's
-mock repositories were built and screenshotted against — so a live demo
-matches the UI the team has already seen. It also gives the demo user a
-representative loan/reliability history (an overdue loan with a fine, a loan
-blocked from renewal by a waitlist, a degraded reliability score) so her own
-screens aren't empty on first login. Details and the specific scope decisions
-are documented in the comment block at the top of `prisma/seedData.ts` (the seed's work, as
-`runSeed()`; `prisma/seed.ts` is the command line around it).
+Populates the database with the same 12 books, 3 rooms, and demo user
+(`aditi.sharma@thapar.edu` / `password123`) that the Flutter frontend's mock
+repositories were built and screenshotted against — so a live demo matches the
+UI the team has already seen — and the seat map's 128 desks (below). It also
+gives the demo user a representative loan/reliability history (an overdue loan
+with a fine, a loan blocked from renewal by a waitlist, a degraded reliability
+score) so her own screens aren't empty on first login. Details and the specific
+scope decisions are documented in the comment block at the top of
+`prisma/seedData.ts` (the seed's work, as `runSeed()`; `prisma/seed.ts` is the
+command line around it).
 
-It also generates four weeks of past activity, ending yesterday, for the six
-"Seed Student" accounts: about 600-900 bookings (weekday afternoons busiest,
-about 1 in 5 missed) and 40-60 loans. The admin console's Dashboard reads it.
+**The seat map.** The desks stand in two zones, laid out in
+`prisma/seatLayout.ts` (see *Seat map* for what a position is):
+
+- **Reading Room A**, front label "Windows": 80 desks, 8 rows of 10, desks in
+  columns 1-3, 5-8 and 10-12, so columns 4 and 9 show as aisles.
+- **Silent Zone**, front label "Entrance": 48 desks, 6 rows of 8, desks in
+  columns 1-4 and 6-9, so column 5 shows as an aisle.
+
+Desk N is numbered row by row, left to right, over the desks only, and named
+`<zone> · Desk N`. The four desks the app's mock always had keep their ids, names
+and scripted "taken" slots for today, and get their place: s1 is Reading Room A ·
+Desk 12 (row 2, column 2), s2 is Reading Room A · Desk 14 (row 2, column 5), s3
+is Silent Zone · Desk 3 (row 1, column 3) and s4 is Silent Zone · Desk 7 (row 1,
+column 8). The other 124 desks are `s-rra-<N>` and `s-sz-<N>` and have no booking
+today or on any later day, so the map is mostly free (they do have history,
+below). The seed writes the two zones' front labels to `SeatZone`.
+
+It also generates four weeks of past activity, ending yesterday, for the 81
+"Seed Student" accounts (`seed.student1@thapar.edu` to
+`seed.student81@thapar.edu`): about 15,000 bookings over the 128 desks and 3
+rooms (weekday afternoons busiest, about 1 in 5 missed) and 40-60 loans. A
+student holds at most one booking per slot, which is why there are 81 of them:
+enough to keep the 128 desks about as busy as the old four were (a little over a
+third of desk slots booked). The admin console's Dashboard reads it.
 The same seed (`HISTORY_SEED` in `prisma/history.ts`) gives the same history
 every time, shifted to end yesterday. The demo student's account gets none of
 it, apart from the one missed booking described below.
@@ -123,14 +148,14 @@ shows both counts.
 
 Each late return in that history also has its overdue fine: one waived and one
 lowered (with their notes), the older ones paid, and at least the two newest
-left outstanding (on some weekdays a third is too). The seed then disputes the
-two newest outstanding fines (below), so on the Fines page those two show under
-Disputed and the Outstanding filter holds only a third unsettled fine, on the
-weekdays that have one; Waived, Adjusted, Paid and Accruing (the demo student's
-overdue loan, still out, is an accruing row) each have something. The seeded
-fines name no librarian, since nobody recorded them. Every seeded copy gets its
-barcode from the same sequence as a copy added in the console (see *Catalogue
-and copies*), so the numbers change on each re-seed.
+left outstanding (on some weekdays more are: two more on a Friday). The seed
+then disputes the two newest outstanding fines (below), so on the Fines page
+those two show under Disputed and the Outstanding filter holds only the older
+unsettled fines, on the weekdays that have them; Waived, Adjusted, Paid and
+Accruing (the demo student's overdue loan, still out, is an accruing row) each
+have something. The seeded fines name no librarian, since nobody recorded them.
+Every seeded copy gets its barcode from the same sequence as a copy added in the
+console (see *Catalogue and copies*), so the numbers change on each re-seed.
 
 So that **Needs attention** has data on a fresh seed, it also opens two fine
 disputes (on the two newest outstanding fines, each marked disputed, so *Mark
@@ -142,10 +167,14 @@ overdue items include the demo student's overdue loan and the seed students'
 open history loans that are a day or more past due. The seed creates no notices
 and sends no email.
 
-Re-running it resets the seeded books (b1-b12), resources (s1-r3) and seed
-accounts (the demo student and the six "Seed Student" accounts), then recreates
-them. It is safe to run after the console has been used: it never fails on rows
-the console added.
+Re-running it resets the seeded books (b1-b12), resources (the 128 desks and
+r1-r3) and seed accounts (the demo student and the 81 "Seed Student" accounts),
+then recreates them. It leaves `SeatZone` alone and then writes the two demo
+zones' labels again, so a label a librarian gave a zone of their own stays, and
+one changed on Reading Room A or Silent Zone goes back to "Windows" or
+"Entrance". It is safe to run after the console has been used: it never fails on
+rows the console added, except that it refuses to start, deleting nothing, while
+a seat it did not make stands in one of the demo desks' places (below).
 
 **A re-seed resets:**
 
@@ -191,7 +220,19 @@ through it leaves the database as it was. The recreate that follows is not in
 that transaction, so a failure there leaves the demo data partly made; running
 the seed again repairs it.
 
-Against production, only re-run it if nothing there needs keeping.
+**A seat in a demo desk's place stops the seed before it deletes anything.** The
+128 demo desks need their places in Reading Room A and Silent Zone, and a place
+holds one seat (`Resource_seat_position_unique`). Any seat the seed did not make
+can stand in one: a seat a librarian placed there before the first seed with the
+seat map (no demo desk has to move for that), or after moving a demo desk away.
+So before the reset deletes anything, the seed looks for such seats, and if it
+finds any it stops with an error naming each one and its place (`"Window Nook"
+(Reading Room A, row 1, column 1)`). Move each of them to another place, or
+clear its position, in the console, then run the seed again.
+
+Against production, only re-run it if nothing there needs keeping, and only
+once the student app with the seat map is published: an older app lists every
+seat as a card of its own, which with 128 desks works but is unwieldy.
 
 ## Admin accounts
 
@@ -483,7 +524,7 @@ step is done students see the popularity list, as before. In this order.
 | POST | `/reservations` | ✓ | Join a book's waitlist |
 | GET | `/reservations/me` | ✓ | Your queue position or active claim |
 | DELETE | `/reservations/:id` | ✓ | Leave the waitlist / decline a claim |
-| GET | `/resources/availability?type=&date=` | — | Seats/rooms with per-slot occupancy for a date |
+| GET | `/resources/availability?type=&date=&includeOffline=` | — | Seats/rooms with per-slot occupancy for a date, as an array in name order. Each item also carries `row` and `column` (a seat's place on the seat map; `null` for rooms and seats not yet placed), `zoneFront` (the front label of the seat's zone, or `null`) and `status` (`available` or `offline`). Without `includeOffline=true` only available resources are returned, exactly as before; with it, offline ones come too, with `status: 'offline'` and `takenSlotsToday: []` (see *Seat map*) |
 | POST | `/bookings` | ✓ | Book a seat, or request a room (`{ resourceId, startTime, endTime }`); 409 + alternatives on conflict |
 | GET | `/bookings/me` | ✓ | Your bookings and room requests, with computed grace-window status; also a booking the library cancelled or moved, for 7 days (see *Bookings and resources*). Every booking answer, this one and the ones from `POST /bookings`, check-in and cancel, also carries `canReport` and `reportOpen` (see *Problem reports*) and `noShow` (`null`, or `{ canDispute, dispute }` for a recorded no-show or a booking with a no-show dispute; see *No-shows*) |
 | POST | `/bookings/:id/checkin` | ✓ | Check in within the grace window; 409 for a booking that was released or recorded as a no-show |
@@ -503,10 +544,12 @@ step is done students see the popularity list, as before. In this order.
 | POST | `/admin/requests/:kind/:id/approve` | admin | Approve (`kind` is `borrow` or `room`); 409 if it was already settled |
 | POST | `/admin/requests/:kind/:id/decline` | admin | Decline, with an optional `{ reason }` (up to 300 characters) |
 | GET | `/admin/resources?type=` | admin | Every seat and room (`type` is `seat` or `room`; omit for both), by name, with its status and how many bookings it still holds (`upcomingBookings`) |
-| POST | `/admin/resources` | admin | Add one: `{ type, name, location?, capacity }` (name and location up to 100 characters, capacity a whole number 1-100); answers 201 |
-| PATCH | `/admin/resources/:id` | admin | Change `name`, `location` and/or `capacity` (at least one; a blank `location` clears it); the type cannot change |
+| POST | `/admin/resources` | admin | Add one: `{ type, name, location?, capacity, row?, column? }` (name and location up to 100 characters, capacity a whole number 1-100; `row` and `column` place a seat on the seat map, see *Seat map*); answers 201 |
+| PATCH | `/admin/resources/:id` | admin | Change `name`, `location`, `capacity`, `row` and/or `column` (at least one; a blank `location` clears it; `null` for both `row` and `column` takes the seat off the map, and an omitted one keeps its stored value); the type cannot change. A bad position is a 400, a place already taken a 409 (see *Seat map*) |
 | POST | `/admin/resources/:id/offline` | admin | Take it offline, with an optional `{ note }` (up to 300 characters); 409 if it already is |
 | POST | `/admin/resources/:id/online` | admin | Bring it back and clear the note; 409 if it already is |
+| GET | `/admin/zones` | admin | The seat map's zones: `[{ name, frontLabel, seats, placed }]`, one per distinct non-blank seat `location` (rooms' locations are not listed), sorted by name. `seats` counts the seats in it, of any status; `placed` those with a row and column (see *Seat map*) |
+| PUT | `/admin/zones/:name` | admin | Set the zone's front-of-room label: `{ frontLabel }` (trimmed, up to 40 characters; a blank one clears it). `:name` is the location, URL-encoded. Answers the zone as in the list; 404 "Zone not found" when no seat has that location; publishes `resource.changed` |
 | GET | `/admin/bookings?search=&status=&page=&pageSize=` | admin | Bookings, newest start time first, 25 per page (up to 100), with the total behind the filters; `status` is `booked`, `released`, `no_show`, `checked_in`, `completed` or `cancelled` |
 | POST | `/admin/bookings/:id/cancel` | admin | Cancel a booking for the library, with an optional `{ reason }` (up to 300 characters); 409 if it can no longer be cancelled |
 | GET | `/admin/bookings/:id/reassign-options` | admin | Resources the booking could move to: online, same type, free for its time |
@@ -581,7 +624,8 @@ All nine routes sit behind the `/admin` guard, like the rest.
 
 **Resources.** A resource is `available` or `offline`. Offline means no new
 bookings: `POST /bookings` answers 409 ("This resource is offline right now."),
-`GET /resources/availability` leaves it out, a conflict never suggests it as an
+`GET /resources/availability` leaves it out (unless the caller sends
+`includeOffline=true`, see *Seat map*), a conflict never suggests it as an
 alternative, and no booking can be moved onto it. Bookings that already exist
 stay, which is why the list carries `upcomingBookings` (requested, booked or
 checked-in bookings that have not ended). Taking a resource offline can carry a
@@ -636,6 +680,61 @@ do. A student's own cancel is not listed, as before. A booking the library moved
 shows the new resource's name and id, and `movedFrom`, the old resource's name,
 for 7 days after `movedAt` (null otherwise). The booking's `status` stays the
 raw database value (`cancelled` for a library cancel).
+
+## Seat map
+
+The student app's Seats tab draws a zone as a map of the real room, so a seat can
+carry a place: a `row` and a `column` in the zone named by its `location`. The
+rules are checked by `POST` and `PATCH /admin/resources`, against the seat as it
+will be after the write:
+
+- **Row and column** are whole numbers from 1 to 50 (anything else is a 400).
+- **Both or neither, once the write is done.** The rule is about the seat as it
+  will be after the write: one that would end up with only a row or only a column
+  is a 400 ("Set both row and column, or neither."). On a `POST` that means
+  sending one half without the other. On a `PATCH` an omitted half keeps its
+  stored value, so `{ row: 3 }` on a placed seat moves it within its column (a
+  200), and `{ row: null, column: null }` takes the seat off the map. But `null`
+  for only one half of a placed seat, or one half sent for a seat that has no
+  place yet, is a 400.
+- **Seats only.** A room with a position is a 400 ("Only seats can have a
+  position on the seat map.").
+- **A placed seat needs a non-blank location**, its zone, so clearing the
+  location of a placed seat is a 400 too ("A seat on the map needs a location:
+  its zone."). Changing a placed seat's location keeps its row and column.
+- **One seat per place.** `(location, row, column)` is unique among placed
+  seats, offline ones included, since an offline desk still stands in its spot.
+  A clash is a 409: `Row R, column C in <location> is already taken by <other
+  seat's name>.` The database decides it (the partial unique index
+  `Resource_seat_position_unique`, with the CHECK `Resource_position_pair` for
+  the pair), never a read followed by a write, so of two librarians placing a
+  seat at once only the first lands.
+
+**Zones.** A zone is a distinct seat `location`, not a table of its own: it
+appears when a seat is given that location, and `GET /admin/zones` lists each
+one once (every status counted, rooms' locations left out). The only stored part
+is the **front label**, the front of the room that the app draws as a bar at the
+top of the map ("Windows", "Entrance"), in `SeatZone`. It is trimmed, at most 40 characters,
+and a blank one is stored as null. `PUT /admin/zones/:name` saves it (an upsert,
+so the first save creates the row) and publishes `resource.changed`; it answers
+404 "Zone not found" when no seat has that location, and writes and publishes
+nothing then. The console URL-encodes `:name` (a location may hold spaces and
+slashes, as in `Floor 2 / East`), and the list is sorted by plain character
+order. A label is matched to a location by its exact text, with no foreign key,
+so a location typed with other case ("Reading room A" next to "Reading Room A")
+is a second zone, listed separately so the librarian sees it. Renaming a
+location leaves its old label unused, which is harmless: the new zone is listed
+without one.
+
+**Availability for the map.** `GET /resources/availability` stays an array in
+name order, and each item gains `row`, `column`, `zoneFront` and `status`.
+Offline resources are **opt-in**: only `includeOffline=true` returns them (with
+`status: 'offline'` and `takenSlotsToday: []`), so the map can keep an offline
+desk in its place. Without the flag the answer is exactly what it was before:
+only available resources. That default is the point. The installed Android apps
+(v1.0.0 and v1.1.0) never send the flag, so they never see an offline desk as
+bookable; the new app sends it for seats only. Anything other than `true` or
+`false` for the flag is a 400.
 
 ## No-shows
 
@@ -1516,7 +1615,7 @@ after its email outcome has been written, so the refetch shows the true
 |---|---|---|
 | A request created, decided, withdrawn or lapsed | `request.created`, `request.decided`, `request.cancelled`, `request.expired` | `requests` (an approval also `metrics`, an approved room request also `bookings`) |
 | A booking that is not a request: a seat booked, a check-in, a cancel or a move | `booking.changed` | `bookings`, `metrics` |
-| A resource added, edited, taken offline or brought back | `resource.changed` | `resources`, `metrics` |
+| A resource added, edited (its seat map position included), taken offline or brought back, or a zone's front label saved | `resource.changed` | `resources`, `metrics` |
 | A waitlist join or leave | `activity` | `metrics` |
 | A student's return or renewal | `loan.changed` | `metrics`, `catalogue` (a renewal's new due date, or the copy a return frees); and `fines` and `attention` too when the loan was past due: its due date before the return or renewal, even by under a day (`publishLoanChange(pastDue)` tests only that). A loan a whole day or more late has an accruing row that turns into a stored fine and an overdue item that leaves the queue; one under a day late has neither, and the two topics cost the console one harmless refetch |
 | A return that carries a report | `loan.changed`, then `attention.changed` (only when a report was written); both go out even if the waitlist hand-off after the commit fails | as above, then `attention` |

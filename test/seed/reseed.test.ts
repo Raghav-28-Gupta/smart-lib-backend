@@ -7,6 +7,7 @@ import { sendEmail, setMailTransport } from '../../src/lib/mailer'
 import { prisma } from '../../src/lib/prisma'
 import { noShowDisputeDeadline, noShowInfo } from '../../src/services/bookingService'
 import { sweepBookings } from '../../src/services/noShowService'
+import { seedSeats } from '../../prisma/seatLayout'
 import { DEMO_EMAIL, runSeed, SEED_BOOK_IDS, SEED_RESOURCE_IDS, SEED_STUDENT_EMAILS } from '../../prisma/seedData'
 import { resetDb } from '../helpers/db'
 
@@ -23,6 +24,19 @@ vi.mock('../../src/lib/mailer', async (importOriginal) => {
 const SLOW = 180_000
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
+
+// The four desks the demo has always had: their place in the layout and their scripted "taken today" slots.
+const KEPT_DESKS = [
+  { id: 's1', location: 'Reading Room A', desk: 12, taken: ['11:00 AM', '12:00 PM'] },
+  { id: 's2', location: 'Reading Room A', desk: 14, taken: ['9:00 AM', '10:00 AM', '3:00 PM', '4:00 PM'] },
+  { id: 's3', location: 'Silent Zone', desk: 3, taken: [] },
+  { id: 's4', location: 'Silent Zone', desk: 7, taken: ['1:00 PM', '2:00 PM', '6:00 PM'] },
+]
+
+/** A day as the availability endpoint takes it: YYYY-MM-DD, local. */
+function isoDay(d: Date) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
 
 async function seedStudent(n = 1) {
   return prisma.user.findUniqueOrThrow({ where: { email: SEED_STUDENT_EMAILS[n - 1] } })
@@ -195,13 +209,13 @@ describe('runSeed', () => {
   }, SLOW)
 
   it('opens the two disputes on the two newest outstanding fines when more than two are outstanding', async () => {
-    // The history depends on the date only through the weekday, and on a Thursday three fines stay outstanding.
-    const thursday = new Date()
-    thursday.setDate(thursday.getDate() - ((thursday.getDay() + 3) % 7))
-    await runSeed(prisma, thursday)
+    // The history depends on the date only through the weekday, and on a Friday four fines stay outstanding.
+    const friday = new Date()
+    friday.setDate(friday.getDate() - ((friday.getDay() + 2) % 7))
+    await runSeed(prisma, friday)
 
     const outstanding = await prisma.fine.findMany({ where: { status: 'pending' }, orderBy: { createdAt: 'desc' } })
-    expect(outstanding.length, 'the demo data leaves three fines outstanding on a Thursday').toBeGreaterThanOrEqual(3)
+    expect(outstanding.length, 'the demo data leaves more than two fines outstanding on a Friday').toBeGreaterThanOrEqual(3)
     const disputes = await prisma.fineDispute.findMany()
     expect(disputes.map((d) => d.fineId).sort()).toEqual(outstanding.slice(0, 2).map((f) => f.id).sort())
     // The older outstanding fines have no dispute and no marker.
@@ -216,7 +230,7 @@ describe('runSeed', () => {
     const firstNoShowDisputes = await prisma.noShowDispute.findMany({ select: { id: true } })
     const firstReports = await prisma.issueReport.findMany({ select: { id: true } })
     const second = await runSeed(prisma, today)
-    expect(first).toMatchObject({ books: 12, resources: 7, users: 7, disputes: 2, noShowDisputes: 2, reports: 2 })
+    expect(first).toMatchObject({ books: 12, resources: 131, users: 82, disputes: 2, noShowDisputes: 2, reports: 2 })
     expect(first.noShows).toBeGreaterThan(0)
     expect(second).toEqual(first)
     // The no-show disputes are replaced, not kept beside the new ones, and the no-shows are not counted twice.
@@ -225,8 +239,8 @@ describe('runSeed', () => {
     expect(await prisma.resourceBooking.count({ where: { status: 'no_show' } })).toBe(first.noShows)
     expect(await prisma.noShowEvent.count()).toBe(first.noShows)
     expect(await prisma.book.count()).toBe(12)
-    expect(await prisma.resource.count()).toBe(7)
-    expect(await prisma.user.count()).toBe(7)
+    expect(await prisma.resource.count()).toBe(131)
+    expect(await prisma.user.count()).toBe(82)
     expect(await prisma.fine.count()).toBe(first.fines)
     // The first run's disputes and reports were replaced, not kept beside the new ones; there are still no notices.
     expect(await prisma.fineDispute.count()).toBe(2)
@@ -365,7 +379,7 @@ describe('runSeed', () => {
     expect(await prisma.notice.count({ where: { id: { in: [aboutLoan.id, plain.id, demoNotice.id] } } })).toBe(0)
     // The seed accounts were recreated, so nothing of them is left behind.
     expect(await prisma.notice.count()).toBe(0)
-    expect(await prisma.user.count()).toBe(7)
+    expect(await prisma.user.count()).toBe(82)
   }, SLOW)
 
   it("a notice for a non-seed student about a demo-book loan survives a re-seed with its loan link cleared", async () => {
@@ -432,7 +446,7 @@ describe('runSeed', () => {
     expect(await prisma.fineDispute.count({ where: { userId: other.id } })).toBe(1)
     expect(await prisma.fineDispute.count()).toBe(3)
     await expectNoMarkerWithoutADispute()
-    expect(await prisma.user.count({ where: { email: { in: [DEMO_EMAIL, ...SEED_STUDENT_EMAILS] } } })).toBe(7)
+    expect(await prisma.user.count({ where: { email: { in: [DEMO_EMAIL, ...SEED_STUDENT_EMAILS] } } })).toBe(82)
   }, SLOW)
 
   it('a re-seed succeeds after a student reported a seed copy and a seed resource', async () => {
@@ -480,7 +494,7 @@ describe('runSeed', () => {
     expect(await prisma.issueReport.count()).toBe(4)
     // The librarian who closed two of them is an ordinary account and stays; the seed accounts were recreated.
     expect(await prisma.user.findUnique({ where: { id: librarian.id } })).not.toBeNull()
-    expect(await prisma.user.count({ where: { email: { in: [DEMO_EMAIL, ...SEED_STUDENT_EMAILS] } } })).toBe(7)
+    expect(await prisma.user.count({ where: { email: { in: [DEMO_EMAIL, ...SEED_STUDENT_EMAILS] } } })).toBe(82)
   }, SLOW)
 
   it('a copy a librarian added to a demo book is removed', async () => {
@@ -746,7 +760,7 @@ describe('runSeed', () => {
     // The librarian and the student are ordinary accounts and stay; the seed accounts were recreated.
     expect(await prisma.user.findUnique({ where: { id: librarianUser.id } })).not.toBeNull()
     expect(await prisma.user.findUnique({ where: { id: other.id } })).not.toBeNull()
-    expect(await prisma.user.count({ where: { email: { in: [DEMO_EMAIL, ...SEED_STUDENT_EMAILS] } } })).toBe(7)
+    expect(await prisma.user.count({ where: { email: { in: [DEMO_EMAIL, ...SEED_STUDENT_EMAILS] } } })).toBe(82)
   }, SLOW)
 
   it('a fresh seed leaves no booked row past its grace period', async () => {
@@ -953,5 +967,176 @@ describe('runSeed', () => {
     expect(send).not.toHaveBeenCalled()
     expect(sendEmail).not.toHaveBeenCalled()
     expect(await prisma.notice.count()).toBe(0)
+  }, SLOW)
+
+  it('every seed desk is placed where the layout says, and both zones have their front labels', async () => {
+    const summary = await runSeed(prisma)
+    expect(summary).toMatchObject({ resources: 131, users: 82 })
+
+    const seats = await prisma.resource.findMany({ where: { type: 'seat' } })
+    expect(seats).toHaveLength(128)
+    const byId = new Map(seats.map((s) => [s.id, s]))
+    for (const desk of seedSeats(KEPT_DESKS)) {
+      expect(byId.get(desk.id), desk.id).toMatchObject({
+        name: desk.name, location: desk.location, row: desk.row, column: desk.column, capacity: 1, status: 'available', statusNote: null,
+      })
+    }
+    // s1 to s4 are the desks they always were, now with a place on the map.
+    expect(byId.get('s1')).toMatchObject({ name: 'Reading Room A · Desk 12', location: 'Reading Room A', capacity: 1, row: 2, column: 2 })
+    expect(byId.get('s2')).toMatchObject({ name: 'Reading Room A · Desk 14', location: 'Reading Room A', capacity: 1, row: 2, column: 5 })
+    expect(byId.get('s3')).toMatchObject({ name: 'Silent Zone · Desk 3', location: 'Silent Zone', capacity: 1, row: 1, column: 3 })
+    expect(byId.get('s4')).toMatchObject({ name: 'Silent Zone · Desk 7', location: 'Silent Zone', capacity: 1, row: 1, column: 8 })
+    // The rooms stay off the map.
+    const rooms = await prisma.resource.findMany({ where: { type: 'room' }, orderBy: { id: 'asc' } })
+    expect(rooms.map((r) => [r.id, r.row, r.column])).toEqual([['r1', null, null], ['r2', null, null], ['r3', null, null]])
+    // SEED_RESOURCE_IDS names every one of them, so a re-seed resets them all.
+    expect([...SEED_RESOURCE_IDS].sort()).toEqual([...seats, ...rooms].map((r) => r.id).sort())
+
+    expect(await prisma.seatZone.findMany({ orderBy: { name: 'asc' } })).toEqual([
+      { name: 'Reading Room A', frontLabel: 'Windows' },
+      { name: 'Silent Zone', frontLabel: 'Entrance' },
+    ])
+    // What the app's seat map reads: every desk with its place and its zone's front.
+    const res = await request(app).get(`/resources/availability?type=seat&date=${isoDay(new Date())}`)
+    expect(res.status).toBe(200)
+    const items = res.body as Array<{ id: string; location: string; row: number; column: number; zoneFront: string | null }>
+    expect(items).toHaveLength(128)
+    for (const item of items) {
+      expect(item.zoneFront, item.id).toBe(item.location === 'Reading Room A' ? 'Windows' : 'Entrance')
+      expect([item.row, item.column], item.id).toEqual([byId.get(item.id)!.row, byId.get(item.id)!.column])
+    }
+  }, SLOW)
+
+  it('the new desks have no booking today or later, and s1 to s4 keep today\'s taken slots', async () => {
+    // 8:00 today, before the first slot: every scripted "taken" slot is still to come, so the map shows it taken.
+    const now = new Date()
+    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+    await runSeed(prisma, new Date(now.getFullYear(), now.getMonth(), now.getDate(), 8, 0))
+
+    // Every booking from today on is a scripted "taken" slot today, on s1, s2, s4 or a room.
+    const fromToday = await prisma.resourceBooking.findMany({ where: { startTime: { gte: midnight } } })
+    expect(new Set(fromToday.map((b) => b.resourceId))).toEqual(new Set(['s1', 's2', 's4', 'r1', 'r2', 'r3']))
+    expect(fromToday.filter((b) => b.startTime >= tomorrow)).toEqual([])
+    const hoursOn = (id: string) => fromToday.filter((b) => b.resourceId === id).map((b) => b.startTime.getHours()).sort((a, b) => a - b)
+    expect(hoursOn('s1')).toEqual([11, 12])
+    expect(hoursOn('s2')).toEqual([9, 10, 15, 16])
+    expect(hoursOn('s3')).toEqual([])
+    expect(hoursOn('s4')).toEqual([13, 14, 18])
+
+    // What the app's seat map reads: s1, s2 and s4 show their slots today, every other desk is free, and tomorrow all are.
+    const takenOn = async (day: Date) => {
+      const res = await request(app).get(`/resources/availability?type=seat&date=${isoDay(day)}&includeOffline=true`)
+      expect(res.status).toBe(200)
+      return new Map((res.body as Array<{ id: string; takenSlotsToday: string[] }>).map((s) => [s.id, s.takenSlotsToday]))
+    }
+    const scripted = new Map(KEPT_DESKS.map((k) => [k.id, k.taken]))
+    const today = await takenOn(midnight)
+    expect(today.size).toBe(128)
+    for (const [id, taken] of today) expect(taken, id).toEqual(scripted.get(id) ?? [])
+    const next = await takenOn(tomorrow)
+    expect(next.size).toBe(128)
+    for (const [id, taken] of next) expect(taken, id).toEqual([])
+
+    // The history before today covers the new desks as well as the old ones.
+    const withHistory = new Set(
+      (await prisma.resourceBooking.groupBy({ by: ['resourceId'], where: { startTime: { lt: midnight } } })).map((g) => g.resourceId),
+    )
+    for (const desk of seedSeats(KEPT_DESKS)) expect(withHistory.has(desk.id), desk.id).toBe(true)
+  }, SLOW)
+
+  it('resetSeedData removes all 81 seed students and every seed desk', async () => {
+    const today = new Date()
+    await runSeed(prisma, today)
+    const firstStudents = await prisma.user.findMany({ where: { email: { in: SEED_STUDENT_EMAILS } }, select: { id: true } })
+    expect(firstStudents).toHaveLength(81)
+    // Every seed desk changed the way a librarian could change it, so one that was kept rather than recreated would show it.
+    await prisma.resource.updateMany({ where: { id: { in: SEED_RESOURCE_IDS } }, data: { status: 'offline', statusNote: 'Set before the re-seed' } })
+    await prisma.resource.update({ where: { id: 's-sz-48' }, data: { row: 9, column: 5 } })
+    // The last seed student's booking on a desk a librarian added goes with the student; the desk stays.
+    const student81 = await seedStudent(81)
+    const desk = await prisma.resource.create({ data: { type: 'seat', name: 'Console Desk', capacity: 1 } })
+    const startTime = new Date(today.getTime() - 3 * DAY_MS)
+    const booking = await prisma.resourceBooking.create({
+      data: { userId: student81.id, resourceId: desk.id, startTime, endTime: new Date(startTime.getTime() + HOUR_MS), status: 'checked_in', checkedInAt: startTime },
+    })
+
+    await runSeed(prisma, today)
+
+    // None of the first run's 81 accounts is left; the second run's 81 stand in their place.
+    expect(await prisma.user.count({ where: { id: { in: firstStudents.map((u) => u.id) } } })).toBe(0)
+    expect(await prisma.user.count({ where: { email: { in: SEED_STUDENT_EMAILS } } })).toBe(81)
+    expect(await prisma.user.count()).toBe(82)
+    // Every seed desk was recreated as the layout has it.
+    expect(await prisma.resource.count({ where: { id: { in: SEED_RESOURCE_IDS } } })).toBe(131)
+    expect(await prisma.resource.count({ where: { id: { in: SEED_RESOURCE_IDS }, OR: [{ status: 'offline' }, { statusNote: { not: null } }] } })).toBe(0)
+    expect(await prisma.resource.findUniqueOrThrow({ where: { id: 's-sz-48' } })).toMatchObject({ location: 'Silent Zone', row: 6, column: 9 })
+    expect(await prisma.resourceBooking.findUnique({ where: { id: booking.id } })).toBeNull()
+    expect(await prisma.resource.findUnique({ where: { id: desk.id } })).not.toBeNull()
+  }, SLOW)
+
+  it("a librarian's seat with a position survives a re-seed with its position", async () => {
+    await runSeed(prisma)
+    // A desk a librarian put in Reading Room A's aisle, and an out-of-service one in a zone of their own with its label.
+    const inAisle = await prisma.resource.create({
+      data: { type: 'seat', name: 'Window Nook', location: 'Reading Room A', row: 3, column: 4, capacity: 1 },
+    })
+    const inAnnex = await prisma.resource.create({
+      data: { type: 'seat', name: 'Annex Desk 1', location: 'Annex', row: 1, column: 1, capacity: 1, status: 'offline', statusNote: 'Wobbly leg' },
+    })
+    await prisma.seatZone.create({ data: { name: 'Annex', frontLabel: 'Stairs' } })
+    // The librarian also relabelled a demo zone.
+    await prisma.seatZone.update({ where: { name: 'Reading Room A' }, data: { frontLabel: 'Garden' } })
+
+    await runSeed(prisma)
+
+    // Every column as it was: zone, row and column, and the offline desk's status.
+    expect(await prisma.resource.findUniqueOrThrow({ where: { id: inAisle.id } })).toEqual(inAisle)
+    expect(await prisma.resource.findUniqueOrThrow({ where: { id: inAnnex.id } })).toEqual(inAnnex)
+    expect(await prisma.resource.count({ where: { type: 'seat' } })).toBe(130)
+    // resetSeedData leaves SeatZone alone, so the librarian's own zone keeps its label; the seed puts the demo zones' back.
+    expect(await prisma.seatZone.findMany({ orderBy: { name: 'asc' } })).toEqual([
+      { name: 'Annex', frontLabel: 'Stairs' },
+      { name: 'Reading Room A', frontLabel: 'Windows' },
+      { name: 'Silent Zone', frontLabel: 'Entrance' },
+    ])
+  }, SLOW)
+
+  it("refuses to re-seed, deleting nothing, while a librarian's seat stands in a demo desk's place", async () => {
+    await runSeed(prisma)
+    // The librarian moves Desk 1 into the aisle and puts a desk of their own where it stood.
+    await prisma.resource.update({ where: { id: 's-rra-1' }, data: { row: 9, column: 4 } })
+    const inTheWay = await prisma.resource.create({
+      data: { type: 'seat', name: 'Window Nook', location: 'Reading Room A', row: 1, column: 1, capacity: 1 },
+    })
+    const everything = async () => ({
+      users: await prisma.user.count(),
+      books: await prisma.book.count(),
+      copies: await prisma.bookCopy.count(),
+      resources: await prisma.resource.count(),
+      bookings: await prisma.resourceBooking.count(),
+      noShowEvents: await prisma.noShowEvent.count(),
+      loans: await prisma.loan.count(),
+      fines: await prisma.fine.count(),
+      fineDisputes: await prisma.fineDispute.count(),
+      noShowDisputes: await prisma.noShowDispute.count(),
+      reports: await prisma.issueReport.count(),
+      zones: await prisma.seatZone.findMany({ orderBy: { name: 'asc' } }),
+    })
+    const before = await everything()
+
+    // The refusal names the seat in the way and its place, and says what to do.
+    await expect(runSeed(prisma)).rejects.toThrow(/"Window Nook" \(Reading Room A, row 1, column 1\).*Move/)
+
+    // Nothing was deleted: the first seed's data stands, and both desks are where the librarian left them.
+    expect(await everything()).toEqual(before)
+    expect(await prisma.resource.findUniqueOrThrow({ where: { id: 's-rra-1' } })).toMatchObject({ row: 9, column: 4 })
+    expect(await prisma.resource.findUniqueOrThrow({ where: { id: inTheWay.id } })).toEqual(inTheWay)
+
+    // Once that seat is moved off the place, the seed runs and puts Desk 1 back.
+    await prisma.resource.update({ where: { id: inTheWay.id }, data: { row: 3, column: 4 } })
+    await runSeed(prisma)
+    expect(await prisma.resource.findUniqueOrThrow({ where: { id: 's-rra-1' } })).toMatchObject({ location: 'Reading Room A', row: 1, column: 1 })
+    expect(await prisma.resource.findUniqueOrThrow({ where: { id: inTheWay.id } })).toMatchObject({ row: 3, column: 4 })
   }, SLOW)
 })

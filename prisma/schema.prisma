@@ -264,9 +264,24 @@ model Resource {
   status     ResourceStatus @default(available)
   // The optional note given when a librarian takes the resource offline.
   statusNote String?
+  // Optional place on the seat map: both set or both null, seats only (the
+  // hand-written CHECK Resource_position_pair). Unique per (location, row,
+  // column) among placed seats (the hand-written partial unique index
+  // Resource_seat_position_unique, offline seats included). The database
+  // columns avoid the SQL keywords ROW and COLUMN in raw queries.
+  row        Int?           @map("seatRow")
+  column     Int?           @map("seatColumn")
 
   bookings     ResourceBooking[]
   issueReports IssueReport[]
+}
+
+// The front of a zone on the seat map ("Windows", "Entrance"), keyed by the
+// location text seats carry. Never a foreign key: a location typed with other
+// case is simply another zone.
+model SeatZone {
+  name       String  @id
+  frontLabel String?
 }
 
 model ResourceBooking {
